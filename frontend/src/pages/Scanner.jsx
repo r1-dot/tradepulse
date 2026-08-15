@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { SiBinance } from "react-icons/si";
-import { Search, ArrowDown, ArrowUp, ChevronDown } from "lucide-react";
+import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX } from "lucide-react";
+import { toast, Toaster } from "sonner";
 import MarketOverview from "@/components/MarketOverview";
 import { withCommas, compactUsd, fmtPrice, fmtPct } from "@/lib/format";
 
@@ -17,7 +18,28 @@ const SORTS = [
   { key: "volume_desc", label: "Volume" },
   { key: "symbol_asc", label: "A → Z" },
 ];
+const THRESHOLDS = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1300, 1500, 2000];
 const ROW_H = 34;
+
+let _audioCtx = null;
+function beep() {
+  try {
+    _audioCtx = _audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = _audioCtx;
+    if (ctx.state === "suspended") ctx.resume();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.22);
+    o.connect(g);
+    g.connect(ctx.destination);
+    o.start();
+    o.stop(ctx.currentTime + 0.24);
+  } catch (e) { /* ignore */ }
+}
 
 export default function Scanner() {
   const [timeframe, setTimeframe] = useState("1s");
@@ -28,13 +50,20 @@ export default function Scanner() {
   const [status, setStatus] = useState({});
   const [market, setMarket] = useState(null);
   const [sortOpen, setSortOpen] = useState(false);
+  const [alertThreshold, setAlertThreshold] = useState(null);
+  const [alertOpen, setAlertOpen] = useState(false);
+  const [onlyAlerts, setOnlyAlerts] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [alertCount, setAlertCount] = useState(0);
 
   const prevTrades = useRef({});
   const parentRef = useRef(null);
+  const alertingRef = useRef(new Set());
+  const seedRef = useRef(false);
 
   // stable refs for interval callback
-  const cfg = useRef({ timeframe, sort, search });
-  cfg.current = { timeframe, sort, search };
+  const cfg = useRef({ timeframe, sort, search, alertThreshold, muted });
+  cfg.current = { timeframe, sort, search, alertThreshold, muted };
 
   const fetchTokens = useCallback(async () => {
     const { timeframe, sort, search } = cfg.current;
@@ -57,6 +86,38 @@ export default function Scanner() {
         approx: data.approx, total: data.total, totalPairs: data.totalPairs,
         totalTrades: data.totalTrades, historyDepthSec: data.historyDepthSec,
       });
+
+      // ---- trade alerts ----
+      const th = cfg.current.alertThreshold;
+      if (th) {
+        const nowAlerting = new Set();
+        for (const r of rows) if (r.trades >= th) nowAlerting.add(r.symbol);
+        setAlertCount(nowAlerting.size);
+        if (seedRef.current) {
+          // first pass after enabling/changing — seed silently, no spam
+          alertingRef.current = nowAlerting;
+          seedRef.current = false;
+        } else {
+          const prevSet = alertingRef.current;
+          const crossed = [...nowAlerting].filter((s) => !prevSet.has(s));
+          alertingRef.current = nowAlerting;
+          if (crossed.length) {
+            if (!cfg.current.muted) beep();
+            crossed.slice(0, 3).forEach((sym) => {
+              const r = rows.find((x) => x.symbol === sym);
+              toast(`${r.base}/USDT crossed ${th} trades`, {
+                description: `${withCommas(r.trades)} trades in ${cfg.current.timeframe} · ${fmtPct(r.change)}`,
+              });
+            });
+            if (crossed.length > 3) {
+              toast(`+${crossed.length - 3} more tokens crossed ${th} trades`);
+            }
+          }
+        }
+      } else {
+        alertingRef.current = new Set();
+        setAlertCount(0);
+      }
     } catch (e) {
       // keep last data on transient errors
     }
@@ -69,8 +130,11 @@ export default function Scanner() {
     return () => clearInterval(id);
   }, [fetchTokens]);
 
-  // refetch immediately when controls change
-  useEffect(() => { fetchTokens(); }, [timeframe, sort, search, fetchTokens]);
+  // refetch immediately when controls change (and seed alerts to avoid spam)
+  useEffect(() => {
+    seedRef.current = true;
+    fetchTokens();
+  }, [timeframe, sort, search, alertThreshold, fetchTokens]);
 
   // engine status + market overview
   useEffect(() => {
@@ -90,8 +154,13 @@ export default function Scanner() {
     return () => clearInterval(id);
   }, []);
 
+  const displayTokens = useMemo(() => {
+    if (onlyAlerts && alertThreshold) return tokens.filter((t) => t.trades >= alertThreshold);
+    return tokens;
+  }, [tokens, onlyAlerts, alertThreshold]);
+
   const rowVirtualizer = useVirtualizer({
-    count: tokens.length,
+    count: displayTokens.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => ROW_H,
     overscan: 12,
@@ -163,6 +232,75 @@ export default function Scanner() {
               APPROX · warming history
             </span>
           )}
+
+          {/* Alert controls */}
+          <div className="flex items-center gap-1.5" data-testid="alert-controls">
+            <div className="relative">
+              <button
+                data-testid="alert-toggle"
+                onClick={() => setAlertOpen((o) => !o)}
+                className={`mono flex items-center gap-1 border px-2.5 py-1 text-[12px] transition-colors ${
+                  alertThreshold
+                    ? "border-[#002FA7] bg-[#002FA7] text-white"
+                    : "border-zinc-200 text-zinc-700 hover:border-zinc-400"
+                }`}
+              >
+                <Bell size={12} />
+                {alertThreshold ? `≥ ${alertThreshold}` : "Alerts"}
+                {alertThreshold ? (
+                  <span data-testid="alert-count" className="ml-1 rounded-sm bg-white/25 px-1 text-[10px]">{alertCount}</span>
+                ) : (
+                  <ChevronDown size={13} />
+                )}
+              </button>
+              {alertOpen && (
+                <div className="absolute right-0 z-30 mt-1 w-40 border border-zinc-200 bg-white shadow-sm">
+                  <button
+                    data-testid="alert-off"
+                    onClick={() => { setAlertThreshold(null); setOnlyAlerts(false); setAlertOpen(false); }}
+                    className={`mono block w-full px-3 py-1.5 text-left text-[12px] hover:bg-zinc-50 ${!alertThreshold ? "text-zinc-900 font-semibold" : "text-zinc-500"}`}
+                  >
+                    Off
+                  </button>
+                  <div className="max-h-56 overflow-y-auto scan-scroll">
+                    {THRESHOLDS.map((th) => (
+                      <button
+                        key={th}
+                        data-testid={`alert-threshold-${th}`}
+                        onClick={() => { setAlertThreshold(th); setAlertOpen(false); }}
+                        className={`mono block w-full px-3 py-1.5 text-left text-[12px] hover:bg-zinc-50 ${alertThreshold === th ? "text-[#002FA7] font-semibold" : "text-zinc-600"}`}
+                      >
+                        ≥ {th} trades
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {alertThreshold && (
+              <>
+                <button
+                  data-testid="only-alerts-toggle"
+                  onClick={() => setOnlyAlerts((o) => !o)}
+                  className={`mono border px-2 py-1 text-[11px] transition-colors ${
+                    onlyAlerts ? "border-[#002FA7] text-[#002FA7]" : "border-zinc-200 text-zinc-500 hover:border-zinc-400"
+                  }`}
+                >
+                  Only alerts
+                </button>
+                <button
+                  data-testid="mute-toggle"
+                  aria-label="toggle alert sound"
+                  onClick={() => setMuted((m) => !m)}
+                  className="border border-zinc-200 p-1 text-zinc-500 hover:border-zinc-400"
+                >
+                  {muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+                </button>
+              </>
+            )}
+          </div>
+
           <div className="relative">
             <button
               data-testid="sort-toggle"
@@ -204,25 +342,27 @@ export default function Scanner() {
 
       {/* Virtualized body */}
       <div ref={parentRef} className="scan-scroll flex-1 min-h-0 overflow-y-auto" data-testid="token-table">
-        {tokens.length === 0 ? (
+        {displayTokens.length === 0 ? (
           <div className="flex h-40 items-center justify-center mono text-[13px] text-zinc-400" data-testid="warming-state">
-            {connected ? "No tokens match your search." : "Connecting to Binance…"}
+            {!connected ? "Connecting to Binance…" : (onlyAlerts && alertThreshold) ? `No tokens above ${alertThreshold} trades yet.` : "No tokens match your search."}
           </div>
         ) : (
           <div style={{ height: rowVirtualizer.getTotalSize(), position: "relative", width: "100%" }}>
             {rowVirtualizer.getVirtualItems().map((vi) => {
-              const t = tokens[vi.index];
+              const t = displayTokens[vi.index];
               const up = t.change >= 0;
               const flash = t.dir === 1 ? "flash-up" : t.dir === -1 ? "flash-down" : "";
+              const isAlert = alertThreshold && t.trades >= alertThreshold;
               return (
                 <div
                   key={t.symbol}
                   data-testid={`token-row-${t.symbol}`}
-                  className="grid grid-cols-[44px_minmax(120px,1.4fr)_1fr_0.9fr_1.1fr_1fr_1.1fr] items-center border-b border-zinc-100 px-4 text-[13px] hover:bg-zinc-50"
-                  style={{ position: "absolute", top: 0, left: 0, width: "100%", height: ROW_H, transform: `translateY(${vi.start}px)` }}
+                  className={`grid grid-cols-[44px_minmax(120px,1.4fr)_1fr_0.9fr_1.1fr_1fr_1.1fr] items-center border-b border-zinc-100 px-4 text-[13px] hover:bg-zinc-50 ${isAlert ? "bg-[#002FA7]/[0.04]" : ""}`}
+                  style={{ position: "absolute", top: 0, left: 0, width: "100%", height: ROW_H, transform: `translateY(${vi.start}px)`, boxShadow: isAlert ? "inset 3px 0 0 #002FA7" : "none" }}
                 >
                   <div className="mono tnum text-[11px] text-zinc-300">{vi.index + 1}</div>
                   <div className="flex items-baseline gap-1">
+                    {isAlert && <BellRing size={11} className="text-[#002FA7]" data-testid={`alert-flag-${t.symbol}`} />}
                     <span className="mono font-semibold text-zinc-900">{t.base}</span>
                     <span className="mono text-[10px] text-zinc-300">/USDT</span>
                   </div>
@@ -230,7 +370,7 @@ export default function Scanner() {
                   <div className={`mono tnum text-right ${up ? "text-[#00C805]" : "text-[#FF3B30]"}`}>
                     {fmtPct(t.change)}
                   </div>
-                  <div className={`mono tnum text-right font-semibold text-zinc-900 px-1 ${flash}`}>
+                  <div className={`mono tnum text-right font-semibold px-1 ${isAlert ? "text-[#002FA7]" : "text-zinc-900"} ${flash}`}>
                     {withCommas(t.trades)}
                   </div>
                   <div className="mono tnum text-right text-zinc-400">{withCommas(t.trades24h)}</div>
@@ -253,10 +393,16 @@ export default function Scanner() {
         <span data-testid="footer-trades">
           Σ trades ({timeframe}): <b className="text-zinc-600">{withCommas(meta.totalTrades)}</b>
         </span>
+        {alertThreshold && (
+          <span data-testid="footer-alerts" className="flex items-center gap-1 text-[#002FA7]">
+            <BellRing size={10} /> {alertCount} above {alertThreshold}
+          </span>
+        )}
         <span className="ml-auto">
           history depth {meta.historyDepthSec ? Math.round(meta.historyDepthSec) + "s" : "0s"} · refresh 1s · src data-api.binance.vision
         </span>
       </footer>
+      <Toaster position="bottom-right" toastOptions={{ className: "mono" }} />
     </div>
   );
 }

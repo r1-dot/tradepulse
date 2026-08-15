@@ -19,7 +19,8 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Real-time trade-count engine across all 15 timeframes for ~671 USDT pairs (exact via lastId diff)
 - `/api/tokens` (timeframe, search, sort, limit), `/api/token/{symbol}`, `/api/engine/status`, `/api/timeframes`, `/api/market-overview`
 - Virtualized dashboard: market-overview strip, 15 timeframe pills, sortable/searchable table, live status, 1s auto-refresh, footer aggregates
-- Tested: 22/23 backend, 100% frontend
+- **Trade Alerts** (client-side): thresholds 50/100/200/300/400/500/600/700/800/900/1000/1300/1500/2000; row highlight + bell flag, toast + audio beep on new crossings, "Only alerts" filter, mute toggle, live alert count in header/footer
+- Tested: 22/23 backend (iter1), 100% frontend alerts (iter2)
 
 ## Known Gaps / Notes
 - CoinGecko rate-limits (429) without an API key → Total Mkt Cap/Dominance/Active Coins show "—". Add COINGECKO_API_KEY or COINMARKETCAP_API_KEY.
