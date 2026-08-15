@@ -1,0 +1,3 @@
+/* dashboard uses tailwind + index.css; keep this minimal */
+.App { min-height: 100vh; }
+::selection { background: #002FA7; color: #fff; }

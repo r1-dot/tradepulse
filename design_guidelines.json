@@ -1,0 +1,106 @@
+{
+  "theme": {
+    "mode": "light",
+    "background": "white",
+    "archetype": "Swiss & High-Contrast (Authority, Clarity, Truth)",
+    "description": "A pristine, ultra-functional, high-density dashboard inspired by Bloomberg Terminals but executed in a brilliant light theme. Relies on stark white backgrounds, dense grid logic, and monospaced typography to display thousands of data points without visual fatigue."
+  },
+  "typography": {
+    "rules": [
+      "NO Inter for headings. Use 'Cabinet Grotesk' or 'Chivo' for any large display text (market overview stats, logo marks).",
+      "MANDATORY: Use 'JetBrains Mono' or 'Roboto Mono' for ALL numbers, ticker symbols, and table data. This ensures tabular figures align perfectly when scanning 600+ rows.",
+      "Use 'Inter' or 'IBM Plex Sans' strictly for small UI labels, table headers, and tooltips.",
+      "Apply 'tracking-tight' to headings and 'tracking-tighter' to large metrics.",
+      "Use fluid typography scales, capping H1s at text-4xl due to the dashboard nature (we need screen real estate)."
+    ],
+    "fonts": {
+      "heading": "Cabinet Grotesk",
+      "mono": "JetBrains Mono",
+      "body": "Inter"
+    }
+  },
+  "colors": {
+    "background": {
+      "primary": "#FFFFFF",
+      "secondary": "#FAFAFA",
+      "tertiary": "#F4F4F5"
+    },
+    "text": {
+      "primary": "#0A0A0A",
+      "secondary": "#52525B",
+      "muted": "#A1A1AA"
+    },
+    "border": {
+      "default": "#E4E4E7",
+      "focus": "#18181B"
+    },
+    "accents": {
+      "positive": "#00C805",
+      "negative": "#FF3B30",
+      "active_blue": "#002FA7",
+      "warning": "#F5A623"
+    }
+  },
+  "spacing_and_layout": {
+    "philosophy": "High-Density Table Protocol. We are building a command center.",
+    "table_density": "Row heights must be tight (32px - 36px) to maximize data visibility. Padding inside table cells should be py-1 px-2 or py-1.5 px-3.",
+    "bento_grid": "Use Mode B: High Density Grid for the top market overview strip. gap-2 or gap-4. Every pixel must be utilized.",
+    "structure": [
+      "Top Header: Brand, Live Status Indicator (pulsing dot), Global Search.",
+      "Market Overview Strip: 4-5 small Bento metrics (BTC price, ETH gas, Total Market Cap, 24h Vol) using CoinGecko/Coinbase data concepts.",
+      "Control Bar: Sticky row containing the 15 Timeframe toggle pills (1s, 5s... 10d) + Filters.",
+      "Main Scanner: Virtualized Data Table taking up exactly the remaining viewport height (h-[calc(100vh-200px)]). The table MUST NOT cause page-level scroll; the table body itself scrolls."
+    ]
+  },
+  "components": {
+    "instructions_to_main_agent": [
+      "VIRTUALIZATION IS MANDATORY: You must use @tanstack/react-virtual or react-window for the token list. Rendering 600+ DOM nodes that update every 1 second will crash the browser without it.",
+      "TIMEFRAME SELECTOR: Create a horizontally scrollable segmented control for the 15 timeframes. Active state should be a crisp border or solid black background with white text. Inactive should be transparent with dark gray text.",
+      "TABLE DESIGN: Flat, solid surfaces. 1px bottom border on rows (border-zinc-100). Hover state on rows: bg-zinc-50. Freeze the header and the first column (Ticker Symbol). Numeric columns MUST be text-right.",
+      "ICONS: Install and use 'react-icons' for API brand logos (SiBinance, SiCoinbase, FaEthereum, FaBitcoin) rather than trying to load external images. For general UI, use 'lucide-react'."
+    ],
+    "customizations": [
+      "Do NOT use thick Shadcn cards for the main table. Strip away shadows entirely.",
+      "Data Ticking Animation: When a trade count updates, briefly flash the cell background or text color (green/red) and fade back to neutral within 500ms using CSS transitions.",
+      "Inputs/Search: Use 'border-b-2' minimal style or ultra-crisp rectangular inputs. No pill-shaped search bars."
+    ]
+  },
+  "visual_enhancers": {
+    "rules": [
+      "Use optical clarity: borders are #E4E4E7 (zinc-200), not muddy grays.",
+      "The 'Live' indicator should be a small 8px pulsing green circle (use framer-motion or CSS keyframes for a ping effect) located in the header.",
+      "Empty space is not wasted space in the control bar. Group timeframe toggles on the left, search/filter on the right."
+    ]
+  },
+  "motion": {
+    "rules": [
+      "Keep standard UI motion fast (0.15s ease).",
+      "Data updates must NOT cause layout shifts. Use tabular-nums (font-variant-numeric: tabular-nums) in CSS to keep digit widths static.",
+      "Hover states on table rows must be instantaneous to feel performant."
+    ]
+  },
+  "accessibility": {
+    "rules": [
+      "Ensure color contrast for text exceeds 4.5:1. (e.g., #52525B on #FFFFFF).",
+      "Do NOT rely on color alone to indicate change; use up/down arrows or +/- signs where relevant.",
+      "Add explicit aria-labels to the timeframe buttons.",
+      "Add 'data-testid' to ALL interactive elements (e.g., data-testid='timeframe-btn-1s', data-testid='token-row-BTCUSDT', data-testid='search-input')."
+    ]
+  },
+  "media_and_icons": {
+    "strategy": "Vector over Raster. The UI is too dense and professional for generic stock photos.",
+    "image_urls": {},
+    "libraries": [
+      "react-icons (for SiBinance, SiEthereum, SiCoinbase, FaBitcoin)",
+      "lucide-react (for search, filter, sort arrows)"
+    ]
+  },
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "You MUST NOT apply universal transition (e.g., transition: all). Add transitions ONLY for specific properties.",
+    "Do NOT use thick gradients, shadows, or rounded-3xl corners. This is a pro-trading tool, not a consumer social app.",
+    "Use tabular-nums class on all numbers to prevent horizontal jitter during the 1-second auto-refresh.",
+    "Do NOT center align the app container. Full width, max-w-full, left-aligned standard dashboard layout.",
+    "Install and setup @tanstack/react-virtual immediately—the app requires handling massive DOM updates.",
+    "Build the 15 timeframe options exactly as requested: 1s, 5s, 15s, 30s, 1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 4d, 7d, 10d."
+  ]
+}
