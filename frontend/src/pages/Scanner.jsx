@@ -116,7 +116,8 @@ export default function Scanner() {
               return {
                 id: `${sym}-${now}-${Math.random().toString(36).slice(2, 7)}`,
                 symbol: sym, base: r.base, threshold: th, trades: r.trades,
-                timeframe: cfg.current.timeframe, change: r.change, side: r.side, ts: now,
+                timeframe: cfg.current.timeframe, change: r.change, side: r.side,
+                volume: r.quoteVol, ts: now,
               };
             });
             setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
@@ -499,6 +500,9 @@ export default function Scanner() {
                       <div className="mono tnum text-[13px] font-semibold text-[#002FA7]">{withCommas(h.trades)}</div>
                       <div className={`mono tnum text-[10px] ${h.change >= 0 ? "text-[#00C805]" : "text-[#FF3B30]"}`}>
                         {fmtPct(h.change)}
+                      </div>
+                      <div data-testid={`history-vol-${i}`} className="mono tnum text-[10px] text-zinc-400">
+                        vol {compactUsd(h.volume)}
                       </div>
                     </div>
                   </div>
