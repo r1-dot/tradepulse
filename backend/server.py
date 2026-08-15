@@ -101,7 +101,7 @@ async def poll_binance(http: httpx.AsyncClient):
                     "count24h": int(x["count"]),
                     "lastId": last_id,
                 }
-                snap[sym] = last_id
+                snap[sym] = (last_id, latest[sym]["price"])
             if latest:
                 STATE["latest"] = latest
                 STATE["fine"].append((now, snap))
@@ -133,22 +133,34 @@ def _find_ref(target_ts: float) -> Optional[dict]:
     return best
 
 
+def _side(change: float) -> str:
+    return "buy" if change >= 0 else "sell"
+
+
 def compute_trades(window: int):
-    """Return (dict symbol->trade_count, is_approx)."""
+    """Return (dict symbol -> {"trades": int, "side": "buy"|"sell"}, is_approx).
+
+    side = net aggressor direction over the window, derived from price movement:
+    price up over the window => net buying, price down => net selling.
+    """
     latest = STATE["latest"]
-    if window == DAY:  # exact from ticker
-        return {s: v["count24h"] for s, v in latest.items()}, False
+    if window == DAY:  # exact trade count from ticker; side from 24h change
+        return ({s: {"trades": v["count24h"], "side": _side(v["change"])}
+                 for s, v in latest.items()}, False)
     now = time.time()
     ref = _find_ref(now - window)
     if ref is None:
-        return ({s: round(v["count24h"] * window / DAY) for s, v in latest.items()}, True)
+        return ({s: {"trades": round(v["count24h"] * window / DAY), "side": _side(v["change"])}
+                 for s, v in latest.items()}, True)
     out = {}
     for s, v in latest.items():
         then = ref.get(s)
         if then is None:
-            out[s] = round(v["count24h"] * window / DAY)
+            out[s] = {"trades": round(v["count24h"] * window / DAY), "side": _side(v["change"])}
         else:
-            out[s] = max(0, v["lastId"] - then)
+            then_id, then_price = then
+            side = "buy" if v["price"] >= then_price else "sell"
+            out[s] = {"trades": max(0, v["lastId"] - then_id), "side": side}
     return out, False
 
 
@@ -206,7 +218,8 @@ async def get_tokens(
     for sym, v in latest.items():
         if q and q not in sym:
             continue
-        tc = trades.get(sym, 0)
+        cell = trades.get(sym) or {"trades": 0, "side": "buy"}
+        tc = cell["trades"]
         total_trades += tc
         rows.append({
             "symbol": sym,
@@ -215,6 +228,7 @@ async def get_tokens(
             "change": v["change"],
             "quoteVol": v["quoteVol"],
             "trades": tc,
+            "side": cell["side"],
             "trades24h": v["count24h"],
         })
 
@@ -250,7 +264,8 @@ async def token_detail(symbol: str):
     tf_counts = {}
     for name, secs in TIMEFRAMES:
         counts, approx = compute_trades(secs)
-        tf_counts[name] = {"trades": counts.get(symbol, 0), "approx": approx}
+        cell = counts.get(symbol) or {"trades": 0, "side": "buy"}
+        tf_counts[name] = {"trades": cell["trades"], "side": cell["side"], "approx": approx}
     return {"symbol": symbol, "base": v["base"], "price": v["price"],
             "change": v["change"], "quoteVol": v["quoteVol"],
             "trades24h": v["count24h"], "timeframes": tf_counts}

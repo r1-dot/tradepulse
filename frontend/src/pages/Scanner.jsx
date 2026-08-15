@@ -116,7 +116,7 @@ export default function Scanner() {
               return {
                 id: `${sym}-${now}-${Math.random().toString(36).slice(2, 7)}`,
                 symbol: sym, base: r.base, threshold: th, trades: r.trades,
-                timeframe: cfg.current.timeframe, change: r.change, ts: now,
+                timeframe: cfg.current.timeframe, change: r.change, side: r.side, ts: now,
               };
             });
             setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
@@ -400,8 +400,18 @@ export default function Scanner() {
                   <div className={`mono tnum text-right ${up ? "text-[#00C805]" : "text-[#FF3B30]"}`}>
                     {fmtPct(t.change)}
                   </div>
-                  <div className={`mono tnum text-right font-semibold px-1 ${isAlert ? "text-[#002FA7]" : "text-zinc-900"} ${flash}`}>
-                    {withCommas(t.trades)}
+                  <div className={`text-right px-1 ${flash}`}>
+                    <div className="flex items-center justify-end gap-1.5">
+                      <span
+                        data-testid={`side-${t.symbol}`}
+                        className={`text-[9px] font-semibold uppercase tracking-wide ${t.side === "buy" ? "text-[#00C805]" : "text-[#FF3B30]"}`}
+                      >
+                        {t.side === "buy" ? "buying" : "selling"}
+                      </span>
+                      <span className={`mono tnum font-semibold ${isAlert ? "text-[#002FA7]" : "text-zinc-900"}`}>
+                        {withCommas(t.trades)}
+                      </span>
+                    </div>
                   </div>
                   <div className="mono tnum text-right text-zinc-400">{withCommas(t.trades24h)}</div>
                   <div className="mono tnum text-right text-zinc-500">{compactUsd(t.quoteVol)}</div>
@@ -482,7 +492,7 @@ export default function Scanner() {
                         {h.base}<span className="text-[10px] text-zinc-300">/USDT</span>
                       </div>
                       <div className="mono text-[10px] text-zinc-400">
-                        crossed ≥ {h.threshold} · {h.timeframe}
+                        crossed ≥ {h.threshold} · {h.timeframe} · <span className={h.side === "buy" ? "text-[#00C805]" : "text-[#FF3B30]"}>{h.side === "buy" ? "buying" : "selling"}</span>
                       </div>
                     </div>
                     <div className="text-right">
