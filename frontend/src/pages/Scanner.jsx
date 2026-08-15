@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { SiBinance } from "react-icons/si";
-import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX } from "lucide-react";
+import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2 } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import MarketOverview from "@/components/MarketOverview";
 import { withCommas, compactUsd, fmtPrice, fmtPct } from "@/lib/format";
@@ -20,6 +20,11 @@ const SORTS = [
 ];
 const THRESHOLDS = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1300, 1500, 2000];
 const ROW_H = 34;
+
+const fmtClock = (ts) => {
+  const d = new Date(ts);
+  return d.toLocaleTimeString("en-US", { hour12: false });
+};
 
 let _audioCtx = null;
 function beep() {
@@ -55,6 +60,8 @@ export default function Scanner() {
   const [onlyAlerts, setOnlyAlerts] = useState(false);
   const [muted, setMuted] = useState(false);
   const [alertCount, setAlertCount] = useState(0);
+  const [alertHistory, setAlertHistory] = useState([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const prevTrades = useRef({});
   const parentRef = useRef(null);
@@ -103,6 +110,16 @@ export default function Scanner() {
           alertingRef.current = nowAlerting;
           if (crossed.length) {
             if (!cfg.current.muted) beep();
+            const now = Date.now();
+            const entries = crossed.map((sym) => {
+              const r = rows.find((x) => x.symbol === sym);
+              return {
+                id: `${sym}-${now}-${Math.random().toString(36).slice(2, 7)}`,
+                symbol: sym, base: r.base, threshold: th, trades: r.trades,
+                timeframe: cfg.current.timeframe, change: r.change, ts: now,
+              };
+            });
+            setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
             crossed.slice(0, 3).forEach((sym) => {
               const r = rows.find((x) => x.symbol === sym);
               toast(`${r.base}/USDT crossed ${th} trades`, {
@@ -301,6 +318,19 @@ export default function Scanner() {
             )}
           </div>
 
+          <button
+            data-testid="history-toggle"
+            onClick={() => setHistoryOpen(true)}
+            className="mono flex items-center gap-1 border border-zinc-200 px-2.5 py-1 text-[12px] text-zinc-700 hover:border-zinc-400"
+          >
+            <History size={13} /> Log
+            {alertHistory.length > 0 && (
+              <span data-testid="history-badge" className="ml-0.5 rounded-sm bg-zinc-900 px-1 text-[10px] text-white">
+                {alertHistory.length}
+              </span>
+            )}
+          </button>
+
           <div className="relative">
             <button
               data-testid="sort-toggle"
@@ -403,6 +433,71 @@ export default function Scanner() {
         </span>
       </footer>
       <Toaster position="bottom-right" toastOptions={{ className: "mono" }} />
+
+      {/* Alert history slide-over */}
+      {historyOpen && (
+        <div className="fixed inset-0 z-40" data-testid="alert-history-panel">
+          <div className="absolute inset-0 bg-black/20" onClick={() => setHistoryOpen(false)} />
+          <div className="absolute right-0 top-0 flex h-full w-[400px] max-w-[90vw] flex-col border-l border-zinc-200 bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3">
+              <div className="flex items-center gap-2">
+                <BellRing size={15} className="text-[#002FA7]" />
+                <span className="font-heading text-[15px] font-bold tracking-tight text-zinc-900" style={{ fontWeight: 700 }}>
+                  Alert History
+                </span>
+                <span className="mono text-[11px] text-zinc-400">{alertHistory.length}</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  data-testid="history-clear"
+                  onClick={() => setAlertHistory([])}
+                  className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[11px] text-zinc-600 hover:border-zinc-400"
+                >
+                  <Trash2 size={12} /> Clear
+                </button>
+                <button
+                  data-testid="history-close"
+                  onClick={() => setHistoryOpen(false)}
+                  className="border border-zinc-200 p-1 text-zinc-600 hover:border-zinc-400"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+            <div className="scan-scroll flex-1 overflow-y-auto">
+              {alertHistory.length === 0 ? (
+                <div data-testid="history-empty" className="flex h-40 items-center justify-center px-6 text-center mono text-[12px] text-zinc-400">
+                  No alerts logged yet. Arm a threshold from the Alerts menu; every token that crosses it will appear here.
+                </div>
+              ) : (
+                alertHistory.map((h, i) => (
+                  <div
+                    key={h.id}
+                    data-testid={`history-item-${i}`}
+                    className="flex items-center gap-3 border-b border-zinc-100 px-4 py-2 hover:bg-zinc-50"
+                  >
+                    <div className="mono text-[10px] text-zinc-400 w-16 shrink-0">{fmtClock(h.ts)}</div>
+                    <div className="flex-1 min-w-0">
+                      <div className="mono text-[13px] font-semibold text-zinc-900">
+                        {h.base}<span className="text-[10px] text-zinc-300">/USDT</span>
+                      </div>
+                      <div className="mono text-[10px] text-zinc-400">
+                        crossed ≥ {h.threshold} · {h.timeframe}
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="mono tnum text-[13px] font-semibold text-[#002FA7]">{withCommas(h.trades)}</div>
+                      <div className={`mono tnum text-[10px] ${h.change >= 0 ? "text-[#00C805]" : "text-[#FF3B30]"}`}>
+                        {fmtPct(h.change)}
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,0 +1,22 @@
+{
+  "summary": "Validated new Alert History log panel and regression of prior alert/scanner features. All flows work end-to-end: history-toggle opens the slide-over, empty state shows initially, arming threshold 50 on 1s produces multiple crossings within ~10s, each rendered as history-item-<i> with time (fmtClock HH:MM:SS), SYMBOL/USDT, 'crossed ≥ 50 · 1s', trade count, and % change; history-badge on toggle button reflects count (observed 4). history-clear empties list (empty state returns). history-close and clicking dark overlay both close the panel. Regression: search-input (BTC filter), timeframe switch (5m), sort (change_desc), mute-toggle, only-alerts-toggle all functional.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": ["/app/test_reports/iteration_3.json"],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Scanner.jsx is ~500 lines and starting to grow; consider extracting AlertHistoryPanel into its own component along with the alerts control cluster to keep the page focused.",
+    "history-badge shows raw count; may consider capping display (e.g., 99+) when list approaches 300 cap for aesthetics.",
+    "Overlay div does not carry a dedicated data-testid; tests must rely on structural selector. Consider adding data-testid='history-overlay' for robustness."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "n/a", "frontend": "100%"},
+  "seed_data_creation": "None (live Binance data via /api/tokens).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Alert History (iteration_3) validated end-to-end. Threshold 50 on 1s reliably produces crossings within ~10s. If retesting, prefer 1s + 50 (not 1d + 1000 – 1d rows are large but crossings only log for NEW arrivals after arming). History cap is 300; slice([0,300]) confirmed in code."
+}
