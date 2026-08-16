@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { SiBinance } from "react-icons/si";
-import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2, Cpu } from "lucide-react";
+import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2, Cpu, Download } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import MarketOverview from "@/components/MarketOverview";
 import { withCommas, compactUsd, fmtPrice, fmtPct } from "@/lib/format";
@@ -19,6 +19,8 @@ const SORTS = [
   { key: "symbol_asc", label: "A → Z" },
 ];
 const THRESHOLDS = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1300, 1500, 2000];
+const VOL_THRESHOLDS = [100, 200, 300, 400, 500, 600, 700, 1000]; // in USD millions
+const fmtVol = (m) => (m >= 1000 ? `$${(m / 1000).toFixed(m % 1000 ? 1 : 0)}B` : `$${m}M`);
 const TF_SECONDS = { "1s": 1, "5s": 5, "15s": 15, "30s": 30, "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400, "4d": 345600, "7d": 604800, "10d": 864000 };
 // Algorithmic-trade footprint: high trade rate + small average order size + a burst
 // above the token's normal 24h rate. Sensitivity loosens/tightens the thresholds.
@@ -76,6 +78,11 @@ export default function Scanner() {
   const [onlyAlgo, setOnlyAlgo] = useState(false);
   const [algoCount, setAlgoCount] = useState(0);
   const [pressure, setPressure] = useState("all"); // all | buy | sell
+  const [volThreshold, setVolThreshold] = useState(null); // USD
+  const [volOpen, setVolOpen] = useState(false);
+  const [volAlertCount, setVolAlertCount] = useState(0);
+  const [flipOn, setFlipOn] = useState(false);
+  const [flipCount, setFlipCount] = useState(0);
 
   const prevTrades = useRef({});
   const parentRef = useRef(null);
@@ -83,10 +90,14 @@ export default function Scanner() {
   const seedRef = useRef(false);
   const algoRef = useRef(new Set());
   const algoSeedRef = useRef(false);
+  const volAlertingRef = useRef(new Set());
+  const volSeedRef = useRef(false);
+  const prevSideRef = useRef(new Map());
+  const flipSeedRef = useRef(false);
 
   // stable refs for interval callback
-  const cfg = useRef({ timeframe, sort, search, alertThreshold, muted, algoOn, algoSens });
-  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens };
+  const cfg = useRef({ timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn });
+  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn };
 
   const fetchTokens = useCallback(async () => {
     const { timeframe, sort, search } = cfg.current;
@@ -204,6 +215,88 @@ export default function Scanner() {
         algoRef.current = new Set();
         setAlgoCount(0);
       }
+
+      // ---- volume-category alerts (24h quote volume crosses threshold) ----
+      const vth = cfg.current.volThreshold;
+      if (vth) {
+        const nowVol = new Set();
+        for (const r of rows) if (r.quoteVol >= vth) nowVol.add(r.symbol);
+        setVolAlertCount(nowVol.size);
+        if (volSeedRef.current) {
+          volAlertingRef.current = nowVol;
+          volSeedRef.current = false;
+        } else {
+          const newly = [...nowVol].filter((x) => !volAlertingRef.current.has(x));
+          volAlertingRef.current = nowVol;
+          if (newly.length) {
+            if (!cfg.current.muted) beep();
+            const now = Date.now();
+            const label = fmtVol(vth / 1e6);
+            const entries = newly.map((sym) => {
+              const r = rows.find((x) => x.symbol === sym);
+              return {
+                id: `vol-${sym}-${now}-${Math.random().toString(36).slice(2, 7)}`,
+                kind: "volume", symbol: sym, base: r.base, trades: r.trades,
+                timeframe: cfg.current.timeframe, change: r.change, side: r.side,
+                volume: r.quoteVol, threshold: vth, ts: now,
+                reason: `24h volume crossed ${label}`,
+              };
+            });
+            setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
+            newly.slice(0, 3).forEach((sym) => {
+              const r = rows.find((x) => x.symbol === sym);
+              toast(`${r.base}/USDT — volume > ${label}`, {
+                description: `24h volume ${compactUsd(r.quoteVol)}`,
+              });
+            });
+            if (newly.length > 3) toast(`+${newly.length - 3} more tokens crossed ${label} volume`);
+          }
+        }
+      } else {
+        volAlertingRef.current = new Set();
+        setVolAlertCount(0);
+      }
+
+      // ---- pressure-flip alerts (buying <-> selling) ----
+      if (cfg.current.flipOn) {
+        const m = prevSideRef.current;
+        if (flipSeedRef.current) {
+          const seed = new Map();
+          for (const r of rows) seed.set(r.symbol, r.side);
+          prevSideRef.current = seed;
+          flipSeedRef.current = false;
+          setFlipCount(0);
+        } else {
+          const flips = [];
+          for (const r of rows) {
+            const before = m.get(r.symbol);
+            if (before && before !== r.side && r.trades >= 5) flips.push(r);
+            m.set(r.symbol, r.side);
+          }
+          setFlipCount(flips.length);
+          if (flips.length) {
+            if (!cfg.current.muted) beep();
+            const now = Date.now();
+            const entries = flips.slice(0, 50).map((r) => ({
+              id: `flip-${r.symbol}-${now}-${Math.random().toString(36).slice(2, 7)}`,
+              kind: "flip", symbol: r.symbol, base: r.base, trades: r.trades,
+              timeframe: cfg.current.timeframe, change: r.change, side: r.side,
+              volume: r.quoteVol, ts: now,
+              reason: `flipped to ${r.side === "buy" ? "buying" : "selling"}`,
+            }));
+            setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
+            flips.slice(0, 3).forEach((r) => {
+              toast(`${r.base}/USDT flipped to ${r.side === "buy" ? "BUYING" : "SELLING"}`, {
+                description: `${withCommas(r.trades)} trades in ${cfg.current.timeframe}`,
+              });
+            });
+            if (flips.length > 3) toast(`+${flips.length - 3} more tokens flipped`);
+          }
+        }
+      } else {
+        prevSideRef.current = new Map();
+        setFlipCount(0);
+      }
     } catch (e) {
       // keep last data on transient errors
     }
@@ -220,8 +313,10 @@ export default function Scanner() {
   useEffect(() => {
     seedRef.current = true;
     algoSeedRef.current = true;
+    volSeedRef.current = true;
+    flipSeedRef.current = true;
     fetchTokens();
-  }, [timeframe, sort, search, alertThreshold, algoOn, algoSens, fetchTokens]);
+  }, [timeframe, sort, search, alertThreshold, algoOn, algoSens, volThreshold, flipOn, fetchTokens]);
 
   // engine status + market overview
   useEffect(() => {
@@ -260,6 +355,34 @@ export default function Scanner() {
     () => SORTS.find((s) => s.key === sort)?.label || "Sort",
     [sort]
   );
+
+  const exportCSV = useCallback(() => {
+    if (!alertHistory.length) return;
+    const headers = ["time", "type", "symbol", "timeframe", "side", "trades", "threshold", "volume_usd", "change_pct", "reason"];
+    const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const lines = alertHistory.map((h) => [
+      new Date(h.ts).toISOString(),
+      h.kind || "threshold",
+      `${h.base}USDT`,
+      h.timeframe,
+      h.side === "buy" ? "buying" : "selling",
+      h.trades,
+      h.threshold ?? "",
+      Math.round(h.volume || 0),
+      h.change ?? "",
+      h.reason || "",
+    ].map(esc).join(","));
+    const csv = [headers.join(","), ...lines].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `tradepulse-alerts-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [alertHistory]);
 
   const connected = status.connected;
 
@@ -411,6 +534,58 @@ export default function Scanner() {
             )}
           </div>
 
+          {/* Volume-category alerts */}
+          <div className="relative" data-testid="vol-controls">
+            <button
+              data-testid="vol-toggle"
+              onClick={() => setVolOpen((o) => !o)}
+              className={`mono flex items-center gap-1 border px-2.5 py-1 text-[12px] transition-colors ${
+                volThreshold ? "border-[#0E7490] bg-[#0E7490] text-white" : "border-zinc-200 text-zinc-700 hover:border-zinc-400"
+              }`}
+            >
+              Vol {volThreshold ? `≥ ${fmtVol(volThreshold / 1e6)}` : ""}
+              {volThreshold ? (
+                <span data-testid="vol-count" className="ml-0.5 rounded-sm bg-white/25 px-1 text-[10px]">{volAlertCount}</span>
+              ) : (
+                <ChevronDown size={13} />
+              )}
+            </button>
+            {volOpen && (
+              <div className="absolute right-0 z-30 mt-1 w-36 border border-zinc-200 bg-white shadow-sm">
+                <button
+                  data-testid="vol-off"
+                  onClick={() => { setVolThreshold(null); setVolOpen(false); }}
+                  className={`mono block w-full px-3 py-1.5 text-left text-[12px] hover:bg-zinc-50 ${!volThreshold ? "text-zinc-900 font-semibold" : "text-zinc-500"}`}
+                >
+                  Off
+                </button>
+                {VOL_THRESHOLDS.map((m) => (
+                  <button
+                    key={m}
+                    data-testid={`vol-threshold-${m}`}
+                    onClick={() => { setVolThreshold(m * 1e6); setVolOpen(false); }}
+                    className={`mono block w-full px-3 py-1.5 text-left text-[12px] hover:bg-zinc-50 ${volThreshold === m * 1e6 ? "text-[#0E7490] font-semibold" : "text-zinc-600"}`}
+                  >
+                    ≥ {fmtVol(m)} vol
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Pressure-flip alerts */}
+          <button
+            data-testid="flip-toggle"
+            onClick={() => setFlipOn((o) => !o)}
+            className={`mono flex items-center gap-1 border px-2.5 py-1 text-[12px] transition-colors ${
+              flipOn ? "border-zinc-900 bg-zinc-900 text-white" : "border-zinc-200 text-zinc-700 hover:border-zinc-400"
+            }`}
+            title="Alert when a token flips between buying and selling"
+          >
+            <ArrowUp size={11} /><ArrowDown size={11} /> Flip
+            {flipOn && <span data-testid="flip-count" className="ml-0.5 rounded-sm bg-white/25 px-1 text-[10px]">{flipCount}</span>}
+          </button>
+
           {/* Algo detection */}
           <div className="flex items-center gap-1.5" data-testid="algo-controls">
             <button
@@ -529,6 +704,7 @@ export default function Scanner() {
               const flash = t.dir === 1 ? "flash-up" : t.dir === -1 ? "flash-down" : "";
               const isAlert = alertThreshold && t.trades >= alertThreshold;
               const isAlgo = algoOn && t.algo;
+              const isVol = volThreshold && t.quoteVol >= volThreshold;
               return (
                 <div
                   key={t.symbol}
@@ -548,6 +724,15 @@ export default function Scanner() {
                         className="ml-1 inline-flex items-center gap-0.5 self-center rounded-sm bg-[#F5A623]/15 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-[#B26A00]"
                       >
                         <Cpu size={8} /> algo
+                      </span>
+                    )}
+                    {isVol && (
+                      <span
+                        data-testid={`vol-flag-${t.symbol}`}
+                        title={`24h volume ${compactUsd(t.quoteVol)}`}
+                        className="ml-1 inline-flex items-center self-center rounded-sm bg-[#0E7490]/15 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-[#0E7490]"
+                      >
+                        vol
                       </span>
                     )}
                   </div>
@@ -598,6 +783,16 @@ export default function Scanner() {
             <Cpu size={10} /> {algoCount} algo
           </span>
         )}
+        {volThreshold && (
+          <span data-testid="footer-vol" className="flex items-center gap-1 text-[#0E7490]">
+            {volAlertCount} ≥ {fmtVol(volThreshold / 1e6)}
+          </span>
+        )}
+        {flipOn && (
+          <span data-testid="footer-flip" className="flex items-center gap-1 text-zinc-600">
+            <ArrowUp size={9} /><ArrowDown size={9} /> {flipCount} flips
+          </span>
+        )}
         <span className="ml-auto">
           history depth {meta.historyDepthSec ? Math.round(meta.historyDepthSec) + "s" : "0s"} · refresh 1s · src data-api.binance.vision
         </span>
@@ -618,6 +813,14 @@ export default function Scanner() {
                 <span className="mono text-[11px] text-zinc-400">{alertHistory.length}</span>
               </div>
               <div className="flex items-center gap-1">
+                <button
+                  data-testid="history-export"
+                  onClick={exportCSV}
+                  disabled={alertHistory.length === 0}
+                  className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[11px] text-zinc-600 hover:border-zinc-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download size={12} /> CSV
+                </button>
                 <button
                   data-testid="history-clear"
                   onClick={() => setAlertHistory([])}
@@ -653,9 +856,15 @@ export default function Scanner() {
                         {h.kind === "algo" && (
                           <span className="inline-flex items-center gap-0.5 rounded-sm bg-[#F5A623]/15 px-1 text-[8px] font-semibold uppercase text-[#B26A00]"><Cpu size={8} /> algo</span>
                         )}
+                        {h.kind === "volume" && (
+                          <span className="inline-flex items-center rounded-sm bg-[#0E7490]/15 px-1 text-[8px] font-semibold uppercase text-[#0E7490]">vol</span>
+                        )}
+                        {h.kind === "flip" && (
+                          <span className="inline-flex items-center rounded-sm bg-zinc-900/10 px-1 text-[8px] font-semibold uppercase text-zinc-700">flip</span>
+                        )}
                       </div>
                       <div className="mono text-[10px] text-zinc-400 truncate">
-                        {h.kind === "algo" ? h.reason : `crossed ≥ ${h.threshold}`} · {h.timeframe} · <span className={h.side === "buy" ? "text-[#00C805]" : "text-[#FF3B30]"}>{h.side === "buy" ? "buying" : "selling"}</span>
+                        {h.kind === "threshold" ? `crossed ≥ ${h.threshold}` : h.reason} · {h.timeframe} · <span className={h.side === "buy" ? "text-[#00C805]" : "text-[#FF3B30]"}>{h.side === "buy" ? "buying" : "selling"}</span>
                       </div>
                     </div>
                     <div className="text-right">

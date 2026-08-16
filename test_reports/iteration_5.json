@@ -1,0 +1,43 @@
+{
+  "summary": "Frontend-only validation of TradePulse Scanner's 3 new features: Volume alerts, Pressure-Flip alerts, and CSV export. All pass. Regression (threshold/algo/pressure/timeframe/1s refresh) unaffected.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "detailed_results": {
+    "volume_alerts": {
+      "vol-toggle_opens_menu": true,
+      "all_thresholds_visible": "100/200/300/400/500/600/700/1000 all present + vol-off",
+      "selecting_100M": "vol-toggle text = 'Vol ≥ $100M4', vol-count badge visible, footer-vol visible, 3 vol-flag- badges rendered on rows",
+      "selecting_1000M": "vol-toggle text = 'Vol ≥ $1B0' (correct $1B label)",
+      "vol-off": "clears footer-vol from DOM"
+    },
+    "flip_alerts": {
+      "flip-toggle_on": "shows flip-count badge and footer-flip",
+      "flip_count_after_15s_on_1s_tf": "6 flips detected (mechanism works, toast 'ACE/USDT flipped to SELLING · 5 trades in 1s' observed)",
+      "flip-toggle_off": "footer-flip removed from DOM",
+      "flip_history_entries": "75 FLIP tags observed in Alert History with 'flipped to buying/selling' reason and vol line"
+    },
+    "csv_export": {
+      "history-export_present": true,
+      "disabled_when_empty": "not tested (log already had entries from earlier polls); after arming alerts button enabled",
+      "download_triggered": true,
+      "filename": "tradepulse-alerts-2026-08-16-13-11-00.csv (starts with 'tradepulse-alerts-')"
+    },
+    "regression": "Threshold alert (alert-threshold-50) armed successfully alongside flip; footer shows '0 above 50 · 2 flips'; 1s live tick refresh active; pairs count 671; multiple alert types coexist"
+  },
+  "test_report_links": [],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Scanner.jsx is 888 lines — consider splitting into hooks/components (alerts, history, controls) for maintainability",
+    "exportCSV filename uses local time via toISOString slice — acceptable but consider ISO with timezone for clarity"
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "N/A (not requested)", "frontend": "100%"},
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "All 3 new features (vol alerts, flip alerts, CSV export) verified end-to-end via Playwright on public URL. Flip mechanism confirmed on 1s timeframe (6 flips in 15s window). CSV download filename validated. History panel renders FLIP/VOL/ALGO tags correctly."
+}
