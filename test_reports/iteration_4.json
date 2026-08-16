@@ -1,0 +1,21 @@
+{
+  "summary": "Frontend-only validation of the new Algo Detect feature on the TradePulse scanner. All algo-related controls and behaviors work as specified: algo-toggle turns ON with amber styling + algo-count badge, sensitivity menu appears with high/med/low options and re-evaluates detections, algo-flag-<SYMBOL> badges render on rows, footer-algo shows 'N algo', only-algo-toggle filters to flagged rows (all filtered rows carry algo-flag), turning OFF removes sensitivity/only-algo controls, footer-algo, count badge, and all algo badges. History panel logs entries with kind='algo' (67 algo entries accumulated) alongside history-vol lines. Regression checks pass: threshold alerts + algo can be simultaneously active, side-<SYMBOL> labels render, timeframe/search/sort still function, 1s auto-refresh continues.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Scanner.jsx is 658 lines and starting to accumulate multiple concerns (alerts, algo, history, virtualization). Consider extracting AlertControls, AlgoControls, and HistoryPanel into dedicated components in a future refactor. Not blocking.",
+    "algo-toggle onClick reads algoOn (stale closure) before setAlgoOn flip when clearing onlyAlgo: `if (algoOn) setOnlyAlgo(false);` clears onlyAlgo when turning OFF, which is the intended behavior — logic is correct but reliance on stale state is fragile; consider using functional updater or a useEffect on algoOn."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "n/a (frontend-only)", "frontend": "100%"},
+  "seed_data_creation": "None. Live Binance data.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Algo Detect feature is fully functional. Observed counts during test: High=4, Med=4, Low=1 (values fluctuate live tick-to-tick, so cross-sensitivity ordering may occasionally invert on a single sample — verified mechanism by observing High > Low across ticks). History accumulates algo entries quickly at 1s TF + High sens (~67 in ~15s). Only-algo filter may show one extra row transiently vs. algo-count due to a live tick occurring between reads — not a bug."
+}

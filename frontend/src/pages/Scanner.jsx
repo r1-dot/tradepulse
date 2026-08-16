@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { SiBinance } from "react-icons/si";
-import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2 } from "lucide-react";
+import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2, Cpu } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import MarketOverview from "@/components/MarketOverview";
 import { withCommas, compactUsd, fmtPrice, fmtPct } from "@/lib/format";
@@ -19,6 +19,14 @@ const SORTS = [
   { key: "symbol_asc", label: "A → Z" },
 ];
 const THRESHOLDS = [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1300, 1500, 2000];
+const TF_SECONDS = { "1s": 1, "5s": 5, "15s": 15, "30s": 30, "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400, "4d": 345600, "7d": 604800, "10d": 864000 };
+// Algorithmic-trade footprint: high trade rate + small average order size + a burst
+// above the token's normal 24h rate. Sensitivity loosens/tightens the thresholds.
+const ALGO_SENS = {
+  high: { label: "High", rate: 1, burst: 2.5, avgSize: 2000, minTrades: 3 },
+  med: { label: "Med", rate: 2, burst: 4, avgSize: 1000, minTrades: 5 },
+  low: { label: "Low", rate: 4, burst: 6, avgSize: 500, minTrades: 8 },
+};
 const ROW_H = 34;
 
 const fmtClock = (ts) => {
@@ -62,15 +70,22 @@ export default function Scanner() {
   const [alertCount, setAlertCount] = useState(0);
   const [alertHistory, setAlertHistory] = useState([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [algoOn, setAlgoOn] = useState(false);
+  const [algoSens, setAlgoSens] = useState("med");
+  const [algoSensOpen, setAlgoSensOpen] = useState(false);
+  const [onlyAlgo, setOnlyAlgo] = useState(false);
+  const [algoCount, setAlgoCount] = useState(0);
 
   const prevTrades = useRef({});
   const parentRef = useRef(null);
   const alertingRef = useRef(new Set());
   const seedRef = useRef(false);
+  const algoRef = useRef(new Set());
+  const algoSeedRef = useRef(false);
 
   // stable refs for interval callback
-  const cfg = useRef({ timeframe, sort, search, alertThreshold, muted });
-  cfg.current = { timeframe, sort, search, alertThreshold, muted };
+  const cfg = useRef({ timeframe, sort, search, alertThreshold, muted, algoOn, algoSens });
+  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens };
 
   const fetchTokens = useCallback(async () => {
     const { timeframe, sort, search } = cfg.current;
@@ -115,6 +130,7 @@ export default function Scanner() {
               const r = rows.find((x) => x.symbol === sym);
               return {
                 id: `${sym}-${now}-${Math.random().toString(36).slice(2, 7)}`,
+                kind: "threshold",
                 symbol: sym, base: r.base, threshold: th, trades: r.trades,
                 timeframe: cfg.current.timeframe, change: r.change, side: r.side,
                 volume: r.quoteVol, ts: now,
@@ -136,6 +152,57 @@ export default function Scanner() {
         alertingRef.current = new Set();
         setAlertCount(0);
       }
+
+      // ---- algorithmic-trade detection ----
+      if (cfg.current.algoOn) {
+        const winSec = TF_SECONDS[cfg.current.timeframe] || 1;
+        const s = ALGO_SENS[cfg.current.algoSens] || ALGO_SENS.med;
+        for (const r of rows) {
+          const rate = r.trades / winSec;                 // trades per second (window)
+          const baseline = r.trades24h / 86400;            // avg trades/sec over 24h
+          const burst = baseline > 0 ? rate / baseline : (rate > 0 ? 99 : 0);
+          const avgSize = r.trades24h > 0 ? r.quoteVol / r.trades24h : 0; // $ per trade
+          r.algo = rate >= s.rate && burst >= s.burst && avgSize > 0 && avgSize <= s.avgSize && r.trades >= s.minTrades;
+          if (r.algo) { r.algoBurst = burst; r.algoAvg = avgSize; r.algoRate = rate; }
+        }
+        const nowAlgo = new Set();
+        for (const r of rows) if (r.algo) nowAlgo.add(r.symbol);
+        setAlgoCount(nowAlgo.size);
+        if (algoSeedRef.current) {
+          algoRef.current = nowAlgo;
+          algoSeedRef.current = false;
+        } else {
+          const prevAlgo = algoRef.current;
+          const newly = [...nowAlgo].filter((x) => !prevAlgo.has(x));
+          algoRef.current = nowAlgo;
+          if (newly.length) {
+            if (!cfg.current.muted) beep();
+            const now = Date.now();
+            const entries = newly.map((sym) => {
+              const r = rows.find((x) => x.symbol === sym);
+              return {
+                id: `algo-${sym}-${now}-${Math.random().toString(36).slice(2, 7)}`,
+                kind: "algo",
+                symbol: sym, base: r.base, trades: r.trades,
+                timeframe: cfg.current.timeframe, change: r.change, side: r.side,
+                volume: r.quoteVol, ts: now,
+                reason: `${r.algoBurst >= 99 ? "99+" : r.algoBurst.toFixed(1)}× normal rate · ~$${Math.round(r.algoAvg)}/trade`,
+              };
+            });
+            setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
+            newly.slice(0, 3).forEach((sym) => {
+              const r = rows.find((x) => x.symbol === sym);
+              toast(`${r.base}/USDT — algo activity`, {
+                description: `${withCommas(r.trades)} trades in ${cfg.current.timeframe} · ${r.algoBurst >= 99 ? "99+" : r.algoBurst.toFixed(1)}× normal`,
+              });
+            });
+            if (newly.length > 3) toast(`+${newly.length - 3} more tokens flagged as algo`);
+          }
+        }
+      } else {
+        algoRef.current = new Set();
+        setAlgoCount(0);
+      }
     } catch (e) {
       // keep last data on transient errors
     }
@@ -151,8 +218,9 @@ export default function Scanner() {
   // refetch immediately when controls change (and seed alerts to avoid spam)
   useEffect(() => {
     seedRef.current = true;
+    algoSeedRef.current = true;
     fetchTokens();
-  }, [timeframe, sort, search, alertThreshold, fetchTokens]);
+  }, [timeframe, sort, search, alertThreshold, algoOn, algoSens, fetchTokens]);
 
   // engine status + market overview
   useEffect(() => {
@@ -173,9 +241,11 @@ export default function Scanner() {
   }, []);
 
   const displayTokens = useMemo(() => {
-    if (onlyAlerts && alertThreshold) return tokens.filter((t) => t.trades >= alertThreshold);
-    return tokens;
-  }, [tokens, onlyAlerts, alertThreshold]);
+    let list = tokens;
+    if (onlyAlerts && alertThreshold) list = list.filter((t) => t.trades >= alertThreshold);
+    if (onlyAlgo && algoOn) list = list.filter((t) => t.algo);
+    return list;
+  }, [tokens, onlyAlerts, alertThreshold, onlyAlgo, algoOn]);
 
   const rowVirtualizer = useVirtualizer({
     count: displayTokens.length,
@@ -319,6 +389,58 @@ export default function Scanner() {
             )}
           </div>
 
+          {/* Algo detection */}
+          <div className="flex items-center gap-1.5" data-testid="algo-controls">
+            <button
+              data-testid="algo-toggle"
+              onClick={() => setAlgoOn((o) => { if (o) setOnlyAlgo(false); return !o; })}
+              className={`mono flex items-center gap-1 border px-2.5 py-1 text-[12px] transition-colors ${
+                algoOn ? "border-[#F5A623] bg-[#F5A623] text-white" : "border-zinc-200 text-zinc-700 hover:border-zinc-400"
+              }`}
+            >
+              <Cpu size={12} /> Algo
+              {algoOn ? (
+                <span data-testid="algo-count" className="ml-0.5 rounded-sm bg-white/25 px-1 text-[10px]">{algoCount}</span>
+              ) : null}
+            </button>
+            {algoOn && (
+              <>
+                <div className="relative">
+                  <button
+                    data-testid="algo-sens-toggle"
+                    onClick={() => setAlgoSensOpen((o) => !o)}
+                    className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[11px] text-zinc-600 hover:border-zinc-400"
+                  >
+                    {ALGO_SENS[algoSens].label} <ChevronDown size={12} />
+                  </button>
+                  {algoSensOpen && (
+                    <div className="absolute right-0 z-30 mt-1 w-28 border border-zinc-200 bg-white shadow-sm">
+                      {Object.entries(ALGO_SENS).map(([k, v]) => (
+                        <button
+                          key={k}
+                          data-testid={`algo-sens-${k}`}
+                          onClick={() => { setAlgoSens(k); setAlgoSensOpen(false); }}
+                          className={`mono block w-full px-3 py-1.5 text-left text-[11px] hover:bg-zinc-50 ${algoSens === k ? "text-[#F5A623] font-semibold" : "text-zinc-600"}`}
+                        >
+                          {v.label} sensitivity
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <button
+                  data-testid="only-algo-toggle"
+                  onClick={() => setOnlyAlgo((o) => !o)}
+                  className={`mono border px-2 py-1 text-[11px] transition-colors ${
+                    onlyAlgo ? "border-[#F5A623] text-[#B26A00]" : "border-zinc-200 text-zinc-500 hover:border-zinc-400"
+                  }`}
+                >
+                  Only algo
+                </button>
+              </>
+            )}
+          </div>
+
           <button
             data-testid="history-toggle"
             onClick={() => setHistoryOpen(true)}
@@ -384,6 +506,7 @@ export default function Scanner() {
               const up = t.change >= 0;
               const flash = t.dir === 1 ? "flash-up" : t.dir === -1 ? "flash-down" : "";
               const isAlert = alertThreshold && t.trades >= alertThreshold;
+              const isAlgo = algoOn && t.algo;
               return (
                 <div
                   key={t.symbol}
@@ -396,6 +519,15 @@ export default function Scanner() {
                     {isAlert && <BellRing size={11} className="text-[#002FA7]" data-testid={`alert-flag-${t.symbol}`} />}
                     <span className="mono font-semibold text-zinc-900">{t.base}</span>
                     <span className="mono text-[10px] text-zinc-300">/USDT</span>
+                    {isAlgo && (
+                      <span
+                        data-testid={`algo-flag-${t.symbol}`}
+                        title={`Algo: ${t.algoBurst >= 99 ? "99+" : t.algoBurst?.toFixed(1)}× normal rate, ~$${Math.round(t.algoAvg || 0)}/trade`}
+                        className="ml-1 inline-flex items-center gap-0.5 self-center rounded-sm bg-[#F5A623]/15 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-[#B26A00]"
+                      >
+                        <Cpu size={8} /> algo
+                      </span>
+                    )}
                   </div>
                   <div className="mono tnum text-right text-zinc-700">{fmtPrice(t.price)}</div>
                   <div className={`mono tnum text-right ${up ? "text-[#00C805]" : "text-[#FF3B30]"}`}>
@@ -437,6 +569,11 @@ export default function Scanner() {
         {alertThreshold && (
           <span data-testid="footer-alerts" className="flex items-center gap-1 text-[#002FA7]">
             <BellRing size={10} /> {alertCount} above {alertThreshold}
+          </span>
+        )}
+        {algoOn && (
+          <span data-testid="footer-algo" className="flex items-center gap-1 text-[#B26A00]">
+            <Cpu size={10} /> {algoCount} algo
           </span>
         )}
         <span className="ml-auto">
@@ -489,11 +626,14 @@ export default function Scanner() {
                   >
                     <div className="mono text-[10px] text-zinc-400 w-16 shrink-0">{fmtClock(h.ts)}</div>
                     <div className="flex-1 min-w-0">
-                      <div className="mono text-[13px] font-semibold text-zinc-900">
+                      <div className="mono text-[13px] font-semibold text-zinc-900 flex items-center gap-1">
                         {h.base}<span className="text-[10px] text-zinc-300">/USDT</span>
+                        {h.kind === "algo" && (
+                          <span className="inline-flex items-center gap-0.5 rounded-sm bg-[#F5A623]/15 px-1 text-[8px] font-semibold uppercase text-[#B26A00]"><Cpu size={8} /> algo</span>
+                        )}
                       </div>
-                      <div className="mono text-[10px] text-zinc-400">
-                        crossed ≥ {h.threshold} · {h.timeframe} · <span className={h.side === "buy" ? "text-[#00C805]" : "text-[#FF3B30]"}>{h.side === "buy" ? "buying" : "selling"}</span>
+                      <div className="mono text-[10px] text-zinc-400 truncate">
+                        {h.kind === "algo" ? h.reason : `crossed ≥ ${h.threshold}`} · {h.timeframe} · <span className={h.side === "buy" ? "text-[#00C805]" : "text-[#FF3B30]"}>{h.side === "buy" ? "buying" : "selling"}</span>
                       </div>
                     </div>
                     <div className="text-right">
