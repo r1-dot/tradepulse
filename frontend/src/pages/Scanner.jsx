@@ -4,6 +4,8 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { SiBinance } from "react-icons/si";
 import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2, Cpu, Download } from "lucide-react";
 import { toast, Toaster } from "sonner";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 import MarketOverview from "@/components/MarketOverview";
 import { withCommas, compactUsd, fmtPrice, fmtPct } from "@/lib/format";
 
@@ -382,6 +384,46 @@ export default function Scanner() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  }, [alertHistory]);
+
+  const exportPDF = useCallback(() => {
+    if (!alertHistory.length) return;
+    const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
+    doc.setFontSize(16);
+    doc.setTextColor("#0A0A0A");
+    doc.text("TradePulse — Alert History", 40, 40);
+    doc.setFontSize(9);
+    doc.setTextColor("#52525B");
+    doc.text(`Generated ${new Date().toLocaleString()} · ${alertHistory.length} events · source data-api.binance.vision`, 40, 56);
+
+    const body = alertHistory.map((h) => [
+      fmtClock(h.ts),
+      (h.kind || "threshold").toUpperCase(),
+      `${h.base}/USDT`,
+      h.timeframe,
+      h.side === "buy" ? "BUYING" : "SELLING",
+      withCommas(h.trades),
+      h.kind === "volume" ? fmtVol((h.threshold || 0) / 1e6) : (h.threshold ?? "—"),
+      compactUsd(h.volume),
+      fmtPct(h.change),
+      h.kind === "threshold" ? `crossed >= ${h.threshold}` : (h.reason || ""),
+    ]);
+
+    autoTable(doc, {
+      startY: 70,
+      head: [["Time", "Type", "Symbol", "TF", "Side", "Trades", "Threshold", "24h Volume", "Change", "Reason"]],
+      body,
+      styles: { font: "courier", fontSize: 7.5, cellPadding: 3, textColor: "#0A0A0A" },
+      headStyles: { fillColor: "#18181B", textColor: "#FFFFFF", fontStyle: "bold" },
+      alternateRowStyles: { fillColor: "#FAFAFA" },
+      columnStyles: { 5: { halign: "right" }, 7: { halign: "right" }, 8: { halign: "right" } },
+      didParseCell: (data) => {
+        if (data.section === "body" && data.column.index === 4) {
+          data.cell.styles.textColor = data.cell.raw === "BUYING" ? "#00A004" : "#D32F2F";
+        }
+      },
+    });
+    doc.save(`tradepulse-alerts-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.pdf`);
   }, [alertHistory]);
 
   const connected = status.connected;
@@ -820,6 +862,14 @@ export default function Scanner() {
                   className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[11px] text-zinc-600 hover:border-zinc-400 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Download size={12} /> CSV
+                </button>
+                <button
+                  data-testid="history-export-pdf"
+                  onClick={exportPDF}
+                  disabled={alertHistory.length === 0}
+                  className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[11px] text-zinc-600 hover:border-zinc-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download size={12} /> PDF
                 </button>
                 <button
                   data-testid="history-clear"
