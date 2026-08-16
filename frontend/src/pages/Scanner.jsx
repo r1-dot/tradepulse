@@ -75,6 +75,7 @@ export default function Scanner() {
   const [algoSensOpen, setAlgoSensOpen] = useState(false);
   const [onlyAlgo, setOnlyAlgo] = useState(false);
   const [algoCount, setAlgoCount] = useState(0);
+  const [pressure, setPressure] = useState("all"); // all | buy | sell
 
   const prevTrades = useRef({});
   const parentRef = useRef(null);
@@ -242,10 +243,11 @@ export default function Scanner() {
 
   const displayTokens = useMemo(() => {
     let list = tokens;
+    if (pressure !== "all") list = list.filter((t) => t.side === pressure);
     if (onlyAlerts && alertThreshold) list = list.filter((t) => t.trades >= alertThreshold);
     if (onlyAlgo && algoOn) list = list.filter((t) => t.algo);
     return list;
-  }, [tokens, onlyAlerts, alertThreshold, onlyAlgo, algoOn]);
+  }, [tokens, pressure, onlyAlerts, alertThreshold, onlyAlgo, algoOn]);
 
   const rowVirtualizer = useVirtualizer({
     count: displayTokens.length,
@@ -315,6 +317,26 @@ export default function Scanner() {
         </div>
 
         <div className="ml-auto flex items-center gap-3">
+          {/* Pressure filter */}
+          <div className="flex items-center border border-zinc-200" data-testid="pressure-filter">
+            {[
+              { k: "all", label: "All", cls: "text-zinc-700" },
+              { k: "buy", label: "Buying", cls: "text-[#00C805]" },
+              { k: "sell", label: "Selling", cls: "text-[#FF3B30]" },
+            ].map((p, idx) => (
+              <button
+                key={p.k}
+                data-testid={`pressure-${p.k}`}
+                onClick={() => setPressure(p.k)}
+                className={`mono px-2.5 py-1 text-[11px] font-medium transition-colors ${idx > 0 ? "border-l border-zinc-200" : ""} ${
+                  pressure === p.k ? "bg-zinc-900 text-white" : `${p.cls} hover:bg-zinc-50`
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+
           {meta.approx && (
             <span data-testid="approx-badge" className="mono text-[10px] text-[#F5A623] border border-[#F5A623]/40 px-1.5 py-0.5">
               APPROX · warming history
@@ -558,7 +580,7 @@ export default function Scanner() {
       {/* Footer status */}
       <footer className="flex items-center gap-4 border-t border-zinc-200 bg-[#FAFAFA] px-4 py-1.5 mono text-[10px] text-zinc-400">
         <span data-testid="footer-total">
-          {meta.total || 0} / {meta.totalPairs || 0} pairs
+          {displayTokens.length} / {meta.totalPairs || 0} pairs
         </span>
         <span className="flex items-center gap-1">
           <ArrowUp size={10} className="text-[#00C805]" />/<ArrowDown size={10} className="text-[#FF3B30]" /> live tick
