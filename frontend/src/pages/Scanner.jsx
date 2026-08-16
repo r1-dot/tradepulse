@@ -83,6 +83,7 @@ export default function Scanner() {
   const [volThreshold, setVolThreshold] = useState(null); // USD
   const [volOpen, setVolOpen] = useState(false);
   const [volAlertCount, setVolAlertCount] = useState(0);
+  const [onlyVol, setOnlyVol] = useState(false);
   const [flipOn, setFlipOn] = useState(false);
   const [flipCount, setFlipCount] = useState(0);
 
@@ -227,6 +228,26 @@ export default function Scanner() {
         if (volSeedRef.current) {
           volAlertingRef.current = nowVol;
           volSeedRef.current = false;
+          // immediate feedback: log & announce the pairs currently above the level
+          const label = fmtVol(vth / 1e6);
+          const qualifiers = rows.filter((r) => r.quoteVol >= vth).sort((a, b) => b.quoteVol - a.quoteVol);
+          if (qualifiers.length) {
+            const now = Date.now();
+            const entries = qualifiers.slice(0, 25).map((r) => ({
+              id: `vol-${r.symbol}-${now}-${Math.random().toString(36).slice(2, 7)}`,
+              kind: "volume", symbol: r.symbol, base: r.base, trades: r.trades,
+              timeframe: cfg.current.timeframe, change: r.change, side: r.side,
+              volume: r.quoteVol, threshold: vth, ts: now,
+              reason: `above ${label} 24h volume`,
+            }));
+            setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
+            if (!cfg.current.muted) beep();
+            toast(`${qualifiers.length} pairs above ${label} volume`, {
+              description: `Top: ${qualifiers.slice(0, 3).map((r) => r.base).join(", ")}`,
+            });
+          } else {
+            toast(`No pairs currently above ${label} volume`);
+          }
         } else {
           const newly = [...nowVol].filter((x) => !volAlertingRef.current.has(x));
           volAlertingRef.current = nowVol;
@@ -343,8 +364,9 @@ export default function Scanner() {
     if (pressure !== "all") list = list.filter((t) => t.side === pressure);
     if (onlyAlerts && alertThreshold) list = list.filter((t) => t.trades >= alertThreshold);
     if (onlyAlgo && algoOn) list = list.filter((t) => t.algo);
+    if (onlyVol && volThreshold) list = list.filter((t) => t.quoteVol >= volThreshold);
     return list;
-  }, [tokens, pressure, onlyAlerts, alertThreshold, onlyAlgo, algoOn]);
+  }, [tokens, pressure, onlyAlerts, alertThreshold, onlyAlgo, algoOn, onlyVol, volThreshold]);
 
   const rowVirtualizer = useVirtualizer({
     count: displayTokens.length,
@@ -357,34 +379,6 @@ export default function Scanner() {
     () => SORTS.find((s) => s.key === sort)?.label || "Sort",
     [sort]
   );
-
-  const exportCSV = useCallback(() => {
-    if (!alertHistory.length) return;
-    const headers = ["time", "type", "symbol", "timeframe", "side", "trades", "threshold", "volume_usd", "change_pct", "reason"];
-    const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
-    const lines = alertHistory.map((h) => [
-      new Date(h.ts).toISOString(),
-      h.kind || "threshold",
-      `${h.base}USDT`,
-      h.timeframe,
-      h.side === "buy" ? "buying" : "selling",
-      h.trades,
-      h.threshold ?? "",
-      Math.round(h.volume || 0),
-      h.change ?? "",
-      h.reason || "",
-    ].map(esc).join(","));
-    const csv = [headers.join(","), ...lines].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `tradepulse-alerts-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, [alertHistory]);
 
   const exportPDF = useCallback(() => {
     if (!alertHistory.length) return;
@@ -596,7 +590,7 @@ export default function Scanner() {
               <div className="absolute right-0 z-30 mt-1 w-36 border border-zinc-200 bg-white shadow-sm">
                 <button
                   data-testid="vol-off"
-                  onClick={() => { setVolThreshold(null); setVolOpen(false); }}
+                  onClick={() => { setVolThreshold(null); setOnlyVol(false); setVolOpen(false); }}
                   className={`mono block w-full px-3 py-1.5 text-left text-[12px] hover:bg-zinc-50 ${!volThreshold ? "text-zinc-900 font-semibold" : "text-zinc-500"}`}
                 >
                   Off
@@ -614,6 +608,18 @@ export default function Scanner() {
               </div>
             )}
           </div>
+
+          {volThreshold && (
+            <button
+              data-testid="only-vol-toggle"
+              onClick={() => setOnlyVol((o) => !o)}
+              className={`mono border px-2 py-1 text-[11px] transition-colors ${
+                onlyVol ? "border-[#0E7490] text-[#0E7490]" : "border-zinc-200 text-zinc-500 hover:border-zinc-400"
+              }`}
+            >
+              Only vol
+            </button>
+          )}
 
           {/* Pressure-flip alerts */}
           <button
@@ -855,14 +861,6 @@ export default function Scanner() {
                 <span className="mono text-[11px] text-zinc-400">{alertHistory.length}</span>
               </div>
               <div className="flex items-center gap-1">
-                <button
-                  data-testid="history-export"
-                  onClick={exportCSV}
-                  disabled={alertHistory.length === 0}
-                  className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[11px] text-zinc-600 hover:border-zinc-400 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  <Download size={12} /> CSV
-                </button>
                 <button
                   data-testid="history-export-pdf"
                   onClick={exportPDF}

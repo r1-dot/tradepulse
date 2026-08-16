@@ -1,0 +1,23 @@
+{
+  "summary": "Frontend-only verification of Scanner volume-alert immediate logging and CSV removal. All requested behaviors work: arming vol-threshold-100/200/300 immediately shows a summary toast ('N pairs above $NM volume, Top: ...'), populates the Alert History log with VOL-tagged entries (history-vol-* testids), increments vol-count badge and footer-vol. only-vol-toggle appears when armed, filters rows to only those with 24h volume >= threshold (each visible row carries a vol-flag badge), and disabling restores full list. vol-off clears volThreshold, footer-vol, vol-count, and hides only-vol-toggle. CSV button (data-testid='history-export') is fully removed; only PDF (data-testid='history-export-pdf') remains — disabled when history empty, enabled with entries, downloads a valid .pdf file. Regression: alert-toggle, algo-toggle, flip-toggle, pressure-buy, pressure-sell, history-toggle all still present and functional.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Toolbar + Alert History panel", "issues": ["When Alert History side-panel is open, it overlays the right-side vol dropdown menu, making vol-off / vol-threshold buttons harder to reach via automated force-click. Not blocking for users (they close panel first) but flagging for UX polish — consider narrower panel or push-layout."]}
+    ]
+  },
+  "test_report_links": ["/app/test_reports/iteration_7.json"],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Scanner.jsx is 936 lines — approaching the 700-line guideline; consider splitting alert seeding (threshold/algo/vol/flip) into a hook (useAlertEngine) and history panel + export into separate components.",
+    "Toast summary shows Top pairs but if qualifying set is <25 (as observed: 4/3/1) the log stores exactly that many entries — correct behavior; ensure documented so users don't expect exactly 25."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "n/a", "frontend": "100%"},
+  "seed_data_creation": "None. Live Binance market data used.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "All three iteration-7 change requests verified end-to-end via Playwright on the public REACT_APP_BACKEND_URL. Observed live values: 100M => 4 pairs, 200M => 3 pairs, 300M => 1 pair (USDC). PDF filename pattern: tradepulse-alerts-YYYY-MM-DD-HH-MM-SS.pdf. Note: history side-panel overlays the vol dropdown region — automated tests must interact with vol menu BEFORE opening history-toggle, or explicitly close history first."
+}
