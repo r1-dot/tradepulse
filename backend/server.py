@@ -12,10 +12,15 @@ from fastapi import FastAPI, APIRouter, Query, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
 import os
 import asyncio
 import time
+import hmac
+import hashlib
 import logging
+from datetime import datetime, timezone
+from urllib.parse import urlencode
 from pathlib import Path
 from collections import deque
 from typing import Optional
@@ -33,6 +38,9 @@ QUOTE = os.environ.get('BINANCE_QUOTE', 'USDT')
 ETHERSCAN_API_KEY = os.environ.get('ETHERSCAN_API_KEY', '')
 COINMARKETCAP_API_KEY = os.environ.get('COINMARKETCAP_API_KEY', '')
 COINGECKO_API_KEY = os.environ.get('COINGECKO_API_KEY', '')
+BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '')
+BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
+BINANCE_TRADE_BASE_URL = os.environ.get('BINANCE_TRADE_BASE_URL', 'https://api.binance.com')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("scanner")
@@ -63,6 +71,201 @@ STATE = {
     "error": None,
 }
 COARSE_INTERVAL = 300  # seconds
+
+
+# ============================ AUTO-TRADE BOT ============================
+# Trigger: a symbol qualifies as a "volume alert" when its 24h quote volume >=
+# volThresholdUsd. When the same symbol shows the SAME raw price direction
+# (buy = price up vs last poll, sell = price down) for `streak` consecutive
+# polls within ~1s, the bot fires: BUY opens a long spot position (quoteOrderQty),
+# SELL closes an existing position early. Each position auto-exits at TP (+tpPct)
+# or SL (-slPct). Realized daily PnL <= -dailyLossLimit halts the bot.
+#
+# SAFETY: dryRun=True by default => simulated fills at the live mark price (no real
+# orders). Set dryRun=False (LIVE) + configure BINANCE_API_KEY/SECRET to place real
+# spot orders on BINANCE_TRADE_BASE_URL. api.binance.com is geo-blocked from this
+# preview server, so LIVE orders only execute once deployed to a reachable region.
+
+BOT_DEFAULTS = {
+    "enabled": False,
+    "dryRun": True,
+    "slPct": 1.5,
+    "tpPct": 2.0,
+    "maxPositionUsdt": 5.0,
+    "dailyLossLimit": 5.0,
+    "volThresholdUsd": 100_000_000.0,
+    "streak": 2,
+    "maxOpenPositions": 3,
+    "cooldownSec": 30,
+}
+
+BOT = {
+    "config": dict(BOT_DEFAULTS),
+    "positions": {},        # symbol -> position dict
+    "journal": deque(maxlen=300),
+    "dailyPnl": 0.0,
+    "dailyDate": "",
+    "stopped": False,       # halted by daily loss limit
+    "prevPrice": {},        # symbol -> last poll price
+    "streaks": {},          # symbol -> {"side","count","startTs"}
+    "lastTradeTs": {},      # symbol -> ts (cooldown)
+}
+
+
+def jlog(kind: str, **kw):
+    entry = {"ts": time.time(), "kind": kind, **kw}
+    BOT["journal"].appendleft(entry)
+    return entry
+
+
+async def binance_signed(http: httpx.AsyncClient, method: str, path: str, params: dict):
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        raise RuntimeError("Binance API key/secret not configured")
+    p = {k: str(v) for k, v in params.items() if v is not None}
+    p["timestamp"] = int(time.time() * 1000)
+    p.setdefault("recvWindow", "5000")
+    query = urlencode(p)
+    sig = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"{BINANCE_TRADE_BASE_URL}{path}?{query}&signature={sig}"
+    r = await http.request(method, url, headers={"X-MBX-APIKEY": BINANCE_API_KEY}, timeout=15)
+    if r.status_code >= 400:
+        raise RuntimeError(f"binance {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+async def _live_market(http, symbol, side, quote_qty=None, base_qty=None):
+    params = {"symbol": symbol, "side": side, "type": "MARKET", "newOrderRespType": "FULL"}
+    if quote_qty is not None:
+        params["quoteOrderQty"] = round(quote_qty, 2)
+    else:
+        params["quantity"] = base_qty
+    res = await binance_signed(http, "POST", "/api/v3/order", params)
+    executed = float(res.get("executedQty", 0) or 0)
+    cq = float(res.get("cummulativeQuoteQty", 0) or 0)
+    fill = (cq / executed) if executed else 0.0
+    return {"executedQty": executed, "quote": cq, "fillPrice": fill, "orderId": res.get("orderId")}
+
+
+async def _open_position(http, sym, price, now):
+    cfg = BOT["config"]
+    qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
+    order_id = None
+    if cfg["dryRun"]:
+        fill = price
+        executed = qty
+    else:
+        try:
+            r = await _live_market(http, sym, "BUY", quote_qty=cfg["maxPositionUsdt"])
+            fill = r["fillPrice"] or price
+            executed = r["executedQty"] or qty
+            order_id = r["orderId"]
+        except Exception as e:  # noqa: BLE001
+            jlog("error", symbol=sym, action="BUY", message=str(e), live=True)
+            return
+    pos = {
+        "symbol": sym, "base": sym[: -len(QUOTE)], "side": "long",
+        "entryPrice": fill, "qty": executed, "quoteSpent": fill * executed,
+        "tpPrice": fill * (1 + cfg["tpPct"] / 100),
+        "slPrice": fill * (1 - cfg["slPct"] / 100),
+        "openedTs": now, "orderId": order_id, "dryRun": cfg["dryRun"],
+    }
+    BOT["positions"][sym] = pos
+    BOT["lastTradeTs"][sym] = now
+    jlog("entry", symbol=sym, base=pos["base"], side="buy", price=fill, qty=executed,
+         spent=pos["quoteSpent"], tp=pos["tpPrice"], sl=pos["slPrice"],
+         mode="SIM" if cfg["dryRun"] else "LIVE")
+
+
+async def _close_position(http, sym, price, reason):
+    pos = BOT["positions"].pop(sym, None)
+    if not pos:
+        return
+    cfg = BOT["config"]
+    fill = price
+    if not cfg["dryRun"] and not pos.get("dryRun"):
+        try:
+            r = await _live_market(http, sym, "SELL", base_qty=pos["qty"])
+            fill = r["fillPrice"] or price
+        except Exception as e:  # noqa: BLE001
+            jlog("error", symbol=sym, action="SELL", message=str(e), live=True)
+    pnl = (fill - pos["entryPrice"]) * pos["qty"]
+    BOT["dailyPnl"] += pnl
+    BOT["lastTradeTs"][sym] = time.time()
+    jlog("exit", symbol=sym, base=pos["base"], side="sell", price=fill,
+         entry=pos["entryPrice"], qty=pos["qty"], pnl=pnl, reason=reason,
+         mode="SIM" if pos.get("dryRun") else "LIVE")
+    if BOT["dailyPnl"] <= -cfg["dailyLossLimit"]:
+        BOT["stopped"] = True
+        cfg["enabled"] = False
+        jlog("halt", message=f"Daily loss limit hit ({BOT['dailyPnl']:.2f} USDT). Bot stopped.")
+        await save_bot_config()
+
+
+async def process_bot(http: httpx.AsyncClient, now: float):
+    cfg = BOT["config"]
+    latest = STATE["latest"]
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if BOT["dailyDate"] != today:
+        BOT["dailyDate"] = today
+        BOT["dailyPnl"] = 0.0
+        BOT["stopped"] = False
+        jlog("daily_reset", date=today)
+
+    # 1) manage exits for open positions (always active to protect capital)
+    for sym in list(BOT["positions"].keys()):
+        v = latest.get(sym)
+        if not v:
+            continue
+        price = v["price"]
+        pos = BOT["positions"][sym]
+        if price >= pos["tpPrice"]:
+            await _close_position(http, sym, price, "take-profit")
+        elif price <= pos["slPrice"]:
+            await _close_position(http, sym, price, "stop-loss")
+
+    # 2) detect new entry/exit signals only when running
+    prev = BOT["prevPrice"]
+    if cfg["enabled"] and not BOT["stopped"]:
+        for sym, v in latest.items():
+            pp = prev.get(sym)
+            price = v["price"]
+            if pp is None:
+                continue
+            if v["quoteVol"] < cfg["volThresholdUsd"]:
+                BOT["streaks"].pop(sym, None)
+                continue
+            side = "buy" if price >= pp else "sell"
+            st = BOT["streaks"].get(sym)
+            if st and st["side"] == side:
+                st["count"] += 1
+            else:
+                st = {"side": side, "count": 1, "startTs": now}
+                BOT["streaks"][sym] = st
+            if st["count"] >= cfg["streak"] and (now - st["startTs"]) <= 1.6:
+                cd = now - BOT["lastTradeTs"].get(sym, 0) >= cfg["cooldownSec"]
+                if side == "buy":
+                    if sym not in BOT["positions"] and cd and len(BOT["positions"]) < cfg["maxOpenPositions"]:
+                        await _open_position(http, sym, price, now)
+                else:  # sell closes an open position early
+                    if sym in BOT["positions"]:
+                        await _close_position(http, sym, price, "sell-signal")
+                BOT["streaks"].pop(sym, None)  # reset after firing
+
+    BOT["prevPrice"] = {s: v["price"] for s, v in latest.items()}
+
+
+async def save_bot_config():
+    await db.bot_config.update_one({"_id": "config"}, {"$set": BOT["config"]}, upsert=True)
+
+
+async def load_bot_config():
+    doc = await db.bot_config.find_one({"_id": "config"})
+    if doc:
+        for k in BOT_DEFAULTS:
+            if k in doc:
+                BOT["config"][k] = doc[k]
+
 
 
 async def poll_binance(http: httpx.AsyncClient):
@@ -112,6 +315,10 @@ async def poll_binance(http: httpx.AsyncClient):
                 STATE["connected"] = True
                 STATE["poll_count"] += 1
                 STATE["error"] = None
+                try:
+                    await process_bot(http, now)
+                except Exception as be:  # noqa: BLE001
+                    logger.error("bot error: %s", be)
         except Exception as e:  # noqa: BLE001
             STATE["connected"] = False
             STATE["error"] = str(e)
@@ -271,6 +478,104 @@ async def token_detail(symbol: str):
             "trades24h": v["count24h"], "timeframes": tf_counts}
 
 
+# ----------------------------- Auto-Trade Bot endpoints -----------------------------
+class BotConfigUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    dryRun: Optional[bool] = None
+    slPct: Optional[float] = None
+    tpPct: Optional[float] = None
+    maxPositionUsdt: Optional[float] = None
+    dailyLossLimit: Optional[float] = None
+    volThresholdUsd: Optional[float] = None
+    streak: Optional[int] = None
+    maxOpenPositions: Optional[int] = None
+    cooldownSec: Optional[int] = None
+
+
+def _bot_status():
+    cfg = BOT["config"]
+    latest = STATE["latest"]
+    positions = []
+    unrealized = 0.0
+    for sym, pos in BOT["positions"].items():
+        price = latest.get(sym, {}).get("price", pos["entryPrice"])
+        upnl = (price - pos["entryPrice"]) * pos["qty"]
+        unrealized += upnl
+        positions.append({
+            "symbol": sym, "base": pos["base"], "entryPrice": pos["entryPrice"],
+            "currentPrice": price, "qty": pos["qty"], "quoteSpent": pos["quoteSpent"],
+            "tpPrice": pos["tpPrice"], "slPrice": pos["slPrice"],
+            "uPnl": upnl, "openedTs": pos["openedTs"], "mode": "SIM" if pos.get("dryRun") else "LIVE",
+        })
+    return {
+        "config": cfg,
+        "stopped": BOT["stopped"],
+        "dailyPnl": BOT["dailyPnl"],
+        "dailyDate": BOT["dailyDate"],
+        "unrealizedPnl": unrealized,
+        "openPositions": positions,
+        "journal": list(BOT["journal"])[:100],
+        "keysConfigured": bool(BINANCE_API_KEY and BINANCE_API_SECRET),
+        "tradeBase": BINANCE_TRADE_BASE_URL,
+        "watching": sum(1 for v in STATE["latest"].values() if v["quoteVol"] >= cfg["volThresholdUsd"]),
+    }
+
+
+@api_router.get("/bot/status")
+async def bot_status():
+    return _bot_status()
+
+
+@api_router.post("/bot/config")
+async def bot_config(update: BotConfigUpdate):
+    cfg = BOT["config"]
+    data = update.model_dump(exclude_none=True)
+    # basic clamps
+    if "slPct" in data:
+        data["slPct"] = max(0.1, min(50.0, data["slPct"]))
+    if "tpPct" in data:
+        data["tpPct"] = max(0.1, min(100.0, data["tpPct"]))
+    if "maxPositionUsdt" in data:
+        data["maxPositionUsdt"] = max(1.0, min(100000.0, data["maxPositionUsdt"]))
+    if "dailyLossLimit" in data:
+        data["dailyLossLimit"] = max(0.5, min(100000.0, data["dailyLossLimit"]))
+    if "streak" in data:
+        data["streak"] = max(2, min(20, int(data["streak"])))
+    if "maxOpenPositions" in data:
+        data["maxOpenPositions"] = max(1, min(50, int(data["maxOpenPositions"])))
+    if "cooldownSec" in data:
+        data["cooldownSec"] = max(0, min(3600, int(data["cooldownSec"])))
+    if data.get("enabled"):
+        BOT["stopped"] = False  # re-enabling clears the halt
+    cfg.update(data)
+    await save_bot_config()
+    if "enabled" in data:
+        jlog("power", message=f"Bot {'STARTED' if data['enabled'] else 'STOPPED'}",
+             mode="SIM" if cfg["dryRun"] else "LIVE")
+    return _bot_status()
+
+
+@api_router.post("/bot/close-all")
+async def bot_close_all():
+    latest = STATE["latest"]
+    closed = 0
+    for sym in list(BOT["positions"].keys()):
+        price = latest.get(sym, {}).get("price", BOT["positions"][sym]["entryPrice"])
+        await _close_position(app.state.http, sym, price, "manual-close")
+        closed += 1
+    jlog("kill_switch", message=f"Manually closed {closed} position(s)")
+    return _bot_status()
+
+
+@api_router.post("/bot/reset-daily")
+async def bot_reset_daily():
+    BOT["dailyPnl"] = 0.0
+    BOT["stopped"] = False
+    jlog("daily_reset", message="Manual daily reset")
+    return _bot_status()
+
+
+
 # ----------------------------- Market overview (external APIs) -----------------------------
 _MO_CACHE = {"ts": 0.0, "data": None}
 
@@ -388,6 +693,10 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     app.state.http = httpx.AsyncClient(headers={"User-Agent": "token-scanner/1.0"})
+    try:
+        await load_bot_config()
+    except Exception as e:  # noqa: BLE001
+        logger.error("bot config load failed: %s", e)
     app.state.poller = asyncio.create_task(poll_binance(app.state.http))
     logger.info("scanner started, source=%s quote=%s", BINANCE_BASE, QUOTE)
 

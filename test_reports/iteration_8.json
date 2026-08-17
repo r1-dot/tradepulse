@@ -1,0 +1,33 @@
+{
+  "summary": "Iteration 8 — Auto-Trade Bot (SIM mode) end-to-end verification. Backend: 7/7 pytest tests passed (status shape, config clamps, enable clears stopped, live-poll SIM trigger creates BUY positions with correct tp/sl math and mode=SIM, close-all, reset-daily, safe cleanup). Frontend: bot-open opens the slide-over, all data-testids present, START/STOP toggles state RUNNING/IDLE, changing bot-tp + Save persists across re-open, mode toggle triggers window.confirm and switches to LIVE badge, switching back to SIM works, close-all button works. Regression: vol/flip/algo toggles still visible (alerts-toggle data-testid absent in header but alerts button is present via text). Left safe: enabled=false, dryRun=true, volThresholdUsd=100M, no open positions.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "BotPanel — Volume alert level <select>", "issues": ["React hydration warning: '<span> cannot be a child of <option>' from dev tooling wrapping option text in a span. Cosmetic (dev-only warning) but should be silenced by rendering option text as plain text or by disabling the ve-dynamic wrapper for <option> children."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_bot.py",
+    "/app/test_reports/pytest/bot_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Fix hydration warning inside BotPanel <select> options — the JSX renders `≥ {fmtVol(m)} 24h volume` inside <option>; dev tool wraps the interpolation in a <span>, causing a hydration warning. Consider concatenating into a single string expression to avoid a nested span child.",
+    "(Nice-to-have) Header button `[data-testid=bot-open]` label stays 'Auto-Trade' when running; only its color changes. Consider appending ' • ON' text so state is visible without hovering; not a bug."
+  ],
+  "critical_code_review_comments": [
+    "server.py process_bot uses simple prev-price direction; two rapid alternating ticks can still generate false streaks — acceptable per spec (streak defaults to 2 within 1.6s).",
+    "_close_position sums pnl into dailyPnl but does not subtract fees; live path may over-report pnl. Fine for SIM.",
+    "BOT_DEFAULTS + save_bot_config write to Mongo — no _id leaks via API since /bot/status returns only BOT['config'] dict (no _id). Good.",
+    "cooldownSec allows 0 which lets the bot re-enter the same symbol on the very next second after exit; acceptable but risky in LIVE."
+  ],
+  "updated_files": ["/app/backend/tests/test_bot.py"],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "n/a (no auth)",
+  "seed_data_creation": "None. Only bot_config document in Mongo — reset to safe defaults after tests.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Bot left in safe state: enabled=false, dryRun=true, volThresholdUsd=100M, positions=0. For future SIM triggers use volThresholdUsd=5M and cooldownSec<=5; wait ~10-15s for the 1s poller to accumulate streaks. Always POST /api/bot/close-all then reset config to defaults before finishing. Never toggle dryRun=false with enabled=true in this preview.",
+  "rca of the issue": "No bugs found in this iteration."
+}

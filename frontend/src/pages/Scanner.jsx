@@ -2,11 +2,12 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { SiBinance } from "react-icons/si";
-import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2, Cpu, Download } from "lucide-react";
+import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2, Cpu, Download, Bot } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import MarketOverview from "@/components/MarketOverview";
+import BotPanel from "@/components/BotPanel";
 import { withCommas, compactUsd, fmtPrice, fmtPct } from "@/lib/format";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
@@ -86,6 +87,9 @@ export default function Scanner() {
   const [onlyVol, setOnlyVol] = useState(false);
   const [flipOn, setFlipOn] = useState(false);
   const [flipCount, setFlipCount] = useState(0);
+  const [botOpen, setBotOpen] = useState(false);
+  const [botRunning, setBotRunning] = useState(false);
+  const [botLive, setBotLive] = useState(false);
 
   const prevTrades = useRef({});
   const parentRef = useRef(null);
@@ -358,6 +362,18 @@ export default function Scanner() {
     const id = setInterval(load, 30000);
     return () => clearInterval(id);
   }, []);
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const { data } = await axios.get(`${API}/bot/status`);
+        setBotRunning(data.config.enabled);
+        setBotLive(!data.config.dryRun);
+      } catch {}
+    };
+    load();
+    const id = setInterval(load, 4000);
+    return () => clearInterval(id);
+  }, [botOpen]);
 
   const displayTokens = useMemo(() => {
     let list = tokens;
@@ -441,7 +457,21 @@ export default function Scanner() {
           </span>
         </div>
 
-        <div className="ml-auto relative w-64">
+        <button
+          data-testid="bot-open"
+          onClick={() => setBotOpen(true)}
+          className={`ml-auto mono flex items-center gap-1.5 border px-3 py-1.5 text-[12px] font-medium transition-colors ${
+            botRunning
+              ? (botLive ? "border-[#FF3B30] bg-[#FF3B30] text-white" : "border-[#00C805] bg-[#00C805] text-white")
+              : "border-zinc-200 text-zinc-700 hover:border-zinc-900"
+          }`}
+        >
+          <Bot size={14} />
+          Auto-Trade
+          {botRunning && <span className="rounded-sm bg-white/25 px-1 text-[9px] uppercase">{botLive ? "live" : "sim"}</span>}
+        </button>
+
+        <div className="relative w-64">
           <Search size={14} className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-400" />
           <input
             data-testid="search-input"
@@ -846,6 +876,8 @@ export default function Scanner() {
         </span>
       </footer>
       <Toaster position="bottom-right" toastOptions={{ className: "mono" }} />
+
+      <BotPanel open={botOpen} onClose={() => setBotOpen(false)} />
 
       {/* Alert history slide-over */}
       {historyOpen && (
