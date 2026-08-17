@@ -96,6 +96,7 @@ BOT_DEFAULTS = {
     "streak": 2,
     "maxOpenPositions": 3,
     "cooldownSec": 30,
+    "minVolumeUsd": 5_000_000.0,
 }
 
 BOT = {
@@ -228,13 +229,16 @@ async def process_bot(http: httpx.AsyncClient, now: float):
     # the bot stays inactive. process_bot only handles daily reset + protective exits.
 
 
-async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: float, now: float):
+async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: float, now: float, volume: float = 0.0):
     """Consume one alert-history event; fire a trade on `streak` consecutive
-    same-direction alerts for the same symbol within ~1s."""
+    same-direction alerts for the same symbol within ~1s. BUY only on buy signals,
+    SELL only on sell signals; both gated by the token volume filter."""
     cfg = BOT["config"]
     if not cfg["enabled"] or BOT["stopped"] or price <= 0:
         return
     if sym not in STATE["latest"]:  # only trade symbols we actually track
+        return
+    if volume < cfg.get("minVolumeUsd", 0):  # volume gate
         return
     st = BOT["signalStreaks"].get(sym)
     if st and st["side"] == side and (now - st["startTs"]) <= 1.5:
@@ -487,6 +491,7 @@ class BotConfigUpdate(BaseModel):
     streak: Optional[int] = None
     maxOpenPositions: Optional[int] = None
     cooldownSec: Optional[int] = None
+    minVolumeUsd: Optional[float] = None
 
 
 def _bot_status():
@@ -546,6 +551,8 @@ async def bot_config(update: BotConfigUpdate):
         data["maxOpenPositions"] = max(1, min(50, int(data["maxOpenPositions"])))
     if "cooldownSec" in data:
         data["cooldownSec"] = max(0, min(3600, int(data["cooldownSec"])))
+    if "minVolumeUsd" in data:
+        data["minVolumeUsd"] = max(0.0, float(data["minVolumeUsd"]))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)
@@ -560,6 +567,7 @@ class SignalIn(BaseModel):
     symbol: str
     side: str
     price: float
+    volume: Optional[float] = 0.0
 
 
 class SignalBatch(BaseModel):
@@ -573,7 +581,7 @@ async def bot_signal(batch: SignalBatch):
     fired = 0
     for e in batch.events[:200]:
         if e.side in ("buy", "sell") and e.price > 0:
-            await handle_signal(app.state.http, e.symbol.upper(), e.side, e.price, now)
+            await handle_signal(app.state.http, e.symbol.upper(), e.side, e.price, now, e.volume or 0.0)
             fired += 1
     return {"ok": True, "received": fired, "openPositions": len(BOT["positions"]), "active": bool(BOT["config"]["enabled"] and not BOT["stopped"])}
 

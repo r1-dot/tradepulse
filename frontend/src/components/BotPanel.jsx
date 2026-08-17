@@ -3,6 +3,8 @@ import axios from "axios";
 import { X, Power, ShieldAlert, Bot, Trash2, RotateCcw, TriangleAlert } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const BOT_VOL = [5, 10, 30, 50, 70, 100, 200, 300, 400, 500, 600, 700, 800, 900]; // USD millions
+const fmtM = (m) => (m >= 1000 ? `$${(m / 1000).toFixed(m % 1000 ? 1 : 0)}B` : `$${m}M`);
 const clock = (ts) => new Date(ts * 1000).toLocaleTimeString("en-US", { hour12: false });
 
 const NumField = ({ label, value, onChange, step = "0.1", suffix, testid }) => (
@@ -174,6 +176,20 @@ export default function BotPanel({ open, onClose }) {
               {form && (
                 <div className="space-y-3 border-t border-zinc-100 pt-3">
                   <div className="mono text-[10px] uppercase tracking-wider text-zinc-400">Trigger</div>
+                  <label className="block">
+                    <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Minimum volume (buy/sell signal)</span>
+                    <select
+                      data-testid="bot-min-volume"
+                      value={st.config.minVolumeUsd}
+                      onChange={(e) => patch({ minVolumeUsd: parseFloat(e.target.value) })}
+                      className="mono w-full border border-zinc-200 bg-transparent px-2 py-1.5 text-[13px] outline-none focus:border-zinc-900"
+                    >
+                      {BOT_VOL.map((m) => (
+                        <option key={m} value={m * 1e6}>{`≥ ${fmtM(m)} volume`}</option>
+                      ))}
+                    </select>
+                    <span className="mono text-[9px] text-zinc-400">Only buys on a BUY signal / sells on a SELL signal whose token volume is at least this.</span>
+                  </label>
                   <div className="grid grid-cols-2 gap-2">
                     <NumField testid="bot-streak" label="Repeat count" step="1" value={form.streak} onChange={(v) => setForm({ ...form, streak: v })} suffix="alerts" />
                     <NumField testid="bot-cooldown" label="Cooldown" step="1" value={form.cooldownSec} onChange={(v) => setForm({ ...form, cooldownSec: v })} suffix="sec" />

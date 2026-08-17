@@ -143,7 +143,7 @@ export default function Scanner() {
           const prevSet = alertingRef.current;
           const crossed = [...nowAlerting].filter((s) => !prevSet.has(s));
           alertingRef.current = nowAlerting;
-          crossed.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price }); });
+          crossed.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price, volume: r.quoteVol }); });
           if (crossed.length) {
             if (!cfg.current.muted) beep();
             const now = Date.now();
@@ -196,7 +196,7 @@ export default function Scanner() {
           const prevAlgo = algoRef.current;
           const newly = [...nowAlgo].filter((x) => !prevAlgo.has(x));
           algoRef.current = nowAlgo;
-          newly.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price }); });
+          newly.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price, volume: r.quoteVol }); });
           if (newly.length) {
             if (!cfg.current.muted) beep();
             const now = Date.now();
@@ -258,7 +258,7 @@ export default function Scanner() {
         } else {
           const newly = [...nowVol].filter((x) => !volAlertingRef.current.has(x));
           volAlertingRef.current = nowVol;
-          newly.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price }); });
+          newly.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price, volume: r.quoteVol }); });
           if (newly.length) {
             if (!cfg.current.muted) beep();
             const now = Date.now();
@@ -305,7 +305,7 @@ export default function Scanner() {
             m.set(r.symbol, r.side);
           }
           setFlipCount(flips.length);
-          flips.forEach((r) => botSignals.push({ symbol: r.symbol, side: r.side, price: r.price }));
+          flips.forEach((r) => botSignals.push({ symbol: r.symbol, side: r.side, price: r.price, volume: r.quoteVol }));
           if (flips.length) {
             if (!cfg.current.muted) beep();
             const now = Date.now();
