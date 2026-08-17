@@ -4,8 +4,8 @@ import { X, Power, ShieldAlert, Bot, Trash2, RotateCcw, TriangleAlert, Cpu } fro
 import { compactUsd } from "@/lib/format";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
-const VOL_OPTS = [50, 100, 200, 300, 400, 500, 600, 700, 1000];
-const fmtVol = (m) => (m >= 1000 ? `$${(m / 1000).toFixed(m % 1000 ? 1 : 0)}B` : `$${m}M`);
+const VOL_1S = [100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000];
+const VOL_24H = [1e6, 5e6, 1e7, 5e7, 1e8, 2.5e8, 5e8, 1e9];
 const clock = (ts) => new Date(ts * 1000).toLocaleTimeString("en-US", { hour12: false });
 
 const NumField = ({ label, value, onChange, step = "0.1", suffix, testid }) => (
@@ -169,17 +169,41 @@ export default function BotPanel({ open, onClose }) {
                 <div className="space-y-3 border-t border-zinc-100 pt-3">
                   <div className="mono text-[10px] uppercase tracking-wider text-zinc-400">Trigger</div>
                   <label className="block">
-                    <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Volume alert level</span>
+                    <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Volume window</span>
+                    <div className="flex border border-zinc-200" data-testid="bot-vol-window">
+                      {["1s", "24h"].map((w) => (
+                        <button
+                          key={w}
+                          data-testid={`bot-vol-window-${w}`}
+                          onClick={() => patch({ volWindow: w })}
+                          className={`mono flex-1 py-1.5 text-[12px] font-medium transition-colors ${w !== "1s" ? "border-l border-zinc-200" : ""} ${
+                            st.config.volWindow === w ? "bg-zinc-900 text-white" : "text-zinc-500 hover:bg-zinc-50"
+                          }`}
+                        >
+                          {w === "1s" ? "Per second" : "24 hours"}
+                        </button>
+                      ))}
+                    </div>
+                  </label>
+                  <label className="block">
+                    <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">
+                      Volume alert level ({st.config.volWindow} volume)
+                    </span>
                     <select
                       data-testid="bot-vol-threshold"
                       value={st.config.volThresholdUsd}
                       onChange={(e) => patch({ volThresholdUsd: parseFloat(e.target.value) })}
                       className="mono w-full border border-zinc-200 bg-transparent px-2 py-1.5 text-[13px] outline-none focus:border-zinc-900"
                     >
-                      {VOL_OPTS.map((m) => (
-                        <option key={m} value={m * 1e6}>{`≥ ${fmtVol(m)} 24h volume`}</option>
+                      {(st.config.volWindow === "24h" ? VOL_24H : VOL_1S).map((amt) => (
+                        <option key={amt} value={amt}>{`≥ ${compactUsd(amt)} / ${st.config.volWindow}`}</option>
                       ))}
                     </select>
+                    <span className="mono text-[9px] text-zinc-400">
+                      {st.config.volWindow === "1s"
+                        ? "Per-second volume is small (busiest pairs ~$5k/s). Use a low level so it can trigger."
+                        : "Rolling 24h quote volume."}
+                    </span>
                   </label>
                   <div className="grid grid-cols-2 gap-2">
                     <NumField testid="bot-streak" label="Repeat count" step="1" value={form.streak} onChange={(v) => setForm({ ...form, streak: v })} suffix="× / 1s" />

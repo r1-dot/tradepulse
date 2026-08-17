@@ -93,7 +93,8 @@ BOT_DEFAULTS = {
     "tpPct": 2.0,
     "maxPositionUsdt": 5.0,
     "dailyLossLimit": 5.0,
-    "volThresholdUsd": 100_000_000.0,
+    "volThresholdUsd": 1_000.0,
+    "volWindow": "1s",     # "1s" = per-second volume, "24h" = rolling 24h volume
     "streak": 2,
     "maxOpenPositions": 3,
     "cooldownSec": 30,
@@ -107,6 +108,8 @@ BOT = {
     "dailyDate": "",
     "stopped": False,       # halted by daily loss limit
     "prevPrice": {},        # symbol -> last poll price
+    "prevLastId": {},       # symbol -> last poll lastId
+    "vol1s": {},            # symbol -> estimated quote volume in last poll (~1s)
     "streaks": {},          # symbol -> {"side","count","startTs"}
     "lastTradeTs": {},      # symbol -> ts (cooldown)
 }
@@ -224,6 +227,22 @@ async def process_bot(http: httpx.AsyncClient, now: float):
         elif price <= pos["slPrice"]:
             await _close_position(http, sym, price, "stop-loss")
 
+    # compute per-second estimated quote volume for every symbol
+    prevId = BOT["prevLastId"]
+    vol1s = {}
+    for sym, v in latest.items():
+        pid = prevId.get(sym)
+        if pid is not None:
+            dt = max(0, v["lastId"] - pid)
+            avg = (v["quoteVol"] / v["count24h"]) if v["count24h"] else 0.0
+            vol1s[sym] = dt * avg
+    BOT["vol1s"] = vol1s
+
+    def metric(sym, v):
+        if cfg.get("volWindow", "1s") == "24h":
+            return v["quoteVol"]
+        return vol1s.get(sym, 0.0)
+
     # 2) detect new entry/exit signals only when running
     prev = BOT["prevPrice"]
     if cfg["enabled"] and not BOT["stopped"]:
@@ -232,7 +251,7 @@ async def process_bot(http: httpx.AsyncClient, now: float):
             price = v["price"]
             if pp is None:
                 continue
-            if v["quoteVol"] < cfg["volThresholdUsd"]:
+            if metric(sym, v) < cfg["volThresholdUsd"]:
                 BOT["streaks"].pop(sym, None)
                 continue
             side = "buy" if price >= pp else "sell"
@@ -253,6 +272,7 @@ async def process_bot(http: httpx.AsyncClient, now: float):
                 BOT["streaks"].pop(sym, None)  # reset after firing
 
     BOT["prevPrice"] = {s: v["price"] for s, v in latest.items()}
+    BOT["prevLastId"] = {s: v["lastId"] for s, v in latest.items()}
 
 
 async def save_bot_config():
@@ -487,6 +507,7 @@ class BotConfigUpdate(BaseModel):
     maxPositionUsdt: Optional[float] = None
     dailyLossLimit: Optional[float] = None
     volThresholdUsd: Optional[float] = None
+    volWindow: Optional[str] = None
     streak: Optional[int] = None
     maxOpenPositions: Optional[int] = None
     cooldownSec: Optional[int] = None
@@ -507,6 +528,10 @@ def _bot_status():
             "tpPrice": pos["tpPrice"], "slPrice": pos["slPrice"],
             "uPnl": upnl, "openedTs": pos["openedTs"], "mode": "SIM" if pos.get("dryRun") else "LIVE",
         })
+    if cfg.get("volWindow", "1s") == "24h":
+        watching = sum(1 for v in STATE["latest"].values() if v["quoteVol"] >= cfg["volThresholdUsd"])
+    else:
+        watching = sum(1 for x in BOT["vol1s"].values() if x >= cfg["volThresholdUsd"])
     return {
         "config": cfg,
         "stopped": BOT["stopped"],
@@ -517,7 +542,7 @@ def _bot_status():
         "journal": list(BOT["journal"])[:100],
         "keysConfigured": bool(BINANCE_API_KEY and BINANCE_API_SECRET),
         "tradeBase": BINANCE_TRADE_BASE_URL,
-        "watching": sum(1 for v in STATE["latest"].values() if v["quoteVol"] >= cfg["volThresholdUsd"]),
+        "watching": watching,
     }
 
 
@@ -545,6 +570,10 @@ async def bot_config(update: BotConfigUpdate):
         data["maxOpenPositions"] = max(1, min(50, int(data["maxOpenPositions"])))
     if "cooldownSec" in data:
         data["cooldownSec"] = max(0, min(3600, int(data["cooldownSec"])))
+    if "volWindow" in data and data["volWindow"] not in ("1s", "24h"):
+        data.pop("volWindow")
+    if "volThresholdUsd" in data:
+        data["volThresholdUsd"] = max(0.0, float(data["volThresholdUsd"]))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)
