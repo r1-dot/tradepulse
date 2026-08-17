@@ -1,0 +1,25 @@
+{
+  "summary": "Iteration 9 — Signal-driven Auto-Trade Bot verification. Backend pytest 9/9 passed: new /bot/status shape (alertsFeeding/lastSignalAgo/active, no volThresholdUsd/volWindow); clamps; disabled bot ignores POST /bot/signal (no position opened after 2 buy signals); enabled bot opens exactly 1 SIM position on 2 consecutive buy signals for same symbol within 1s with tp=+2%, sl=-1.5%; a single buy for a different symbol does NOT open; sell signal streak closes with journal reason 'sell-signal'; close-all + reset-daily + config persistence all good. Frontend integration test: BotPanel has no bot-vol-window/bot-vol-threshold, contains bot-feed-note, bot-feed, bot-streak, bot-cooldown, risk fields, bot-save, bot-mode, bot-power. With bot STARTED and no alerts enabled bot-feed showed 'no alerts' and 0 positions opened over ~10s (alertsFeeding=false, active=false). After enabling alert-threshold-50 on 1s timeframe the dashboard POSTed to /api/bot/signal, alertsFeeding flipped to true, journal recorded entry events (bot fired via alert history). Cleanup left system safe (enabled=false, dryRun=true, no positions).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_bot.py",
+    "/app/test_reports/pytest/bot_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "handle_signal streak uses startTs vs now with 1.5s window — matches spec (~1s). Good.",
+    "process_bot correctly only manages TP/SL exits and daily reset now; no autonomous entries. Matches new requirement.",
+    "_bot_status computes alertsFeeding as (now - lastSignalTs) < 6 which briefly stays true after the dashboard alert is turned off; acceptable (auto-expires in 6s).",
+    "POST /api/bot/signal accepts arbitrary symbol/price with no server-side sanity vs STATE['latest']; a malicious client could open SIM positions on non-existent symbols. Only impacts SIM. Consider validating symbol against STATE['latest'] before firing.",
+    "cooldownSec still allows 0. Acceptable for SIM."
+  ],
+  "updated_files": ["/app/backend/tests/test_bot.py"],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "n/a",
+  "seed_data_creation": "None. bot_config Mongo doc reset to safe defaults (enabled=false, dryRun=true).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Bot is signal-driven only. To test manually: POST /api/bot/config {enabled:true,dryRun:true,streak:2,cooldownSec:5} then POST /api/bot/signal {events:[{symbol:'BTCUSDT',side:'buy',price:63000}]} twice within 1s to open a SIM position. Frontend: bot only fires when dashboard alert (threshold/vol/flip/algo) is enabled AND bot-power ON — Scanner.jsx pushes botSignals to /api/bot/signal every poll when botRunning. Always cleanup: close-all + config enabled=false + turn off alert-toggle before finishing.",
+  "rca of the issue": "No bugs."
+}

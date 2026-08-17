@@ -1,4 +1,4 @@
-"""Auto-trade bot backend tests (SIM/dryRun only — never LIVE)."""
+"""Auto-trade bot backend tests — SIGNAL-DRIVEN (SIM/dryRun only, never LIVE)."""
 import os
 import time
 import pytest
@@ -6,7 +6,6 @@ import requests
 
 BASE_URL = os.environ.get('REACT_APP_BACKEND_URL')
 if not BASE_URL:
-    # fallback to frontend env
     with open('/app/frontend/.env') as f:
         for line in f:
             if line.startswith('REACT_APP_BACKEND_URL='):
@@ -15,53 +14,50 @@ if not BASE_URL:
 BASE_URL = BASE_URL.rstrip('/')
 API = f"{BASE_URL}/api"
 
+CFG_KEYS = ("enabled", "dryRun", "slPct", "tpPct", "maxPositionUsdt",
+            "dailyLossLimit", "streak", "maxOpenPositions", "cooldownSec")
+
 
 @pytest.fixture(scope="module")
 def client():
     s = requests.Session()
     s.headers.update({"Content-Type": "application/json"})
     yield s
-    # ensure safe cleanup
     try:
         s.post(f"{API}/bot/close-all", timeout=15)
-        s.post(f"{API}/bot/config", json={
-            "enabled": False, "dryRun": True,
-            "volThresholdUsd": 100000000, "maxOpenPositions": 3, "cooldownSec": 30,
-        }, timeout=15)
+        s.post(f"{API}/bot/config", json={"enabled": False, "dryRun": True}, timeout=15)
     except Exception:
         pass
 
 
-def test_status_default_shape(client):
+def _disable(client):
+    client.post(f"{API}/bot/close-all", timeout=15)
+    client.post(f"{API}/bot/config", json={"enabled": False, "dryRun": True}, timeout=15)
+
+
+# ---------- status shape ----------
+def test_status_shape_new_fields(client):
+    _disable(client)
     r = client.get(f"{API}/bot/status", timeout=15)
     assert r.status_code == 200
     d = r.json()
-    assert "config" in d and "stopped" in d and "dailyPnl" in d
-    assert "openPositions" in d and isinstance(d["openPositions"], list)
-    assert "journal" in d and isinstance(d["journal"], list)
-    assert "keysConfigured" in d and d["keysConfigured"] is False
-    assert "watching" in d and isinstance(d["watching"], int)
+    for k in ("config", "stopped", "dailyPnl", "openPositions", "journal",
+              "keysConfigured", "alertsFeeding", "lastSignalAgo", "active"):
+        assert k in d, f"missing top-level key: {k}"
+    assert d["keysConfigured"] is False
+    # no volThresholdUsd / volWindow anymore
     c = d["config"]
-    for k in ("enabled", "dryRun", "slPct", "tpPct", "maxPositionUsdt",
-              "dailyLossLimit", "volThresholdUsd", "streak",
-              "maxOpenPositions", "cooldownSec"):
+    assert "volThresholdUsd" not in c
+    assert "volWindow" not in c
+    for k in CFG_KEYS:
         assert k in c, f"missing config key: {k}"
+    # inactive when disabled
+    assert d["active"] is False
 
 
-def test_config_update_and_clamps(client):
-    # First: reset to safe defaults
-    r = client.post(f"{API}/bot/config", json={
-        "enabled": False, "dryRun": True,
-        "volThresholdUsd": 100000000, "maxOpenPositions": 3,
-        "cooldownSec": 30, "slPct": 1.5, "tpPct": 2.0,
-        "maxPositionUsdt": 5, "dailyLossLimit": 5, "streak": 2,
-    }, timeout=15)
-    assert r.status_code == 200
-    d = r.json()
-    assert d["config"]["dryRun"] is True
-    assert d["config"]["volThresholdUsd"] == 100000000
-
-    # Clamps: streak min 2, cooldown >= 0, slPct >= 0.1
+# ---------- config clamps ----------
+def test_config_clamps(client):
+    _disable(client)
     r = client.post(f"{API}/bot/config", json={
         "streak": 1, "cooldownSec": -5, "slPct": 0.0001, "tpPct": 0.05,
         "maxOpenPositions": 0, "maxPositionUsdt": 0, "dailyLossLimit": 0,
@@ -77,72 +73,98 @@ def test_config_update_and_clamps(client):
     assert c["dailyLossLimit"] >= 0.5
 
 
-def test_enable_clears_stopped(client):
-    r = client.post(f"{API}/bot/config", json={"enabled": True, "dryRun": True}, timeout=15)
-    assert r.status_code == 200
-    assert r.json()["stopped"] is False
-    # journal has a power entry
-    j = r.json()["journal"]
-    assert any(e.get("kind") == "power" for e in j)
+# ---------- disabled bot ignores signals ----------
+def test_disabled_bot_ignores_signals(client):
+    _disable(client)
+    for _ in range(2):
+        r = client.post(f"{API}/bot/signal", json={
+            "events": [{"symbol": "BTCUSDT", "side": "buy", "price": 63000}]
+        }, timeout=15)
+        assert r.status_code == 200
+    d = client.get(f"{API}/bot/status", timeout=15).json()
+    assert d["openPositions"] == [], "position opened while bot disabled!"
 
 
-def test_sim_trigger_creates_positions(client):
-    # Enable with low threshold + small cooldown + dryRun
+# ---------- enabled bot: 2 consecutive buys => open ----------
+def test_two_buy_signals_open_position(client):
+    _disable(client)
     r = client.post(f"{API}/bot/config", json={
-        "enabled": True, "dryRun": True,
-        "volThresholdUsd": 5000000,
-        "streak": 2, "cooldownSec": 2,
-        "maxOpenPositions": 5, "maxPositionUsdt": 5,
-        "tpPct": 2.0, "slPct": 1.5,
+        "enabled": True, "dryRun": True, "streak": 2, "cooldownSec": 5,
+        "tpPct": 2.0, "slPct": 1.5, "maxPositionUsdt": 5,
+        "maxOpenPositions": 3, "dailyLossLimit": 5,
     }, timeout=15)
     assert r.status_code == 200
     cfg = r.json()["config"]
-    assert cfg["enabled"] and cfg["dryRun"]
-    assert cfg["volThresholdUsd"] == 5000000
-    # watching should now include many pairs
-    assert r.json()["watching"] >= 1
+    assert cfg["enabled"] and cfg["dryRun"] and cfg["streak"] == 2
 
-    # Wait for bot to fire on live polls
-    positions = []
-    entry_events = 0
-    for _ in range(14):
-        time.sleep(1)
-        d = client.get(f"{API}/bot/status", timeout=15).json()
-        positions = d["openPositions"]
-        entry_events = sum(1 for e in d["journal"] if e.get("kind") == "entry")
-        if positions or entry_events:
-            break
+    sym = "BTCUSDT"
+    price = 63000.0
+    # signal #1
+    r1 = client.post(f"{API}/bot/signal", json={
+        "events": [{"symbol": sym, "side": "buy", "price": price}]
+    }, timeout=15)
+    assert r1.status_code == 200
+    # signal #2 within ~1s
+    time.sleep(0.3)
+    r2 = client.post(f"{API}/bot/signal", json={
+        "events": [{"symbol": sym, "side": "buy", "price": price}]
+    }, timeout=15)
+    assert r2.status_code == 200
 
-    # Verify at least one entry occurred
-    assert entry_events >= 1 or len(positions) >= 1, "no bot activity observed within ~14s"
     d = client.get(f"{API}/bot/status", timeout=15).json()
-    # maxOpenPositions honored
-    assert len(d["openPositions"]) <= d["config"]["maxOpenPositions"]
-
-    # If any position open, validate shape
-    if d["openPositions"]:
-        p = d["openPositions"][0]
-        assert p["entryPrice"] > 0
-        assert p["qty"] > 0
-        assert abs(p["tpPrice"] - p["entryPrice"] * 1.02) / p["entryPrice"] < 1e-6
-        assert abs(p["slPrice"] - p["entryPrice"] * 0.985) / p["entryPrice"] < 1e-6
-        assert p["mode"] == "SIM"
-    # journal 'entry' events should be marked SIM
-    for e in d["journal"]:
-        if e.get("kind") == "entry":
-            assert e.get("mode") == "SIM"
+    positions = d["openPositions"]
+    assert len(positions) == 1, f"expected 1 open position, got {len(positions)}"
+    p = positions[0]
+    assert p["symbol"] == sym
+    assert p["mode"] == "SIM"
+    assert abs(p["tpPrice"] - p["entryPrice"] * 1.02) / p["entryPrice"] < 1e-6
+    assert abs(p["slPrice"] - p["entryPrice"] * 0.985) / p["entryPrice"] < 1e-6
+    # alertsFeeding should now be True (lastSignalTs within 6s)
+    assert d["alertsFeeding"] is True
+    assert d["active"] is True
 
 
-def test_close_all(client):
+# ---------- single signal on different symbol does NOT open ----------
+def test_single_signal_does_not_open(client):
+    # bot still enabled from previous test
+    client.get(f"{API}/bot/status", timeout=15)
+    r = client.post(f"{API}/bot/signal", json={
+        "events": [{"symbol": "ETHUSDT", "side": "buy", "price": 3200}]
+    }, timeout=15)
+    assert r.status_code == 200
+    d = client.get(f"{API}/bot/status", timeout=15).json()
+    syms = [p["symbol"] for p in d["openPositions"]]
+    assert "ETHUSDT" not in syms, "opened a position on single signal!"
+
+
+# ---------- sell signal closes open position ----------
+def test_sell_signal_closes_position(client):
+    # from earlier test, BTCUSDT is open. Fire two sell signals -> streak triggers close
+    sym = "BTCUSDT"
+    price = 63500.0
+    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "sell", "price": price}]}, timeout=15)
+    time.sleep(0.2)
+    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "sell", "price": price}]}, timeout=15)
+    d = client.get(f"{API}/bot/status", timeout=15).json()
+    syms = [p["symbol"] for p in d["openPositions"]]
+    assert sym not in syms, "sell-signal did not close position"
+    # journal should contain an 'exit' with reason 'sell-signal'
+    exit_events = [e for e in d["journal"] if e.get("kind") == "exit" and e.get("symbol") == sym]
+    assert exit_events, "no exit journal entry for BTCUSDT"
+    assert exit_events[0]["reason"] == "sell-signal"
+
+
+# ---------- close-all + reset-daily ----------
+def test_close_all_and_reset_daily(client):
+    # open another position first
+    client.post(f"{API}/bot/config", json={"enabled": True, "dryRun": True, "streak": 2, "cooldownSec": 0}, timeout=15)
+    sym = "SOLUSDT"; px = 150.0
+    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "buy", "price": px}]}, timeout=15)
+    time.sleep(0.2)
+    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "buy", "price": px}]}, timeout=15)
     r = client.post(f"{API}/bot/close-all", timeout=15)
     assert r.status_code == 200
-    d = r.json()
-    assert d["openPositions"] == []
-    # journal has kill_switch
-    assert any(e.get("kind") == "kill_switch" for e in d["journal"])
-
-
-def test_reset_daily(client):
+    assert r.json()["openPositions"] == []
     r = client.post(f"{API}/bot/reset-daily", timeout=15)
     assert r.status_code == 200
     d = r.json()
@@ -150,15 +172,25 @@ def test_reset_daily(client):
     assert d["stopped"] is False
 
 
-def test_cleanup_leaves_bot_safe(client):
+# ---------- config persists across reads ----------
+def test_config_persists(client):
+    _disable(client)
+    client.post(f"{API}/bot/config", json={"streak": 3, "cooldownSec": 7, "tpPct": 3.0}, timeout=15)
+    d = client.get(f"{API}/bot/status", timeout=15).json()
+    assert d["config"]["streak"] == 3
+    assert d["config"]["cooldownSec"] == 7
+    assert abs(d["config"]["tpPct"] - 3.0) < 1e-6
+    # second read
+    d2 = client.get(f"{API}/bot/status", timeout=15).json()
+    assert d2["config"]["streak"] == 3
+
+
+# ---------- cleanup ----------
+def test_cleanup(client):
     client.post(f"{API}/bot/close-all", timeout=15)
-    r = client.post(f"{API}/bot/config", json={
-        "enabled": False, "dryRun": True,
-        "volThresholdUsd": 100000000, "maxOpenPositions": 3, "cooldownSec": 30,
-    }, timeout=15)
+    r = client.post(f"{API}/bot/config", json={"enabled": False, "dryRun": True, "streak": 2, "cooldownSec": 30}, timeout=15)
     assert r.status_code == 200
     d = r.json()
     assert d["config"]["enabled"] is False
     assert d["config"]["dryRun"] is True
-    assert d["config"]["volThresholdUsd"] == 100000000
     assert d["openPositions"] == []

@@ -93,8 +93,6 @@ BOT_DEFAULTS = {
     "tpPct": 2.0,
     "maxPositionUsdt": 5.0,
     "dailyLossLimit": 5.0,
-    "volThresholdUsd": 1_000.0,
-    "volWindow": "1s",     # "1s" = per-second volume, "24h" = rolling 24h volume
     "streak": 2,
     "maxOpenPositions": 3,
     "cooldownSec": 30,
@@ -107,10 +105,8 @@ BOT = {
     "dailyPnl": 0.0,
     "dailyDate": "",
     "stopped": False,       # halted by daily loss limit
-    "prevPrice": {},        # symbol -> last poll price
-    "prevLastId": {},       # symbol -> last poll lastId
-    "vol1s": {},            # symbol -> estimated quote volume in last poll (~1s)
-    "streaks": {},          # symbol -> {"side","count","startTs"}
+    "signalStreaks": {},    # symbol -> {"side","count","startTs"}
+    "lastSignalTs": 0.0,    # last alert event received from dashboard
     "lastTradeTs": {},      # symbol -> ts (cooldown)
 }
 
@@ -227,52 +223,34 @@ async def process_bot(http: httpx.AsyncClient, now: float):
         elif price <= pos["slPrice"]:
             await _close_position(http, sym, price, "stop-loss")
 
-    # compute per-second estimated quote volume for every symbol
-    prevId = BOT["prevLastId"]
-    vol1s = {}
-    for sym, v in latest.items():
-        pid = prevId.get(sym)
-        if pid is not None:
-            dt = max(0, v["lastId"] - pid)
-            avg = (v["quoteVol"] / v["count24h"]) if v["count24h"] else 0.0
-            vol1s[sym] = dt * avg
-    BOT["vol1s"] = vol1s
+    # Entries are driven ONLY by alert-history events pushed from the dashboard
+    # (see handle_signal + POST /api/bot/signal). If no alerts are enabled/feeding,
+    # the bot stays inactive. process_bot only handles daily reset + protective exits.
 
-    def metric(sym, v):
-        if cfg.get("volWindow", "1s") == "24h":
-            return v["quoteVol"]
-        return vol1s.get(sym, 0.0)
 
-    # 2) detect new entry/exit signals only when running
-    prev = BOT["prevPrice"]
-    if cfg["enabled"] and not BOT["stopped"]:
-        for sym, v in latest.items():
-            pp = prev.get(sym)
-            price = v["price"]
-            if pp is None:
-                continue
-            if metric(sym, v) < cfg["volThresholdUsd"]:
-                BOT["streaks"].pop(sym, None)
-                continue
-            side = "buy" if price >= pp else "sell"
-            st = BOT["streaks"].get(sym)
-            if st and st["side"] == side:
-                st["count"] += 1
-            else:
-                st = {"side": side, "count": 1, "startTs": now}
-                BOT["streaks"][sym] = st
-            if st["count"] >= cfg["streak"] and (now - st["startTs"]) <= 1.6:
-                cd = now - BOT["lastTradeTs"].get(sym, 0) >= cfg["cooldownSec"]
-                if side == "buy":
-                    if sym not in BOT["positions"] and cd and len(BOT["positions"]) < cfg["maxOpenPositions"]:
-                        await _open_position(http, sym, price, now)
-                else:  # sell closes an open position early
-                    if sym in BOT["positions"]:
-                        await _close_position(http, sym, price, "sell-signal")
-                BOT["streaks"].pop(sym, None)  # reset after firing
-
-    BOT["prevPrice"] = {s: v["price"] for s, v in latest.items()}
-    BOT["prevLastId"] = {s: v["lastId"] for s, v in latest.items()}
+async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: float, now: float):
+    """Consume one alert-history event; fire a trade on `streak` consecutive
+    same-direction alerts for the same symbol within ~1s."""
+    cfg = BOT["config"]
+    if not cfg["enabled"] or BOT["stopped"] or price <= 0:
+        return
+    if sym not in STATE["latest"]:  # only trade symbols we actually track
+        return
+    st = BOT["signalStreaks"].get(sym)
+    if st and st["side"] == side and (now - st["startTs"]) <= 1.5:
+        st["count"] += 1
+    else:
+        st = {"side": side, "count": 1, "startTs": now}
+        BOT["signalStreaks"][sym] = st
+    if st["count"] >= cfg["streak"]:
+        cd = now - BOT["lastTradeTs"].get(sym, 0) >= cfg["cooldownSec"]
+        if side == "buy":
+            if sym not in BOT["positions"] and cd and len(BOT["positions"]) < cfg["maxOpenPositions"]:
+                await _open_position(http, sym, price, now)
+        else:  # sell closes an open position early
+            if sym in BOT["positions"]:
+                await _close_position(http, sym, price, "sell-signal")
+        BOT["signalStreaks"].pop(sym, None)
 
 
 async def save_bot_config():
@@ -506,8 +484,6 @@ class BotConfigUpdate(BaseModel):
     tpPct: Optional[float] = None
     maxPositionUsdt: Optional[float] = None
     dailyLossLimit: Optional[float] = None
-    volThresholdUsd: Optional[float] = None
-    volWindow: Optional[str] = None
     streak: Optional[int] = None
     maxOpenPositions: Optional[int] = None
     cooldownSec: Optional[int] = None
@@ -528,10 +504,8 @@ def _bot_status():
             "tpPrice": pos["tpPrice"], "slPrice": pos["slPrice"],
             "uPnl": upnl, "openedTs": pos["openedTs"], "mode": "SIM" if pos.get("dryRun") else "LIVE",
         })
-    if cfg.get("volWindow", "1s") == "24h":
-        watching = sum(1 for v in STATE["latest"].values() if v["quoteVol"] >= cfg["volThresholdUsd"])
-    else:
-        watching = sum(1 for x in BOT["vol1s"].values() if x >= cfg["volThresholdUsd"])
+    now = time.time()
+    alerts_feeding = (now - BOT["lastSignalTs"]) < 6 and BOT["lastSignalTs"] > 0
     return {
         "config": cfg,
         "stopped": BOT["stopped"],
@@ -542,7 +516,9 @@ def _bot_status():
         "journal": list(BOT["journal"])[:100],
         "keysConfigured": bool(BINANCE_API_KEY and BINANCE_API_SECRET),
         "tradeBase": BINANCE_TRADE_BASE_URL,
-        "watching": watching,
+        "alertsFeeding": alerts_feeding,
+        "lastSignalAgo": round(now - BOT["lastSignalTs"], 1) if BOT["lastSignalTs"] else None,
+        "active": bool(cfg["enabled"] and not BOT["stopped"] and alerts_feeding),
     }
 
 
@@ -570,10 +546,6 @@ async def bot_config(update: BotConfigUpdate):
         data["maxOpenPositions"] = max(1, min(50, int(data["maxOpenPositions"])))
     if "cooldownSec" in data:
         data["cooldownSec"] = max(0, min(3600, int(data["cooldownSec"])))
-    if "volWindow" in data and data["volWindow"] not in ("1s", "24h"):
-        data.pop("volWindow")
-    if "volThresholdUsd" in data:
-        data["volThresholdUsd"] = max(0.0, float(data["volThresholdUsd"]))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)
@@ -582,6 +554,28 @@ async def bot_config(update: BotConfigUpdate):
         jlog("power", message=f"Bot {'STARTED' if data['enabled'] else 'STOPPED'}",
              mode="SIM" if cfg["dryRun"] else "LIVE")
     return _bot_status()
+
+
+class SignalIn(BaseModel):
+    symbol: str
+    side: str
+    price: float
+
+
+class SignalBatch(BaseModel):
+    events: list[SignalIn]
+
+
+@api_router.post("/bot/signal")
+async def bot_signal(batch: SignalBatch):
+    now = time.time()
+    BOT["lastSignalTs"] = now
+    fired = 0
+    for e in batch.events[:200]:
+        if e.side in ("buy", "sell") and e.price > 0:
+            await handle_signal(app.state.http, e.symbol.upper(), e.side, e.price, now)
+            fired += 1
+    return {"ok": True, "received": fired, "openPositions": len(BOT["positions"]), "active": bool(BOT["config"]["enabled"] and not BOT["stopped"])}
 
 
 @api_router.post("/bot/close-all")

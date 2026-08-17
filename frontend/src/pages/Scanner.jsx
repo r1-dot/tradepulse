@@ -104,7 +104,7 @@ export default function Scanner() {
 
   // stable refs for interval callback
   const cfg = useRef({ timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn });
-  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn };
+  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn, botRunning };
 
   const fetchTokens = useCallback(async () => {
     const { timeframe, sort, search } = cfg.current;
@@ -129,6 +129,7 @@ export default function Scanner() {
       });
 
       // ---- trade alerts ----
+      const botSignals = [];
       const th = cfg.current.alertThreshold;
       if (th) {
         const nowAlerting = new Set();
@@ -142,6 +143,7 @@ export default function Scanner() {
           const prevSet = alertingRef.current;
           const crossed = [...nowAlerting].filter((s) => !prevSet.has(s));
           alertingRef.current = nowAlerting;
+          crossed.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price }); });
           if (crossed.length) {
             if (!cfg.current.muted) beep();
             const now = Date.now();
@@ -194,6 +196,7 @@ export default function Scanner() {
           const prevAlgo = algoRef.current;
           const newly = [...nowAlgo].filter((x) => !prevAlgo.has(x));
           algoRef.current = nowAlgo;
+          newly.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price }); });
           if (newly.length) {
             if (!cfg.current.muted) beep();
             const now = Date.now();
@@ -255,6 +258,7 @@ export default function Scanner() {
         } else {
           const newly = [...nowVol].filter((x) => !volAlertingRef.current.has(x));
           volAlertingRef.current = nowVol;
+          newly.forEach((s) => { const r = rows.find((x) => x.symbol === s); if (r) botSignals.push({ symbol: s, side: r.side, price: r.price }); });
           if (newly.length) {
             if (!cfg.current.muted) beep();
             const now = Date.now();
@@ -301,6 +305,7 @@ export default function Scanner() {
             m.set(r.symbol, r.side);
           }
           setFlipCount(flips.length);
+          flips.forEach((r) => botSignals.push({ symbol: r.symbol, side: r.side, price: r.price }));
           if (flips.length) {
             if (!cfg.current.muted) beep();
             const now = Date.now();
@@ -323,6 +328,11 @@ export default function Scanner() {
       } else {
         prevSideRef.current = new Map();
         setFlipCount(0);
+      }
+
+      // feed alert events to the auto-trade bot (only while it is running)
+      if (cfg.current.botRunning && botSignals.length) {
+        axios.post(`${API}/bot/signal`, { events: botSignals.slice(0, 200) }).catch(() => {});
       }
     } catch (e) {
       // keep last data on transient errors
