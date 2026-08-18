@@ -158,8 +158,9 @@ export default function BotPanel({ open, onClose }) {
                 <ShieldAlert size={14} className="mt-0.5 text-zinc-500" />
                 <p className="mono text-[10px] leading-relaxed text-zinc-600">
                   The bot only follows your <b>Alert History log</b>. Enable at least one alert
-                  (Alerts / Vol / Flip / Algo) on the dashboard — the bot fires when a token logs
-                  <b> {st.config.streak}+ same-direction alerts within ~1s</b>. With no alerts enabled it stays inactive.
+                  (Alerts / Vol / Flip / Algo) on the dashboard — {st.config.streak <= 1
+                    ? <>the bot fires on <b>each qualifying alert</b> (repeat requirement off)</>
+                    : <>the bot fires when a token logs <b>{st.config.streak}+ same-direction alerts within ~1s</b></>}. With no alerts enabled it stays inactive.
                 </p>
               </div>
 
@@ -191,7 +192,7 @@ export default function BotPanel({ open, onClose }) {
                     <span className="mono text-[9px] text-zinc-400">Only buys on a BUY signal / sells on a SELL signal whose token volume is at least this.</span>
                   </label>
                   <div className="grid grid-cols-2 gap-2">
-                    <NumField testid="bot-streak" label="Repeat count" step="1" value={form.streak} onChange={(v) => setForm({ ...form, streak: v })} suffix="alerts" />
+                    <NumField testid="bot-streak" label="Repeat count (1 = off)" step="1" value={form.streak} onChange={(v) => setForm({ ...form, streak: v })} suffix="alerts" />
                     <NumField testid="bot-cooldown" label="Cooldown" step="1" value={form.cooldownSec} onChange={(v) => setForm({ ...form, cooldownSec: v })} suffix="sec" />
                   </div>
 

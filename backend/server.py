@@ -549,7 +549,7 @@ async def bot_config(update: BotConfigUpdate):
     if "dailyLossLimit" in data:
         data["dailyLossLimit"] = max(0.5, min(100000.0, data["dailyLossLimit"]))
     if "streak" in data:
-        data["streak"] = max(2, min(20, int(data["streak"])))
+        data["streak"] = max(1, min(20, int(data["streak"])))
     if "maxOpenPositions" in data:
         data["maxOpenPositions"] = max(1, min(50, int(data["maxOpenPositions"])))
     if "cooldownSec" in data:
