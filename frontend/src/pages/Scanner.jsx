@@ -90,6 +90,7 @@ export default function Scanner() {
   const [botOpen, setBotOpen] = useState(false);
   const [botRunning, setBotRunning] = useState(false);
   const [botLive, setBotLive] = useState(false);
+  const [botPositions, setBotPositions] = useState(() => new Set());
 
   const prevTrades = useRef({});
   const parentRef = useRef(null);
@@ -379,10 +380,11 @@ export default function Scanner() {
         const { data } = await axios.get(`${API}/bot/status`);
         setBotRunning(data.config.enabled);
         setBotLive(!data.config.dryRun);
+        setBotPositions(new Set((data.openPositions || []).map((p) => p.symbol)));
       } catch {}
     };
     load();
-    const id = setInterval(load, 4000);
+    const id = setInterval(load, 3000);
     return () => clearInterval(id);
   }, [botOpen]);
 
@@ -831,6 +833,9 @@ export default function Scanner() {
                   </div>
                   <div className={`text-right px-1 ${flash}`}>
                     <div className="flex items-center justify-end gap-1.5">
+                      {botPositions.has(t.symbol) && (
+                        <Bot size={11} className={t.side === "buy" ? "text-[#00C805]" : "text-[#FF3B30]"} data-testid={`bot-flag-${t.symbol}`} />
+                      )}
                       <span
                         data-testid={`side-${t.symbol}`}
                         className={`text-[9px] font-semibold uppercase tracking-wide ${t.side === "buy" ? "text-[#00C805]" : "text-[#FF3B30]"}`}
