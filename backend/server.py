@@ -234,11 +234,14 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
     same-direction alerts for the same symbol within ~1s. BUY only on buy signals,
     SELL only on sell signals; both gated by the token volume filter."""
     cfg = BOT["config"]
-    if not cfg["enabled"] or BOT["stopped"] or price <= 0:
+    if not cfg["enabled"] or BOT["stopped"]:
         return
-    if sym not in STATE["latest"]:  # only trade symbols we actually track
+    info = STATE["latest"].get(sym)  # only trade tracked symbols; use authoritative server data
+    if not info:
         return
-    if volume < cfg.get("minVolumeUsd", 0):  # volume gate
+    price = info["price"]
+    volume = info["quoteVol"]
+    if price <= 0 or volume < cfg.get("minVolumeUsd", 0):  # server-side volume gate (anti-spoof)
         return
     st = BOT["signalStreaks"].get(sym)
     if st and st["side"] == side and (now - st["startTs"]) <= 1.5:

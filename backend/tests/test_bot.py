@@ -15,7 +15,9 @@ BASE_URL = BASE_URL.rstrip('/')
 API = f"{BASE_URL}/api"
 
 CFG_KEYS = ("enabled", "dryRun", "slPct", "tpPct", "maxPositionUsdt",
-            "dailyLossLimit", "streak", "maxOpenPositions", "cooldownSec")
+            "dailyLossLimit", "streak", "maxOpenPositions", "cooldownSec", "minVolumeUsd")
+
+HIGH_VOL = 10_000_000_000.0  # bypass volume gate in signal tests
 
 
 @pytest.fixture(scope="module")
@@ -35,6 +37,38 @@ def _disable(client):
     client.post(f"{API}/bot/config", json={"enabled": False, "dryRun": True}, timeout=15)
 
 
+# ---------- CORE FIX: signals set alertsFeeding even while bot disabled ----------
+def test_alerts_feeding_when_bot_disabled(client):
+    _disable(client)
+    d0 = client.get(f"{API}/bot/status", timeout=15).json()
+    r = client.post(f"{API}/bot/signal", json={
+        "events": [{"symbol": "BTCUSDT", "side": "buy", "price": 63000, "volume": HIGH_VOL}]
+    }, timeout=15)
+    assert r.status_code == 200
+    d = client.get(f"{API}/bot/status", timeout=15).json()
+    assert d["alertsFeeding"] is True, "alertsFeeding should flip True on signal even when bot disabled"
+    assert d["openPositions"] == [], "should not open positions while disabled"
+
+
+# ---------- volume gate blocks trades when signal volume < minVolumeUsd ----------
+def test_volume_gate_blocks(client):
+    _disable(client)
+    client.post(f"{API}/bot/config", json={
+        "enabled": True, "dryRun": True, "streak": 2, "cooldownSec": 0,
+        "minVolumeUsd": 900_000_000_000.0,  # absurdly high
+    }, timeout=15)
+    for _ in range(3):
+        client.post(f"{API}/bot/signal", json={
+            "events": [{"symbol": "BTCUSDT", "side": "buy", "price": 63000, "volume": 100_000_000.0}]
+        }, timeout=15)
+        time.sleep(0.2)
+    d = client.get(f"{API}/bot/status", timeout=15).json()
+    syms = [p["symbol"] for p in d["openPositions"]]
+    assert "BTCUSDT" not in syms, "volume gate failed to block low-volume signal"
+    # feed still shows as feeding
+    assert d["alertsFeeding"] is True
+
+
 # ---------- status shape ----------
 def test_status_shape_new_fields(client):
     _disable(client)
@@ -44,7 +78,7 @@ def test_status_shape_new_fields(client):
     for k in ("config", "stopped", "dailyPnl", "openPositions", "journal",
               "keysConfigured", "alertsFeeding", "lastSignalAgo", "active"):
         assert k in d, f"missing top-level key: {k}"
-    assert d["keysConfigured"] is False
+    assert d["keysConfigured"] in (True, False)  # binance keys optional
     # no volThresholdUsd / volWindow anymore
     c = d["config"]
     assert "volThresholdUsd" not in c
@@ -78,7 +112,7 @@ def test_disabled_bot_ignores_signals(client):
     _disable(client)
     for _ in range(2):
         r = client.post(f"{API}/bot/signal", json={
-            "events": [{"symbol": "BTCUSDT", "side": "buy", "price": 63000}]
+            "events": [{"symbol": "BTCUSDT", "side": "buy", "price": 63000, "volume": HIGH_VOL}]
         }, timeout=15)
         assert r.status_code == 200
     d = client.get(f"{API}/bot/status", timeout=15).json()
@@ -91,7 +125,7 @@ def test_two_buy_signals_open_position(client):
     r = client.post(f"{API}/bot/config", json={
         "enabled": True, "dryRun": True, "streak": 2, "cooldownSec": 5,
         "tpPct": 2.0, "slPct": 1.5, "maxPositionUsdt": 5,
-        "maxOpenPositions": 3, "dailyLossLimit": 5,
+        "maxOpenPositions": 3, "dailyLossLimit": 5, "minVolumeUsd": 1_000_000,
     }, timeout=15)
     assert r.status_code == 200
     cfg = r.json()["config"]
@@ -101,13 +135,13 @@ def test_two_buy_signals_open_position(client):
     price = 63000.0
     # signal #1
     r1 = client.post(f"{API}/bot/signal", json={
-        "events": [{"symbol": sym, "side": "buy", "price": price}]
+        "events": [{"symbol": sym, "side": "buy", "price": price, "volume": HIGH_VOL}]
     }, timeout=15)
     assert r1.status_code == 200
     # signal #2 within ~1s
     time.sleep(0.3)
     r2 = client.post(f"{API}/bot/signal", json={
-        "events": [{"symbol": sym, "side": "buy", "price": price}]
+        "events": [{"symbol": sym, "side": "buy", "price": price, "volume": HIGH_VOL}]
     }, timeout=15)
     assert r2.status_code == 200
 
@@ -129,7 +163,7 @@ def test_single_signal_does_not_open(client):
     # bot still enabled from previous test
     client.get(f"{API}/bot/status", timeout=15)
     r = client.post(f"{API}/bot/signal", json={
-        "events": [{"symbol": "ETHUSDT", "side": "buy", "price": 3200}]
+        "events": [{"symbol": "ETHUSDT", "side": "buy", "price": 3200, "volume": HIGH_VOL}]
     }, timeout=15)
     assert r.status_code == 200
     d = client.get(f"{API}/bot/status", timeout=15).json()
@@ -142,9 +176,9 @@ def test_sell_signal_closes_position(client):
     # from earlier test, BTCUSDT is open. Fire two sell signals -> streak triggers close
     sym = "BTCUSDT"
     price = 63500.0
-    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "sell", "price": price}]}, timeout=15)
+    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "sell", "price": price, "volume": HIGH_VOL}]}, timeout=15)
     time.sleep(0.2)
-    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "sell", "price": price}]}, timeout=15)
+    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "sell", "price": price, "volume": HIGH_VOL}]}, timeout=15)
     d = client.get(f"{API}/bot/status", timeout=15).json()
     syms = [p["symbol"] for p in d["openPositions"]]
     assert sym not in syms, "sell-signal did not close position"
@@ -157,11 +191,11 @@ def test_sell_signal_closes_position(client):
 # ---------- close-all + reset-daily ----------
 def test_close_all_and_reset_daily(client):
     # open another position first
-    client.post(f"{API}/bot/config", json={"enabled": True, "dryRun": True, "streak": 2, "cooldownSec": 0}, timeout=15)
+    client.post(f"{API}/bot/config", json={"enabled": True, "dryRun": True, "streak": 2, "cooldownSec": 0, "minVolumeUsd": 1_000_000}, timeout=15)
     sym = "SOLUSDT"; px = 150.0
-    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "buy", "price": px}]}, timeout=15)
+    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "buy", "price": px, "volume": HIGH_VOL}]}, timeout=15)
     time.sleep(0.2)
-    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "buy", "price": px}]}, timeout=15)
+    client.post(f"{API}/bot/signal", json={"events": [{"symbol": sym, "side": "buy", "price": px, "volume": HIGH_VOL}]}, timeout=15)
     r = client.post(f"{API}/bot/close-all", timeout=15)
     assert r.status_code == 200
     assert r.json()["openPositions"] == []

@@ -330,8 +330,9 @@ export default function Scanner() {
         setFlipCount(0);
       }
 
-      // feed alert events to the auto-trade bot (only while it is running)
-      if (cfg.current.botRunning && botSignals.length) {
+      // feed every alert event straight into the auto-trade bot's alert feed.
+      // (the bot still only TRADES when started + volume gate passes.)
+      if (botSignals.length) {
         axios.post(`${API}/bot/signal`, { events: botSignals.slice(0, 200) }).catch(() => {});
       }
     } catch (e) {
