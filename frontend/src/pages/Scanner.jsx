@@ -948,6 +948,9 @@ export default function Scanner() {
                     <div className="mono text-[10px] text-zinc-400 w-16 shrink-0">{fmtClock(h.ts)}</div>
                     <div className="flex-1 min-w-0">
                       <div className="mono text-[13px] font-semibold text-zinc-900 flex items-center gap-1">
+                        {botPositions.has(h.symbol) && (
+                          <Bot size={11} className="text-[#00C805]" data-testid={`history-bot-flag-${h.symbol}`} />
+                        )}
                         {h.base}<span className="text-[10px] text-zinc-300">/USDT</span>
                         {h.kind === "algo" && (
                           <span className="inline-flex items-center gap-0.5 rounded-sm bg-[#F5A623]/15 px-1 text-[8px] font-semibold uppercase text-[#B26A00]"><Cpu size={8} /> algo</span>
