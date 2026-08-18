@@ -205,6 +205,16 @@ export default function BotPanel({ open, onClose }) {
                     <NumField testid="bot-max-open" label="Max open positions" step="1" value={form.maxOpenPositions} onChange={(v) => setForm({ ...form, maxOpenPositions: v })} />
                   </div>
                   <button
+                    data-testid="bot-autoexit-toggle"
+                    onClick={() => patch({ autoExit: !st.config.autoExit })}
+                    className={`mono flex w-full items-center justify-between border px-3 py-2 text-[12px] transition-colors ${
+                      st.config.autoExit ? "border-zinc-200 text-zinc-700" : "border-[#FF3B30] text-[#FF3B30]"
+                    }`}
+                  >
+                    <span>Auto exit on TP / SL</span>
+                    <span className="font-semibold">{st.config.autoExit ? "ON" : "OFF — sell-signal only"}</span>
+                  </button>
+                  <button
                     data-testid="bot-save"
                     onClick={saveSettings}
                     disabled={saving}

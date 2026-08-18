@@ -97,6 +97,7 @@ BOT_DEFAULTS = {
     "maxOpenPositions": 3,
     "cooldownSec": 30,
     "minVolumeUsd": 5_000_000.0,
+    "autoExit": True,      # auto-close on TP/SL; if False, positions close only on a SELL signal
 }
 
 BOT = {
@@ -212,17 +213,19 @@ async def process_bot(http: httpx.AsyncClient, now: float):
         BOT["stopped"] = False
         jlog("daily_reset", date=today)
 
-    # 1) manage exits for open positions (always active to protect capital)
-    for sym in list(BOT["positions"].keys()):
-        v = latest.get(sym)
-        if not v:
-            continue
-        price = v["price"]
-        pos = BOT["positions"][sym]
-        if price >= pos["tpPrice"]:
-            await _close_position(http, sym, price, "take-profit")
-        elif price <= pos["slPrice"]:
-            await _close_position(http, sym, price, "stop-loss")
+    # 1) manage TP/SL exits (only when autoExit enabled; otherwise exits happen
+    #    solely on a SELL signal via handle_signal)
+    if cfg.get("autoExit", True):
+        for sym in list(BOT["positions"].keys()):
+            v = latest.get(sym)
+            if not v:
+                continue
+            price = v["price"]
+            pos = BOT["positions"][sym]
+            if price >= pos["tpPrice"]:
+                await _close_position(http, sym, price, "take-profit")
+            elif price <= pos["slPrice"]:
+                await _close_position(http, sym, price, "stop-loss")
 
     # Entries are driven ONLY by alert-history events pushed from the dashboard
     # (see handle_signal + POST /api/bot/signal). If no alerts are enabled/feeding,
@@ -495,6 +498,7 @@ class BotConfigUpdate(BaseModel):
     maxOpenPositions: Optional[int] = None
     cooldownSec: Optional[int] = None
     minVolumeUsd: Optional[float] = None
+    autoExit: Optional[bool] = None
 
 
 def _bot_status():
