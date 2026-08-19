@@ -178,18 +178,32 @@ export default function BotPanel({ open, onClose }) {
                 <div className="space-y-3 border-t border-zinc-100 pt-3">
                   <div className="mono text-[10px] uppercase tracking-wider text-zinc-400">Trigger</div>
                   <label className="block">
-                    <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Minimum volume (buy/sell signal)</span>
-                    <select
-                      data-testid="bot-min-volume"
-                      value={st.config.minVolumeUsd}
-                      onChange={(e) => patch({ minVolumeUsd: parseFloat(e.target.value) })}
-                      className="mono w-full border border-zinc-200 bg-transparent px-2 py-1.5 text-[13px] outline-none focus:border-zinc-900"
-                    >
-                      {BOT_VOL.map((m) => (
-                        <option key={m} value={m * 1e6}>{`≥ ${fmtM(m)} volume`}</option>
-                      ))}
-                    </select>
-                    <span className="mono text-[9px] text-zinc-400">Only buys on a BUY signal / sells on a SELL signal whose token volume is at least this.</span>
+                    <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Volume band (buy/sell signal)</span>
+                    <div className="flex items-center gap-2">
+                      <select
+                        data-testid="bot-min-volume"
+                        value={st.config.minVolumeUsd}
+                        onChange={(e) => patch({ minVolumeUsd: parseFloat(e.target.value) })}
+                        className="mono w-full border border-zinc-200 bg-transparent px-2 py-1.5 text-[13px] outline-none focus:border-zinc-900"
+                      >
+                        {BOT_VOL.map((m) => (
+                          <option key={m} value={m * 1e6}>{`min ${fmtM(m)}`}</option>
+                        ))}
+                      </select>
+                      <span className="mono text-zinc-400 text-[12px]">to</span>
+                      <select
+                        data-testid="bot-max-volume"
+                        value={st.config.maxVolumeUsd}
+                        onChange={(e) => patch({ maxVolumeUsd: parseFloat(e.target.value) })}
+                        className="mono w-full border border-zinc-200 bg-transparent px-2 py-1.5 text-[13px] outline-none focus:border-zinc-900"
+                      >
+                        <option value={0}>max ∞</option>
+                        {BOT_VOL.map((m) => (
+                          <option key={m} value={m * 1e6}>{`max ${fmtM(m)}`}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <span className="mono text-[9px] text-zinc-400">Only trades signals whose token volume falls inside this band (∞ = no upper limit).</span>
                   </label>
                   <div className="grid grid-cols-2 gap-2">
                     <NumField testid="bot-streak" label="Repeat count (1 = off)" step="1" value={form.streak} onChange={(v) => setForm({ ...form, streak: v })} suffix="alerts" />

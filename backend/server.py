@@ -97,6 +97,7 @@ BOT_DEFAULTS = {
     "maxOpenPositions": 3,
     "cooldownSec": 30,
     "minVolumeUsd": 5_000_000.0,
+    "maxVolumeUsd": 0.0,   # 0 = no upper limit
     "autoExit": True,      # auto-close on TP/SL; if False, positions close only on a SELL signal
 }
 
@@ -245,6 +246,9 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
     price = info["price"]
     volume = info["quoteVol"]
     if price <= 0 or volume < cfg.get("minVolumeUsd", 0):  # server-side volume gate (anti-spoof)
+        return
+    _maxv = cfg.get("maxVolumeUsd", 0) or 0
+    if _maxv > 0 and volume > _maxv:  # upper bound of the volume band
         return
     st = BOT["signalStreaks"].get(sym)
     if st and st["side"] == side and (now - st["startTs"]) <= 1.5:
@@ -498,6 +502,7 @@ class BotConfigUpdate(BaseModel):
     maxOpenPositions: Optional[int] = None
     cooldownSec: Optional[int] = None
     minVolumeUsd: Optional[float] = None
+    maxVolumeUsd: Optional[float] = None
     autoExit: Optional[bool] = None
 
 
@@ -560,6 +565,8 @@ async def bot_config(update: BotConfigUpdate):
         data["cooldownSec"] = max(0, min(3600, int(data["cooldownSec"])))
     if "minVolumeUsd" in data:
         data["minVolumeUsd"] = max(0.0, float(data["minVolumeUsd"]))
+    if "maxVolumeUsd" in data:
+        data["maxVolumeUsd"] = max(0.0, float(data["maxVolumeUsd"]))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)
