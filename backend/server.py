@@ -100,7 +100,7 @@ BOT_DEFAULTS = {
     "minVolumeUsd": 5_000_000.0,
     "maxVolumeUsd": 0.0,   # 0 = no upper limit
     "autoExit": True,      # auto-close on TP/SL; if False, positions close only on a SELL signal
-    "webhookEnabled": True,
+    "webhookEnabled": False,
     "webhookUrl": "https://wtalerts.com/bot/runbot",
     "webhookBuyMsg": "",   # message sent on BUY (paste your WunderTrading bot signal)
     "webhookSellMsg": "",  # message sent on SELL
