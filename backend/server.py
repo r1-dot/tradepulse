@@ -16,6 +16,7 @@ from pydantic import BaseModel
 import os
 import asyncio
 import time
+import json
 import hmac
 import hashlib
 import logging
@@ -99,6 +100,10 @@ BOT_DEFAULTS = {
     "minVolumeUsd": 5_000_000.0,
     "maxVolumeUsd": 0.0,   # 0 = no upper limit
     "autoExit": True,      # auto-close on TP/SL; if False, positions close only on a SELL signal
+    "webhookEnabled": True,
+    "webhookUrl": "https://wtalerts.com/bot/runbot",
+    "webhookBuyMsg": "",   # message sent on BUY (paste your WunderTrading bot signal)
+    "webhookSellMsg": "",  # message sent on SELL
 }
 
 BOT = {
@@ -118,6 +123,26 @@ def jlog(kind: str, **kw):
     entry = {"ts": time.time(), "kind": kind, **kw}
     BOT["journal"].appendleft(entry)
     return entry
+
+
+async def send_webhook(action: str, symbol: str, price: float):
+    """POST a buy/sell signal to the configured external webhook (e.g. WunderTrading)."""
+    cfg = BOT["config"]
+    url = cfg.get("webhookUrl") or ""
+    if not cfg.get("webhookEnabled") or not url:
+        return
+    tmpl = cfg.get("webhookBuyMsg") if action == "buy" else cfg.get("webhookSellMsg")
+    if tmpl:
+        msg = (tmpl.replace("{{symbol}}", symbol).replace("{{ticker}}", symbol)
+                   .replace("{{price}}", str(price)).replace("{{action}}", action)
+                   .replace("{{side}}", action))
+    else:
+        msg = json.dumps({"action": action, "symbol": symbol, "price": price, "exchange": "BINANCE"})
+    try:
+        r = await app.state.http.post(url, json={"message": msg}, timeout=10)
+        jlog("webhook", action=action, symbol=symbol, status=r.status_code, message=msg[:80])
+    except Exception as e:  # noqa: BLE001
+        jlog("webhook", action=action, symbol=symbol, status="error", message=str(e)[:80])
 
 
 async def binance_signed(http: httpx.AsyncClient, method: str, path: str, params: dict):
@@ -176,6 +201,7 @@ async def _open_position(http, sym, price, now):
     jlog("entry", symbol=sym, base=pos["base"], side="buy", price=fill, qty=executed,
          spent=pos["quoteSpent"], tp=pos["tpPrice"], sl=pos["slPrice"],
          mode="SIM" if cfg["dryRun"] else "LIVE")
+    await send_webhook("buy", sym, fill)
 
 
 async def _close_position(http, sym, price, reason):
@@ -196,6 +222,7 @@ async def _close_position(http, sym, price, reason):
     jlog("exit", symbol=sym, base=pos["base"], side="sell", price=fill,
          entry=pos["entryPrice"], qty=pos["qty"], pnl=pnl, reason=reason,
          mode="SIM" if pos.get("dryRun") else "LIVE")
+    await send_webhook("sell", sym, fill)
     if BOT["dailyPnl"] <= -cfg["dailyLossLimit"]:
         BOT["stopped"] = True
         cfg["enabled"] = False
@@ -504,6 +531,10 @@ class BotConfigUpdate(BaseModel):
     minVolumeUsd: Optional[float] = None
     maxVolumeUsd: Optional[float] = None
     autoExit: Optional[bool] = None
+    webhookEnabled: Optional[bool] = None
+    webhookUrl: Optional[str] = None
+    webhookBuyMsg: Optional[str] = None
+    webhookSellMsg: Optional[str] = None
 
 
 def _bot_status():
@@ -617,6 +648,13 @@ async def bot_reset_daily():
     BOT["dailyPnl"] = 0.0
     BOT["stopped"] = False
     jlog("daily_reset", message="Manual daily reset")
+    return _bot_status()
+
+
+@api_router.post("/bot/test-webhook")
+async def bot_test_webhook():
+    price = STATE["latest"].get("BTCUSDT", {}).get("price", 0) or 0
+    await send_webhook("buy", "BTCUSDT", price)
     return _bot_status()
 
 

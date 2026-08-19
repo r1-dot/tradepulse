@@ -74,7 +74,12 @@ export default function BotPanel({ open, onClose }) {
     streak: parseInt(form.streak, 10),
     maxOpenPositions: parseInt(form.maxOpenPositions, 10),
     cooldownSec: parseInt(form.cooldownSec, 10),
+    webhookUrl: form.webhookUrl || "",
+    webhookBuyMsg: form.webhookBuyMsg || "",
+    webhookSellMsg: form.webhookSellMsg || "",
   });
+
+  const testWebhook = async () => { await axios.post(`${API}/bot/test-webhook`); load(); };
 
   const closeAll = async () => { await axios.post(`${API}/bot/close-all`); load(); };
   const resetDaily = async () => { await axios.post(`${API}/bot/reset-daily`); load(); };
@@ -236,6 +241,48 @@ export default function BotPanel({ open, onClose }) {
                   >
                     {saving ? "Saving…" : "Save settings"}
                   </button>
+
+                  {/* webhook / external bot */}
+                  <div className="space-y-2 border-t border-zinc-100 pt-3">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Webhook (send buys/sells out)</span>
+                      <button
+                        data-testid="bot-webhook-toggle"
+                        onClick={() => patch({ webhookEnabled: !st.config.webhookEnabled })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.webhookEnabled ? "border-[#00C805] text-[#00A004]" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.webhookEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <input
+                      data-testid="bot-webhook-url"
+                      value={form.webhookUrl || ""}
+                      onChange={(e) => setForm({ ...form, webhookUrl: e.target.value })}
+                      placeholder="https://wtalerts.com/bot/runbot"
+                      className="mono w-full border border-zinc-200 bg-transparent px-2 py-1.5 text-[11px] outline-none focus:border-zinc-900"
+                    />
+                    <textarea
+                      data-testid="bot-webhook-buy"
+                      value={form.webhookBuyMsg || ""}
+                      onChange={(e) => setForm({ ...form, webhookBuyMsg: e.target.value })}
+                      placeholder="BUY message — paste your WunderTrading signal (placeholders: {{symbol}} {{price}})"
+                      rows={2}
+                      className="mono w-full resize-none border border-zinc-200 bg-transparent px-2 py-1.5 text-[11px] outline-none focus:border-zinc-900"
+                    />
+                    <textarea
+                      data-testid="bot-webhook-sell"
+                      value={form.webhookSellMsg || ""}
+                      onChange={(e) => setForm({ ...form, webhookSellMsg: e.target.value })}
+                      placeholder="SELL message — paste your WunderTrading signal"
+                      rows={2}
+                      className="mono w-full resize-none border border-zinc-200 bg-transparent px-2 py-1.5 text-[11px] outline-none focus:border-zinc-900"
+                    />
+                    <div className="flex gap-2">
+                      <button data-testid="bot-webhook-save" onClick={saveSettings} className="mono flex-1 border border-zinc-300 py-1.5 text-[11px] hover:border-zinc-900">Save webhook</button>
+                      <button data-testid="bot-webhook-test" onClick={testWebhook} className="mono flex-1 border border-zinc-900 bg-zinc-900 py-1.5 text-[11px] font-semibold text-white hover:bg-zinc-700">Send test</button>
+                    </div>
+                    <span className="mono text-[9px] text-zinc-400">Leave messages blank to send a JSON payload. WunderTrading needs the exact signal text from your bot.</span>
+                  </div>
                 </div>
               )}
 
@@ -300,5 +347,6 @@ const JournalLine = ({ j }) => {
   if (j.kind === "power") return <span className="text-zinc-700">{j.message} ({j.mode})</span>;
   if (j.kind === "error") return <span className="text-[#FF3B30]">ERR {j.symbol} {j.action}: {String(j.message).slice(0, 60)}</span>;
   if (j.kind === "kill_switch") return <span className="text-[#FF3B30]">{j.message}</span>;
+  if (j.kind === "webhook") return <span className={j.status === 200 ? "text-[#00A004]" : "text-[#B26A00]"}>webhook {j.action} {j.symbol} → {String(j.status)}</span>;
   return <span className="text-zinc-400">{j.message || j.kind}</span>;
 };
