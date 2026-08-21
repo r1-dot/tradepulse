@@ -139,7 +139,7 @@ async def send_webhook(action: str, symbol: str, price: float):
     else:
         msg = json.dumps({"action": action, "symbol": symbol, "price": price, "exchange": "BINANCE"})
     try:
-        r = await app.state.http.post(url, json={"message": msg}, timeout=10)
+        r = await app.state.http.post(url, content=msg.encode(), headers={"Content-Type": "text/plain"}, timeout=10)
         jlog("webhook", action=action, symbol=symbol, status=r.status_code, message=msg[:80])
     except Exception as e:  # noqa: BLE001
         jlog("webhook", action=action, symbol=symbol, status="error", message=str(e)[:80])
