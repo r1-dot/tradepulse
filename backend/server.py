@@ -670,6 +670,36 @@ async def bot_test_webhook():
     return _bot_status()
 
 
+@api_router.get("/hyperliquid/account")
+async def hyperliquid_account():
+    """Read-only Hyperliquid account state for the configured address (no private key needed)."""
+    addr = os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "")
+    net = os.environ.get("HYPERLIQUID_NETWORK", "mainnet").lower()
+    if not addr:
+        raise HTTPException(400, "HYPERLIQUID_ACCOUNT_ADDRESS not configured")
+    try:
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+        base = constants.MAINNET_API_URL if net == "mainnet" else constants.TESTNET_API_URL
+        info = Info(base, skip_ws=True)
+        state = await asyncio.to_thread(info.user_state, addr)
+        ms = state.get("marginSummary", {})
+        positions = [
+            {"coin": p["position"]["coin"], "szi": p["position"]["szi"],
+             "entryPx": p["position"].get("entryPx"), "unrealizedPnl": p["position"].get("unrealizedPnl")}
+            for p in state.get("assetPositions", [])
+        ]
+        return {
+            "address": addr, "network": net,
+            "accountValue": float(ms.get("accountValue", 0) or 0),
+            "withdrawable": float(state.get("withdrawable", 0) or 0),
+            "positions": positions,
+            "keyConfigured": bool(os.environ.get("HYPERLIQUID_PRIVATE_KEY")),
+        }
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"Hyperliquid info failed: {e}")
+
+
 
 # ----------------------------- Market overview (external APIs) -----------------------------
 _MO_CACHE = {"ts": 0.0, "data": None}
