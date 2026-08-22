@@ -63,6 +63,7 @@ export default function Scanner() {
   const [timeframe, setTimeframe] = useState("1s");
   const [sort, setSort] = useState("trades_desc");
   const [search, setSearch] = useState("");
+  const [quote, setQuote] = useState("USDT");
   const [tokens, setTokens] = useState([]);
   const [meta, setMeta] = useState({});
   const [status, setStatus] = useState({});
@@ -105,13 +106,13 @@ export default function Scanner() {
 
   // stable refs for interval callback
   const cfg = useRef({ timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn });
-  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn, botRunning };
+  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn, botRunning, quote };
 
   const fetchTokens = useCallback(async () => {
-    const { timeframe, sort, search } = cfg.current;
+    const { timeframe, sort, search, quote } = cfg.current;
     try {
       const { data } = await axios.get(`${API}/tokens`, {
-        params: { timeframe, sort, search, limit: 1000 },
+        params: { timeframe, sort, search, quote, limit: 1000 },
       });
       const prev = prevTrades.current;
       const next = {};
@@ -355,7 +356,7 @@ export default function Scanner() {
     volSeedRef.current = true;
     flipSeedRef.current = true;
     fetchTokens();
-  }, [timeframe, sort, search, alertThreshold, algoOn, algoSens, volThreshold, flipOn, fetchTokens]);
+  }, [timeframe, sort, search, alertThreshold, algoOn, algoSens, volThreshold, flipOn, quote, fetchTokens]);
 
   // engine status + market overview
   useEffect(() => {
@@ -468,6 +469,21 @@ export default function Scanner() {
           <span className="mono text-[11px] text-zinc-500">
             {connected ? "LIVE" : "CONNECTING"} · {status.pairsTracked || 0} pairs
           </span>
+        </div>
+
+        <div className="ml-3 flex items-center border border-zinc-200" data-testid="quote-filter">
+          {["USDT", "USDC"].map((qc, i) => (
+            <button
+              key={qc}
+              data-testid={`quote-${qc}`}
+              onClick={() => setQuote(qc)}
+              className={`mono px-2.5 py-1 text-[11px] font-semibold transition-colors ${i > 0 ? "border-l border-zinc-200" : ""} ${
+                quote === qc ? "bg-zinc-900 text-white" : "text-zinc-500 hover:bg-zinc-50"
+              }`}
+            >
+              {qc}
+            </button>
+          ))}
         </div>
 
         <button
@@ -807,7 +823,7 @@ export default function Scanner() {
                   <div className="flex items-baseline gap-1">
                     {isAlert && <BellRing size={11} className="text-[#002FA7]" data-testid={`alert-flag-${t.symbol}`} />}
                     <span className="mono font-semibold text-zinc-900">{t.base}</span>
-                    <span className="mono text-[10px] text-zinc-300">/USDT</span>
+                    <span className="mono text-[10px] text-zinc-300">/{t.quote}</span>
                     {isAlgo && (
                       <span
                         data-testid={`algo-flag-${t.symbol}`}

@@ -35,7 +35,8 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 BINANCE_BASE = os.environ.get('BINANCE_BASE', 'https://data-api.binance.vision')
-QUOTE = os.environ.get('BINANCE_QUOTE', 'USDT')
+QUOTES = [q.strip().upper() for q in os.environ.get('BINANCE_QUOTE', 'USDT,USDC').split(',') if q.strip()]
+QUOTE = QUOTES[0]
 ETHERSCAN_API_KEY = os.environ.get('ETHERSCAN_API_KEY', '')
 COINMARKETCAP_API_KEY = os.environ.get('COINMARKETCAP_API_KEY', '')
 COINGECKO_API_KEY = os.environ.get('COINGECKO_API_KEY', '')
@@ -327,7 +328,8 @@ async def poll_binance(http: httpx.AsyncClient):
             snap = {}
             for x in data:
                 sym = x["symbol"]
-                if not sym.endswith(QUOTE):
+                quote = next((q for q in QUOTES if sym.endswith(q)), None)
+                if quote is None:
                     continue
                 try:
                     last_id = int(x["lastId"])
@@ -336,7 +338,8 @@ async def poll_binance(http: httpx.AsyncClient):
                 if last_id < 0:
                     continue
                 latest[sym] = {
-                    "base": sym[: -len(QUOTE)],
+                    "base": sym[: -len(quote)],
+                    "quote": quote,
                     "price": float(x["lastPrice"]),
                     "change": float(x["priceChangePercent"]),
                     "quoteVol": float(x["quoteVolume"]),
@@ -448,6 +451,7 @@ async def get_tokens(
     timeframe: str = Query("1s"),
     search: str = Query(""),
     sort: str = Query("trades_desc"),
+    quote: str = Query("USDT"),
     limit: int = Query(1000, le=2000),
 ):
     if timeframe not in TF_SECONDS:
@@ -458,10 +462,15 @@ async def get_tokens(
     trades, approx = compute_trades(TF_SECONDS[timeframe])
     latest = STATE["latest"]
     q = search.strip().upper()
+    quote = quote.strip().upper()
 
     rows = []
     total_trades = 0
+    total_pairs = 0
     for sym, v in latest.items():
+        if quote != "ALL" and v.get("quote") != quote:
+            continue
+        total_pairs += 1
         if q and q not in sym:
             continue
         cell = trades.get(sym) or {"trades": 0, "side": "buy"}
@@ -470,6 +479,7 @@ async def get_tokens(
         rows.append({
             "symbol": sym,
             "base": v["base"],
+            "quote": v.get("quote", QUOTE),
             "price": v["price"],
             "change": v["change"],
             "quoteVol": v["quoteVol"],
@@ -493,8 +503,10 @@ async def get_tokens(
     return {
         "timeframe": timeframe,
         "approx": approx,
+        "quote": quote,
+        "quotes": QUOTES,
         "total": matched,
-        "totalPairs": len(latest),
+        "totalPairs": total_pairs,
         "totalTrades": total_trades,
         "historyDepthSec": round(_history_depth()),
         "tokens": rows,
