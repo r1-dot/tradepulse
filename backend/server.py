@@ -9,8 +9,10 @@ counts for 1s ... 10d can be computed exactly (long windows fill in as the engin
 until then they are scaled from the real 24h trade count).
 """
 from fastapi import FastAPI, APIRouter, Query, HTTPException
+from fastapi.responses import ORJSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 import os
@@ -47,7 +49,8 @@ BINANCE_TRADE_BASE_URL = os.environ.get('BINANCE_TRADE_BASE_URL', 'https://api.b
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("scanner")
 
-app = FastAPI()
+app = FastAPI(default_response_class=ORJSONResponse)
+app.add_middleware(GZipMiddleware, minimum_size=800)
 api_router = APIRouter(prefix="/api")
 
 # ----------------------------- Timeframes -----------------------------

@@ -402,7 +402,7 @@ export default function Scanner() {
     count: displayTokens.length,
     getScrollElement: () => parentRef.current,
     estimateSize: () => ROW_H,
-    overscan: 12,
+    overscan: 6,
   });
 
   const activeSortLabel = useMemo(
