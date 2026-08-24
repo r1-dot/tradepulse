@@ -145,6 +145,40 @@ export default function BotPanel({ open, onClose }) {
                 </button>
               </div>
 
+              {/* execution venue */}
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <div className="flex flex-1 border border-zinc-200" data-testid="bot-exchange">
+                    {["binance", "hyperliquid"].map((x) => (
+                      <button
+                        key={x}
+                        data-testid={`bot-exchange-${x}`}
+                        onClick={() => patch({ exchange: x })}
+                        className={`mono flex-1 py-1.5 text-[11px] font-semibold uppercase transition-colors ${x !== "binance" ? "border-l border-zinc-200" : ""} ${
+                          st.config.exchange === x ? "bg-zinc-900 text-white" : "text-zinc-500 hover:bg-zinc-50"
+                        }`}
+                      >
+                        {x}
+                      </button>
+                    ))}
+                  </div>
+                  {st.config.exchange === "hyperliquid" && (
+                    <button
+                      data-testid="bot-hl-testnet"
+                      onClick={() => patch({ hlTestnet: !st.config.hlTestnet })}
+                      className={`mono border px-2 py-1.5 text-[11px] font-semibold transition-colors ${st.config.hlTestnet ? "border-[#F5A623] text-[#B26A00]" : "border-zinc-300 text-zinc-600"}`}
+                    >
+                      {st.config.hlTestnet ? "Testnet" : "Mainnet"}
+                    </button>
+                  )}
+                </div>
+                {st.config.exchange === "hyperliquid" && (
+                  <div data-testid="bot-hl-status" className="mono text-[9px] text-zinc-400">
+                    HL key: <b className={st.hlKeyConfigured ? "text-[#00A004]" : "text-[#B26A00]"}>{st.hlKeyConfigured ? "configured" : "missing (add HYPERLIQUID_PRIVATE_KEY)"}</b> · {st.hlAddress ? st.hlAddress.slice(0, 10) + "…" : "no address"}
+                  </div>
+                )}
+              </div>
+
               {/* status grid */}
               <div className="grid grid-cols-2 gap-2">
                 <Stat label="State" value={halted ? "HALTED" : running ? "RUNNING" : "IDLE"}
@@ -218,7 +252,7 @@ export default function BotPanel({ open, onClose }) {
                   <div className="mono text-[10px] uppercase tracking-wider text-zinc-400 pt-1">Risk</div>
                   <div className="grid grid-cols-2 gap-2">
                     <NumField testid="bot-tp" label="Take profit" value={form.tpPct} onChange={(v) => setForm({ ...form, tpPct: v })} suffix="%" />
-                    <NumField testid="bot-sl" label="Stop loss" value={form.slPct} onChange={(v) => setForm({ ...form, slPct: v })} suffix="%" />
+                    <NumField testid="bot-sl" label="Stop loss (max 1%)" step="0.00000001" value={form.slPct} onChange={(v) => setForm({ ...form, slPct: v })} suffix="%" />
                     <NumField testid="bot-max-pos" label="Max position" value={form.maxPositionUsdt} onChange={(v) => setForm({ ...form, maxPositionUsdt: v })} suffix="USDT" />
                     <NumField testid="bot-daily-loss" label="Daily loss limit" value={form.dailyLossLimit} onChange={(v) => setForm({ ...form, dailyLossLimit: v })} suffix="USDT" />
                     <NumField testid="bot-max-open" label="Max open positions" step="1" value={form.maxOpenPositions} onChange={(v) => setForm({ ...form, maxOpenPositions: v })} />

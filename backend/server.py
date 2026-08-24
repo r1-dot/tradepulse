@@ -91,7 +91,7 @@ COARSE_INTERVAL = 300  # seconds
 BOT_DEFAULTS = {
     "enabled": False,
     "dryRun": True,
-    "slPct": 1.5,
+    "slPct": 1.0,
     "tpPct": 2.0,
     "maxPositionUsdt": 5.0,
     "dailyLossLimit": 5.0,
@@ -105,6 +105,8 @@ BOT_DEFAULTS = {
     "webhookUrl": "https://wtalerts.com/bot/runbot",
     "webhookBuyMsg": "",   # message sent on BUY (paste your WunderTrading bot signal)
     "webhookSellMsg": "",  # message sent on SELL
+    "exchange": "binance", # "binance" | "hyperliquid"
+    "hlTestnet": False,    # Hyperliquid: use testnet
 }
 
 BOT = {
@@ -174,6 +176,50 @@ async def _live_market(http, symbol, side, quote_qty=None, base_qty=None):
     return {"executedQty": executed, "quote": cq, "fillPrice": fill, "orderId": res.get("orderId")}
 
 
+_HL = {"exchange": None, "info": None, "net": None}
+
+
+def _get_hl_exchange():
+    """Lazily build a Hyperliquid Exchange from env (agent key + master address)."""
+    import eth_account
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+    key = os.environ.get("HYPERLIQUID_PRIVATE_KEY", "")
+    addr = os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "")
+    if not key or not addr:
+        raise RuntimeError("Hyperliquid key/address not configured")
+    net = "testnet" if BOT["config"].get("hlTestnet") else "mainnet"
+    base = constants.TESTNET_API_URL if net == "testnet" else constants.MAINNET_API_URL
+    if _HL["exchange"] is None or _HL["net"] != net:
+        signer = eth_account.Account.from_key(key)
+        _HL["info"] = Info(base, skip_ws=True)
+        _HL["exchange"] = Exchange(signer, base, account_address=addr)
+        _HL["net"] = net
+    return _HL["exchange"]
+
+
+async def _hl_market_open(base_coin, size):
+    ex = _get_hl_exchange()
+    res = await asyncio.to_thread(ex.market_open, base_coin, True, size, None, 0.01)
+    if res.get("status") != "ok":
+        raise RuntimeError(str(res)[:200])
+    fills = res["response"]["data"]["statuses"]
+    filled = next((s["filled"] for s in fills if "filled" in s), None)
+    return {"fillPrice": float(filled["avgPx"]) if filled else 0.0,
+            "executedQty": float(filled["totalSz"]) if filled else size}
+
+
+async def _hl_market_close(base_coin):
+    ex = _get_hl_exchange()
+    res = await asyncio.to_thread(ex.market_close, base_coin)
+    if res and res.get("status") != "ok":
+        raise RuntimeError(str(res)[:200])
+    fills = (res or {}).get("response", {}).get("data", {}).get("statuses", [])
+    filled = next((s["filled"] for s in fills if "filled" in s), None)
+    return {"fillPrice": float(filled["avgPx"]) if filled else 0.0}
+
+
 async def _open_position(http, sym, price, now):
     cfg = BOT["config"]
     qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
@@ -181,6 +227,14 @@ async def _open_position(http, sym, price, now):
     if cfg["dryRun"]:
         fill = price
         executed = qty
+    elif cfg.get("exchange") == "hyperliquid":
+        try:
+            r = await _hl_market_open(STATE["latest"][sym]["base"], qty)
+            fill = r["fillPrice"] or price
+            executed = r["executedQty"] or qty
+        except Exception as e:  # noqa: BLE001
+            jlog("error", symbol=sym, action="BUY", message=str(e), live=True, venue="hyperliquid")
+            return
     else:
         try:
             r = await _live_market(http, sym, "BUY", quote_qty=cfg["maxPositionUsdt"])
@@ -212,11 +266,18 @@ async def _close_position(http, sym, price, reason):
     cfg = BOT["config"]
     fill = price
     if not cfg["dryRun"] and not pos.get("dryRun"):
-        try:
-            r = await _live_market(http, sym, "SELL", base_qty=pos["qty"])
-            fill = r["fillPrice"] or price
-        except Exception as e:  # noqa: BLE001
-            jlog("error", symbol=sym, action="SELL", message=str(e), live=True)
+        if cfg.get("exchange") == "hyperliquid":
+            try:
+                r = await _hl_market_close(pos["base"])
+                fill = r["fillPrice"] or price
+            except Exception as e:  # noqa: BLE001
+                jlog("error", symbol=sym, action="SELL", message=str(e), live=True, venue="hyperliquid")
+        else:
+            try:
+                r = await _live_market(http, sym, "SELL", base_qty=pos["qty"])
+                fill = r["fillPrice"] or price
+            except Exception as e:  # noqa: BLE001
+                jlog("error", symbol=sym, action="SELL", message=str(e), live=True)
     pnl = (fill - pos["entryPrice"]) * pos["qty"]
     BOT["dailyPnl"] += pnl
     BOT["lastTradeTs"][sym] = time.time()
@@ -547,6 +608,8 @@ class BotConfigUpdate(BaseModel):
     webhookUrl: Optional[str] = None
     webhookBuyMsg: Optional[str] = None
     webhookSellMsg: Optional[str] = None
+    exchange: Optional[str] = None
+    hlTestnet: Optional[bool] = None
 
 
 def _bot_status():
@@ -575,6 +638,8 @@ def _bot_status():
         "openPositions": positions,
         "journal": list(BOT["journal"])[:100],
         "keysConfigured": bool(BINANCE_API_KEY and BINANCE_API_SECRET),
+        "hlKeyConfigured": bool(os.environ.get("HYPERLIQUID_PRIVATE_KEY")),
+        "hlAddress": os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", ""),
         "tradeBase": BINANCE_TRADE_BASE_URL,
         "alertsFeeding": alerts_feeding,
         "lastSignalAgo": round(now - BOT["lastSignalTs"], 1) if BOT["lastSignalTs"] else None,
@@ -593,7 +658,7 @@ async def bot_config(update: BotConfigUpdate):
     data = update.model_dump(exclude_none=True)
     # basic clamps
     if "slPct" in data:
-        data["slPct"] = max(0.1, min(50.0, data["slPct"]))
+        data["slPct"] = max(0.00000001, min(1.0, data["slPct"]))
     if "tpPct" in data:
         data["tpPct"] = max(0.1, min(100.0, data["tpPct"]))
     if "maxPositionUsdt" in data:
@@ -608,6 +673,8 @@ async def bot_config(update: BotConfigUpdate):
         data["cooldownSec"] = max(0, min(3600, int(data["cooldownSec"])))
     if "minVolumeUsd" in data:
         data["minVolumeUsd"] = max(0.0, float(data["minVolumeUsd"]))
+    if "exchange" in data and data["exchange"] not in ("binance", "hyperliquid"):
+        data.pop("exchange")
     if "maxVolumeUsd" in data:
         data["maxVolumeUsd"] = max(0.0, float(data["maxVolumeUsd"]))
     if data.get("enabled"):
