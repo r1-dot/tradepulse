@@ -40,6 +40,7 @@ BINANCE_BASE = os.environ.get('BINANCE_BASE', 'https://data-api.binance.vision')
 QUOTES = [q.strip().upper() for q in os.environ.get('BINANCE_QUOTE', 'USDT,USDC').split(',') if q.strip()]
 QUOTE = QUOTES[0]
 ETHERSCAN_API_KEY = os.environ.get('ETHERSCAN_API_KEY', '')
+BLOCKCHAIN_API_KEY = os.environ.get('BLOCKCHAIN_API_KEY', '')
 COINMARKETCAP_API_KEY = os.environ.get('COINMARKETCAP_API_KEY', '')
 COINGECKO_API_KEY = os.environ.get('COINGECKO_API_KEY', '')
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '')
@@ -110,6 +111,7 @@ BOT_DEFAULTS = {
     "webhookSellMsg": "",  # message sent on SELL
     "exchange": "binance", # "binance" | "hyperliquid"
     "hlTestnet": False,    # Hyperliquid: use testnet
+    "maxLossPerTradeUsdt": 0.0002,  # hard cap: auto-close any position at this $ loss
 }
 
 BOT = {
@@ -305,6 +307,19 @@ async def process_bot(http: httpx.AsyncClient, now: float):
         BOT["dailyPnl"] = 0.0
         BOT["stopped"] = False
         jlog("daily_reset", date=today)
+
+    # HARD per-trade max-loss cap — overrides autoExit and every other rule.
+    # Runs every poll regardless of autoExit so a position can never bleed past it.
+    hard_cap = cfg.get("maxLossPerTradeUsdt", 0) or 0
+    if hard_cap > 0:
+        for sym in list(BOT["positions"].keys()):
+            v = latest.get(sym)
+            if not v:
+                continue
+            pos = BOT["positions"][sym]
+            upnl = (v["price"] - pos["entryPrice"]) * pos["qty"]
+            if upnl <= -hard_cap:
+                await _close_position(http, sym, v["price"], "max-loss-cap")
 
     # 1) manage TP/SL exits (only when autoExit enabled; otherwise exits happen
     #    solely on a SELL signal via handle_signal)
@@ -510,24 +525,12 @@ async def engine_status():
     }
 
 
-@api_router.get("/tokens")
-async def get_tokens(
-    timeframe: str = Query("1s"),
-    search: str = Query(""),
-    sort: str = Query("trades_desc"),
-    quote: str = Query("USDT"),
-    limit: int = Query(1000, le=2000),
-):
-    if timeframe not in TF_SECONDS:
-        raise HTTPException(400, f"invalid timeframe. valid: {list(TF_SECONDS)}")
-    if not STATE["latest"]:
-        return {"timeframe": timeframe, "approx": True, "total": 0, "tokens": [], "warming": True}
-
+def _compute_rows(timeframe: str, search: str, sort: str, quote: str, limit: int):
+    """Shared row builder for /tokens and /tokens/delta."""
     trades, approx = compute_trades(TF_SECONDS[timeframe])
     latest = STATE["latest"]
     q = search.strip().upper()
     quote = quote.strip().upper()
-
     rows = []
     total_trades = 0
     total_pairs = 0
@@ -564,17 +567,91 @@ async def get_tokens(
     rows.sort(key=keymap.get(key, keymap["trades"]), reverse=reverse)
     matched = len(rows)
     rows = rows[:limit]
+    meta = {
+        "approx": approx, "quote": quote, "totalPairs": total_pairs,
+        "totalTrades": total_trades, "matched": matched,
+        "historyDepthSec": round(_history_depth()),
+    }
+    return rows, meta
+
+
+@api_router.get("/tokens")
+async def get_tokens(
+    timeframe: str = Query("1s"),
+    search: str = Query(""),
+    sort: str = Query("trades_desc"),
+    quote: str = Query("USDT"),
+    limit: int = Query(1000, le=2000),
+):
+    if timeframe not in TF_SECONDS:
+        raise HTTPException(400, f"invalid timeframe. valid: {list(TF_SECONDS)}")
+    if not STATE["latest"]:
+        return {"timeframe": timeframe, "approx": True, "total": 0, "tokens": [], "warming": True}
+
+    rows, meta = _compute_rows(timeframe, search, sort, quote, limit)
     return {
         "timeframe": timeframe,
-        "approx": approx,
-        "quote": quote,
+        "approx": meta["approx"],
+        "quote": meta["quote"],
         "quotes": QUOTES,
-        "total": matched,
-        "totalPairs": total_pairs,
-        "totalTrades": total_trades,
-        "historyDepthSec": round(_history_depth()),
+        "total": meta["matched"],
+        "totalPairs": meta["totalPairs"],
+        "totalTrades": meta["totalTrades"],
+        "historyDepthSec": meta["historyDepthSec"],
         "tokens": rows,
     }
+
+
+# Delta stream: sends the full ordered symbol list every tick (cheap) but only the
+# ROWS whose values actually changed since this client's last poll. Rows are encoded
+# as positional arrays [price, change, quoteVol, trades, side(1=buy/0=sell), trades24h]
+# which, combined with delta + gzip, cuts bandwidth dramatically vs full snapshots.
+_TOKEN_SESSIONS = {}  # sid -> {"ts", "sig", "rows": {sym: [..]}}
+
+
+@api_router.get("/tokens/delta")
+async def get_tokens_delta(
+    sid: str = Query(...),
+    timeframe: str = Query("1s"),
+    search: str = Query(""),
+    sort: str = Query("trades_desc"),
+    quote: str = Query("USDT"),
+    limit: int = Query(1000, le=2000),
+):
+    if timeframe not in TF_SECONDS:
+        raise HTTPException(400, f"invalid timeframe. valid: {list(TF_SECONDS)}")
+    now = time.time()
+    # prune stale sessions
+    for k in [k for k, v in _TOKEN_SESSIONS.items() if now - v["ts"] > 120]:
+        _TOKEN_SESSIONS.pop(k, None)
+    if not STATE["latest"]:
+        return {"full": True, "warming": True, "timeframe": timeframe,
+                "order": [], "rows": {}, "totalPairs": 0, "totalTrades": 0, "approx": True}
+
+    rows, meta = _compute_rows(timeframe, search, sort, quote, limit)
+    sig = f"{timeframe}|{meta['quote']}|{search.strip().upper()}|{sort}|{limit}"
+    order = [r["symbol"] for r in rows]
+    current = {
+        r["symbol"]: [r["price"], r["change"], r["quoteVol"], r["trades"],
+                      1 if r["side"] == "buy" else 0, r["trades24h"]]
+        for r in rows
+    }
+    base = {
+        "timeframe": timeframe, "approx": meta["approx"], "quote": meta["quote"],
+        "quotes": QUOTES, "order": order, "totalPairs": meta["totalPairs"],
+        "totalTrades": meta["totalTrades"], "matched": meta["matched"],
+        "historyDepthSec": meta["historyDepthSec"],
+    }
+    sess = _TOKEN_SESSIONS.get(sid)
+    if sess is None or sess["sig"] != sig:
+        _TOKEN_SESSIONS[sid] = {"ts": now, "sig": sig, "rows": current}
+        return {**base, "full": True, "rows": current}
+    prev = sess["rows"]
+    changed = {s: vals for s, vals in current.items() if prev.get(s) != vals}
+    removed = [s for s in prev if s not in current]
+    sess["ts"] = now
+    sess["rows"] = current
+    return {**base, "full": False, "changed": changed, "removed": removed}
 
 
 @api_router.get("/token/{symbol}")
@@ -613,6 +690,7 @@ class BotConfigUpdate(BaseModel):
     webhookSellMsg: Optional[str] = None
     exchange: Optional[str] = None
     hlTestnet: Optional[bool] = None
+    maxLossPerTradeUsdt: Optional[float] = None
 
 
 def _bot_status():
@@ -680,6 +758,8 @@ async def bot_config(update: BotConfigUpdate):
         data.pop("exchange")
     if "maxVolumeUsd" in data:
         data["maxVolumeUsd"] = max(0.0, float(data["maxVolumeUsd"]))
+    if "maxLossPerTradeUsdt" in data:
+        data["maxLossPerTradeUsdt"] = max(0.0, float(data["maxLossPerTradeUsdt"]))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)
@@ -784,7 +864,8 @@ async def market_overview(http: httpx.AsyncClient):
     sources = {}
     out = {"btc": None, "eth": None, "sol": None, "totalMarketCap": None,
            "totalVolume24h": None, "btcDominance": None, "ethGasGwei": None,
-           "btcTxCount24h": None, "btcHashRate": None, "activeCryptos": None}
+           "btcTxCount24h": None, "btcHashRate": None, "btcBlockHeight": None,
+           "activeCryptos": None}
 
     async def cb():
         try:
@@ -797,10 +878,14 @@ async def market_overview(http: httpx.AsyncClient):
 
     async def bc():
         try:
-            r = await http.get("https://api.blockchain.info/stats?cors=true", timeout=8)
+            url = "https://api.blockchain.info/stats?cors=true"
+            if BLOCKCHAIN_API_KEY:
+                url += f"&key={BLOCKCHAIN_API_KEY}"
+            r = await http.get(url, timeout=8)
             d = r.json()
             out["btcTxCount24h"] = int(d.get("n_tx", 0))
             out["btcHashRate"] = float(d.get("hash_rate", 0))
+            out["btcBlockHeight"] = int(d.get("n_blocks_total", 0)) or None
             sources["blockchain.com"] = "ok"
         except Exception as e:  # noqa: BLE001
             sources["blockchain.com"] = f"error: {e}"
@@ -848,7 +933,7 @@ async def market_overview(http: httpx.AsyncClient):
             return
         try:
             r = await http.get(
-                f"https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey={ETHERSCAN_API_KEY}",
+                f"https://api.etherscan.io/v2/api?chainid=1&module=gastracker&action=gasoracle&apikey={ETHERSCAN_API_KEY}",
                 timeout=8)
             d = r.json()
             if d.get("status") == "1":

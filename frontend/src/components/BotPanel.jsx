@@ -74,6 +74,7 @@ export default function BotPanel({ open, onClose }) {
     streak: parseInt(form.streak, 10),
     maxOpenPositions: parseInt(form.maxOpenPositions, 10),
     cooldownSec: parseInt(form.cooldownSec, 10),
+    maxLossPerTradeUsdt: parseFloat(form.maxLossPerTradeUsdt),
     webhookUrl: form.webhookUrl || "",
     webhookBuyMsg: form.webhookBuyMsg || "",
     webhookSellMsg: form.webhookSellMsg || "",
@@ -200,6 +201,7 @@ export default function BotPanel({ open, onClose }) {
                   (Alerts / Vol / Flip / Algo) on the dashboard — {st.config.streak <= 1
                     ? <>the bot fires on <b>each qualifying alert</b> (repeat requirement off)</>
                     : <>the bot fires when a token logs <b>{st.config.streak}+ same-direction alerts within ~1s</b></>}. With no alerts enabled it stays inactive.
+                  {" "}<span className="text-[#B26A00]">Tip: star tokens on the dashboard to restrict the bot to only those.</span>
                 </p>
               </div>
 
@@ -256,7 +258,9 @@ export default function BotPanel({ open, onClose }) {
                     <NumField testid="bot-max-pos" label="Max position" value={form.maxPositionUsdt} onChange={(v) => setForm({ ...form, maxPositionUsdt: v })} suffix="USDT" />
                     <NumField testid="bot-daily-loss" label="Daily loss limit" value={form.dailyLossLimit} onChange={(v) => setForm({ ...form, dailyLossLimit: v })} suffix="USDT" />
                     <NumField testid="bot-max-open" label="Max open positions" step="1" value={form.maxOpenPositions} onChange={(v) => setForm({ ...form, maxOpenPositions: v })} />
+                    <NumField testid="bot-max-loss" label="Hard max loss / trade" step="0.00000001" value={form.maxLossPerTradeUsdt} onChange={(v) => setForm({ ...form, maxLossPerTradeUsdt: v })} suffix="USDT" />
                   </div>
+                  <div className="mono text-[9px] text-zinc-400 -mt-1">Hard cap: any position is force-closed the instant its loss hits this USDT amount — overrides TP/SL, auto-exit and every other rule. Set 0 to disable.</div>
                   <button
                     data-testid="bot-autoexit-toggle"
                     onClick={() => patch({ autoExit: !st.config.autoExit })}

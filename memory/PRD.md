@@ -27,7 +27,20 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Etherscan/CoinMarketCap tiles need keys (graceful "—" without).
 - Long timeframes (4d/7d/10d) show `approx` until enough runtime history accumulates.
 
+## Implemented (2026-08) — Session 2
+- **Delta token stream** (`GET /api/tokens/delta`): sends full ordered symbol list every tick but only the rows that changed (positional arrays `[price, change, quoteVol, trades, sideNum, trades24h]`). Keyed by `sid` + query signature; param change → full refresh. Cuts bandwidth on top of gzip. Frontend (`Scanner.jsx`) rebuilds rows from a persistent `rowMapRef`. Classic `GET /api/tokens` kept for back-compat.
+- **Star-mark system**: per-row star button + `starred-only-toggle`, persisted in `localStorage`. When ≥1 token is starred, ONLY starred tokens feed the Auto-Trade Bot (`botSignals` filtered before POST /api/bot/signal).
+- **Hard max-loss-per-trade cap** (`maxLossPerTradeUsdt`, default 0.0002 USDT): `process_bot` force-closes any position the instant unrealized loss hits the cap — overrides TP/SL, auto-exit and every other rule (runs even when autoExit is off). Editable in BotPanel (`bot-max-loss`). Journal reason = `max-loss-cap`.
+- **Market-overview enrichment**: Etherscan key added → ETH gas (migrated to Etherscan **V2** `chainid=1` endpoint); Blockchain.com key added → new **BTC Block height** tile (`mo-block`).
+- Verified: 8/8 backend pytest + full frontend flow (iteration_11.json), 100%.
+
+## Known Gaps / Notes (Session 2)
+- User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
+- `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
-- P1: Quote-asset filter (BTC/ETH/FDUSD pairs), persist favorites/watchlist
-- P2: Trade-rate heat coloring, CSV export, sound/visual alerts on trade spikes
+- P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections
+- P2: Trade Analytics (win-rate, avg P&L, equity curve) in bot panel
+- P2: Telegram alerts for bot entries/exits/daily-limit halts
+- P3: Migrate 1s REST polling to WebSockets; partial exits + shorting for WunderTrading

@@ -1,6 +1,6 @@
 import { FaBitcoin, FaEthereum } from "react-icons/fa";
 import { SiSolana } from "react-icons/si";
-import { Activity, Layers, PieChart, Fuel, Boxes } from "lucide-react";
+import { Activity, Layers, PieChart, Fuel, Boxes, Blocks } from "lucide-react";
 import { compactUsd, fmtPrice } from "@/lib/format";
 
 const Stat = ({ icon, label, value, sub, testid, accent }) => (
@@ -39,6 +39,8 @@ export default function MarketOverview({ data }) {
         label="ETH Gas" value={m.ethGasGwei != null ? m.ethGasGwei + " gwei" : "—"} sub="Etherscan" />
       <Stat testid="mo-tx" icon={<Activity size={18} />}
         label="BTC Tx (24h)" value={m.btcTxCount24h ? (m.btcTxCount24h / 1000).toFixed(0) + "K" : "—"} sub="Blockchain.com" />
+      <Stat testid="mo-block" icon={<Blocks size={18} />} accent="#F7931A"
+        label="BTC Block" value={m.btcBlockHeight ? m.btcBlockHeight.toLocaleString() : "—"} sub="Blockchain.com" />
       <Stat testid="mo-assets" icon={<Boxes size={18} />}
         label="Active Coins" value={m.activeCryptos ? m.activeCryptos.toLocaleString() : "—"} sub="CoinGecko" />
     </div>

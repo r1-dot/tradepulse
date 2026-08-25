@@ -1,0 +1,27 @@
+{
+  "summary": "Validated 4 new features from this session: (1) delta token stream, (2) hard max-loss-per-trade cap, (3) star system, (4) enriched market overview. Created /app/backend/tests/test_delta_and_maxloss.py — 8/8 pytest passed: delta first-call returns full+rows (row=[price,change,quoteVol,trades,sideNum,trades24h] with sideNum ∈ {0,1}, order length == rows length, totalPairs/totalTrades present); repeat call with same sid returns full:false + changed/removed; changing timeframe on same sid forces full:true again; GET /api/tokens keeps classic {tokens,total,totalPairs,totalTrades} shape; /api/market-overview returns ethGasGwei (non-null), btcBlockHeight (>500k), sources.etherscan='ok', sources.'blockchain.com'='ok'; POST /api/bot/config accepts+persists maxLossPerTradeUsdt=0.0002 and it is echoed in /bot/status.config; hard-cap force-close verified end-to-end — with autoExit=false, streak=2, maxPositionUsdt=5, maxLoss=0.0002 and 2 buy signals on BTCUSDT, a SIM position opened AND was force-closed by process_bot with journal.reason='max-loss-cap' within ~45s (autoExit was OFF, so this is the ONLY exit path). Safe defaults restored via close-all + config {enabled:false,dryRun:true,autoExit:true,streak:2,minVolumeUsd:5_000_000}. FRONTEND (Chromium/1920x1080): mo-block tile shows '963,993' (Blockchain.com), mo-gas tile shows '0.076152816 gwei' (Etherscan). Star system verified: 32 virtualized star buttons rendered, clicking star-<SYMBOL> flipped starred-count from 'N/A' (hidden when 0) to '1'; starred-only-toggle filtered table to 1 visible star row, un-toggle restored 32; after full page reload the star selection persisted (starred-count still '1'). Scanner delta stream works live — table populated 671/671 pairs, header shows 987 pairs, live-tick indicator shows '2 trades (1s): 838'.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_delta_and_maxloss.py",
+    "/app/test_reports/pytest/delta_maxloss.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py:353-354 — handle_signal overrides client-supplied price/volume with STATE['latest'][sym] values. Good anti-spoof; a comment/warning documenting this in the OpenAPI would help API consumers who might expect their price/volume to be respected.",
+    "server.py:311-322 — hard_cap loop runs BEFORE the TP/SL block and closes with reason 'max-loss-cap'. Correct precedence; because autoExit is checked only for TP/SL, the hard-cap is truly unconditional. LGTM.",
+    "server.py:626 — session pruning threshold (120s) is generous; if many browser tabs open sids without polling, memory could grow. Consider capping len(_TOKEN_SESSIONS) or LRU eviction.",
+    "test_delta_and_maxloss.py test_hard_cap_force_closes is timing-sensitive (needs BTC to move down 0.004% within the poll window). Set to 45s wait — should be robust but note ~1% flake risk on flat markets."
+  ],
+  "updated_files": ["/app/backend/tests/test_delta_and_maxloss.py"],
+  "success_rate": {"backend": "100% (8/8)", "frontend": "100% (star, mo-block, mo-gas, live delta, persistence)"},
+  "test_credentials": "n/a (no auth). Binance keys configured; SIM/dryRun only.",
+  "seed_data_creation": "None. Bot restored to safe defaults: enabled=false, dryRun=true, autoExit=true, streak=2, minVolumeUsd=5_000_000, maxLossPerTradeUsdt=0.0002, positions=[].",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Delta endpoint keyed by (timeframe|quote|search|sort|limit) tuple — any change forces full. Signals price/volume are overridden server-side from STATE['latest'], so to force a specific entry price in tests you cannot — use live prices. Hard-cap testing needs ~30s+ headroom because it depends on live price micro-dips. Star selection persistence is in localStorage but under a different key than 'tp.starred' (getItem returned null yet count persisted across reload) — key rename likely; not a bug."
+}

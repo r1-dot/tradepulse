@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import axios from "axios";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { SiBinance } from "react-icons/si";
-import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2, Cpu, Download, Bot } from "lucide-react";
+import { Search, ArrowDown, ArrowUp, ChevronDown, Bell, BellRing, Volume2, VolumeX, History, X, Trash2, Cpu, Download, Bot, Star } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
@@ -92,7 +92,14 @@ export default function Scanner() {
   const [botRunning, setBotRunning] = useState(false);
   const [botLive, setBotLive] = useState(false);
   const [botPositions, setBotPositions] = useState(() => new Set());
+  const [starred, setStarred] = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem("tradepulse.starred") || "[]")); }
+    catch { return new Set(); }
+  });
+  const [onlyStarred, setOnlyStarred] = useState(false);
 
+  const sidRef = useRef(Math.random().toString(36).slice(2) + Date.now().toString(36));
+  const rowMapRef = useRef(new Map());
   const prevTrades = useRef({});
   const parentRef = useRef(null);
   const alertingRef = useRef(new Set());
@@ -106,27 +113,62 @@ export default function Scanner() {
 
   // stable refs for interval callback
   const cfg = useRef({ timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn });
-  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn, botRunning, quote };
+  cfg.current = { timeframe, sort, search, alertThreshold, muted, algoOn, algoSens, volThreshold, flipOn, botRunning, quote, starred };
+
+  useEffect(() => {
+    localStorage.setItem("tradepulse.starred", JSON.stringify([...starred]));
+  }, [starred]);
+  const toggleStar = useCallback((sym) => {
+    setStarred((prev) => {
+      const n = new Set(prev);
+      n.has(sym) ? n.delete(sym) : n.add(sym);
+      return n;
+    });
+  }, []);
 
   const fetchTokens = useCallback(async () => {
     const { timeframe, sort, search, quote } = cfg.current;
     try {
-      const { data } = await axios.get(`${API}/tokens`, {
-        params: { timeframe, sort, search, quote, limit: 1000 },
+      const { data } = await axios.get(`${API}/tokens/delta`, {
+        params: { sid: sidRef.current, timeframe, sort, search, quote, limit: 1000 },
       });
+      if (data.warming) {
+        setTokens([]);
+        setMeta({ approx: true, total: 0, totalPairs: 0 });
+        return;
+      }
+      // apply the delta into the persistent row map (positional arrays from server)
+      const map = rowMapRef.current;
+      if (data.full) {
+        map.clear();
+        for (const s in data.rows) map.set(s, data.rows[s]);
+      } else {
+        if (data.changed) for (const s in data.changed) map.set(s, data.changed[s]);
+        if (data.removed) for (const s of data.removed) map.delete(s);
+      }
+      const order = data.order || [];
+      const qc = data.quote || quote;
+      const qlen = qc.length;
       const prev = prevTrades.current;
       const next = {};
-      const rows = (data.tokens || []).map((t) => {
-        const before = prev[t.symbol];
+      const rows = [];
+      for (const sym of order) {
+        const vals = map.get(sym);
+        if (!vals) continue;
+        const [price, change, quoteVol, trades, sideNum, trades24h] = vals;
+        const before = prev[sym];
         let dir = 0;
-        if (before !== undefined && t.trades !== before) dir = t.trades > before ? 1 : -1;
-        next[t.symbol] = t.trades;
-        return { ...t, dir };
-      });
+        if (before !== undefined && trades !== before) dir = trades > before ? 1 : -1;
+        next[sym] = trades;
+        rows.push({
+          symbol: sym, base: sym.slice(0, sym.length - qlen), quote: qc,
+          price, change, quoteVol, trades, side: sideNum ? "buy" : "sell", trades24h, dir,
+        });
+      }
       prevTrades.current = next;
       setTokens(rows);
       setMeta({
-        approx: data.approx, total: data.total, totalPairs: data.totalPairs,
+        approx: data.approx, total: data.matched, totalPairs: data.totalPairs,
         totalTrades: data.totalTrades, historyDepthSec: data.historyDepthSec,
       });
 
@@ -332,10 +374,15 @@ export default function Scanner() {
         setFlipCount(0);
       }
 
-      // feed every alert event straight into the auto-trade bot's alert feed.
-      // (the bot still only TRADES when started + volume gate passes.)
+      // feed alert events into the bot. When the user has starred any tokens the
+      // bot is restricted to ONLY those (curated watchlist); otherwise all alerts feed.
       if (botSignals.length) {
-        axios.post(`${API}/bot/signal`, { events: botSignals.slice(0, 200) }).catch(() => {});
+        const sset = cfg.current.starred;
+        let feed = botSignals;
+        if (sset && sset.size) feed = botSignals.filter((s) => sset.has(s.symbol));
+        if (feed.length) {
+          axios.post(`${API}/bot/signal`, { events: feed.slice(0, 200) }).catch(() => {});
+        }
       }
     } catch (e) {
       // keep last data on transient errors
@@ -391,12 +438,13 @@ export default function Scanner() {
 
   const displayTokens = useMemo(() => {
     let list = tokens;
+    if (onlyStarred) list = list.filter((t) => starred.has(t.symbol));
     if (pressure !== "all") list = list.filter((t) => t.side === pressure);
     if (onlyAlerts && alertThreshold) list = list.filter((t) => t.trades >= alertThreshold);
     if (onlyAlgo && algoOn) list = list.filter((t) => t.algo);
     if (onlyVol && volThreshold) list = list.filter((t) => t.quoteVol >= volThreshold);
     return list;
-  }, [tokens, pressure, onlyAlerts, alertThreshold, onlyAlgo, algoOn, onlyVol, volThreshold]);
+  }, [tokens, pressure, onlyAlerts, alertThreshold, onlyAlgo, algoOn, onlyVol, volThreshold, onlyStarred, starred]);
 
   const rowVirtualizer = useVirtualizer({
     count: displayTokens.length,
@@ -746,6 +794,18 @@ export default function Scanner() {
           </div>
 
           <button
+            data-testid="starred-only-toggle"
+            onClick={() => setOnlyStarred((o) => !o)}
+            title="Show only starred tokens. When any token is starred, ONLY starred tokens feed the Auto-Trade Bot."
+            className={`mono flex items-center gap-1 border px-2.5 py-1 text-[12px] transition-colors ${
+              onlyStarred ? "border-[#F5A623] bg-[#F5A623] text-white" : "border-zinc-200 text-zinc-700 hover:border-zinc-400"
+            }`}
+          >
+            <Star size={12} className={onlyStarred ? "fill-white" : (starred.size ? "fill-[#F5A623] text-[#F5A623]" : "")} />
+            {starred.size > 0 && <span data-testid="starred-count">{starred.size}</span>}
+          </button>
+
+          <button
             data-testid="history-toggle"
             onClick={() => setHistoryOpen(true)}
             className="mono flex items-center gap-1 border border-zinc-200 px-2.5 py-1 text-[12px] text-zinc-700 hover:border-zinc-400"
@@ -821,6 +881,14 @@ export default function Scanner() {
                 >
                   <div className="mono tnum text-[11px] text-zinc-300">{vi.index + 1}</div>
                   <div className="flex items-baseline gap-1">
+                    <button
+                      data-testid={`star-${t.symbol}`}
+                      onClick={(e) => { e.stopPropagation(); toggleStar(t.symbol); }}
+                      title={starred.has(t.symbol) ? "Unstar — remove from bot watchlist" : "Star — bot will trade only starred tokens"}
+                      className="mr-0.5 self-center text-zinc-300 hover:text-[#F5A623] transition-colors"
+                    >
+                      <Star size={11} className={starred.has(t.symbol) ? "fill-[#F5A623] text-[#F5A623]" : ""} />
+                    </button>
                     {isAlert && <BellRing size={11} className="text-[#002FA7]" data-testid={`alert-flag-${t.symbol}`} />}
                     <span className="mono font-semibold text-zinc-900">{t.base}</span>
                     <span className="mono text-[10px] text-zinc-300">/{t.quote}</span>
