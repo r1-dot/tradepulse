@@ -97,6 +97,7 @@ export default function Scanner() {
     catch { return new Set(); }
   });
   const [onlyStarred, setOnlyStarred] = useState(false);
+  const [historyView, setHistoryView] = useState("log"); // "log" | "token"
 
   const sidRef = useRef(Math.random().toString(36).slice(2) + Date.now().toString(36));
   const rowMapRef = useRef(new Map());
@@ -458,6 +459,21 @@ export default function Scanner() {
     const sellLead = sellVol >= buyVol;
     const leadPct = totVol > 0 ? Math.round((sellLead ? sellVol : buyVol) / totVol * 100) : 0;
     return { buyTr, buyVol, sellTr, sellVol, totVol, sellLead, leadPct };
+  }, [alertHistory]);
+
+  // per-token buy/sell totals kept separately (bought vs sold, trades + USD)
+  const tokenTotals = useMemo(() => {
+    const m = new Map();
+    for (const h of alertHistory) {
+      let e = m.get(h.base);
+      if (!e) { e = { base: h.base, buyTr: 0, buyVol: 0, sellTr: 0, sellVol: 0 }; m.set(h.base, e); }
+      if (h.side === "buy") { e.buyTr += h.trades || 0; e.buyVol += h.tradeVol || 0; }
+      else { e.sellTr += h.trades || 0; e.sellVol += h.tradeVol || 0; }
+    }
+    const arr = [...m.values()];
+    arr.forEach((e) => { e.totVol = e.buyVol + e.sellVol; e.sellLead = e.sellVol >= e.buyVol; });
+    arr.sort((a, b) => b.totVol - a.totVol);
+    return arr;
   }, [alertHistory]);
 
   const rowVirtualizer = useVirtualizer({
@@ -1069,11 +1085,61 @@ export default function Scanner() {
                 <span className="mono text-[10px] text-zinc-400">No alerts logged yet — arm an alert to accumulate totals</span>
               )}
             </div>
+            {/* View switch: chronological log vs per-token totals */}
+            <div className="flex border-b border-zinc-200 mono text-[11px]" data-testid="history-view-toggle">
+              <button
+                data-testid="history-view-log"
+                onClick={() => setHistoryView("log")}
+                className={`flex-1 py-1.5 transition-colors ${historyView === "log" ? "bg-zinc-900 text-white" : "text-zinc-600 hover:bg-zinc-100"}`}
+              >
+                Log
+              </button>
+              <button
+                data-testid="history-view-token"
+                onClick={() => setHistoryView("token")}
+                className={`flex-1 border-l border-zinc-200 py-1.5 transition-colors ${historyView === "token" ? "bg-zinc-900 text-white" : "text-zinc-600 hover:bg-zinc-100"}`}
+              >
+                By token
+              </button>
+            </div>
             <div className="scan-scroll flex-1 overflow-y-auto">
               {alertHistory.length === 0 ? (
                 <div data-testid="history-empty" className="flex h-40 items-center justify-center px-6 text-center mono text-[12px] text-zinc-400">
                   No alerts logged yet. Arm a threshold from the Alerts menu; every token that crosses it will appear here.
                 </div>
+              ) : historyView === "token" ? (
+                tokenTotals.map((e) => (
+                  <div
+                    key={e.base}
+                    data-testid={`token-total-${e.base}`}
+                    className="border-b border-zinc-100 px-4 py-2.5"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-heading text-[13px] font-bold text-zinc-900">
+                        {e.base}<span className="mono text-[10px] font-normal text-zinc-400">/USDT</span>
+                      </span>
+                      <span className={`mono text-[10px] font-semibold ${e.sellLead ? "text-[#FF3B30]" : "text-[#00A004]"}`}>
+                        {e.sellLead ? "SELLING" : "BUYING"}
+                      </span>
+                    </div>
+                    <div className="mt-1 grid grid-cols-2 gap-3">
+                      <div data-testid={`token-buy-${e.base}`}>
+                        <div className="mono text-[9px] uppercase tracking-wider text-[#00A004]">Bought</div>
+                        <div className="mono tnum text-[13px] font-bold text-[#00A004] leading-tight">{withCommas(e.buyTr)} <span className="text-[9px] font-normal text-zinc-400">tr</span></div>
+                        <div className="mono tnum text-[10px] text-zinc-500">≈{compactUsd(e.buyVol)}</div>
+                      </div>
+                      <div data-testid={`token-sell-${e.base}`}>
+                        <div className="mono text-[9px] uppercase tracking-wider text-[#FF3B30]">Sold</div>
+                        <div className="mono tnum text-[13px] font-bold text-[#FF3B30] leading-tight">{withCommas(e.sellTr)} <span className="text-[9px] font-normal text-zinc-400">tr</span></div>
+                        <div className="mono tnum text-[10px] text-zinc-500">≈{compactUsd(e.sellVol)}</div>
+                      </div>
+                    </div>
+                    <div className="mt-1.5 flex h-1 overflow-hidden rounded-full bg-zinc-200">
+                      <div className="h-full bg-[#00C805]" style={{ width: `${e.totVol > 0 ? Math.round(e.buyVol / e.totVol * 100) : 50}%` }} />
+                      <div className="h-full bg-[#FF3B30]" style={{ width: `${e.totVol > 0 ? Math.round(e.sellVol / e.totVol * 100) : 50}%` }} />
+                    </div>
+                  </div>
+                ))
               ) : (
                 alertHistory.map((h, i) => (
                   <div
