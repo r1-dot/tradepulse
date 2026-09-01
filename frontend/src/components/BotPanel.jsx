@@ -3,8 +3,8 @@ import axios from "axios";
 import { X, Power, ShieldAlert, Bot, Trash2, RotateCcw, TriangleAlert } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
-const BOT_VOL = [5, 10, 30, 50, 70, 100, 200, 300, 400, 500, 600, 700, 800, 900]; // USD millions
-const fmtM = (m) => (m >= 1000 ? `$${(m / 1000).toFixed(m % 1000 ? 1 : 0)}B` : `$${m}M`);
+const BOT_VOL = [0.05, 0.1, 0.3, 0.6, 0.9, 1, 5, 10, 30, 50, 70, 100, 200, 300, 400, 500, 600, 700, 800, 900]; // USD millions
+const fmtM = (m) => (m < 1 ? `$${Math.round(m * 1000)}K` : m >= 1000 ? `$${(m / 1000).toFixed(m % 1000 ? 1 : 0)}B` : `$${m}M`);
 const clock = (ts) => new Date(ts * 1000).toLocaleTimeString("en-US", { hour12: false });
 
 const NumField = ({ label, value, onChange, step = "0.1", suffix, testid }) => (
@@ -228,7 +228,7 @@ export default function BotPanel({ open, onClose }) {
                         className="mono w-full border border-zinc-200 bg-transparent px-2 py-1.5 text-[13px] outline-none focus:border-zinc-900"
                       >
                         {BOT_VOL.map((m) => (
-                          <option key={m} value={m * 1e6}>{`min ${fmtM(m)}`}</option>
+                          <option key={m} value={Math.round(m * 1e6)}>{`min ${fmtM(m)}`}</option>
                         ))}
                       </select>
                       <span className="mono text-zinc-400 text-[12px]">to</span>
@@ -240,7 +240,7 @@ export default function BotPanel({ open, onClose }) {
                       >
                         <option value={0}>max ∞</option>
                         {BOT_VOL.map((m) => (
-                          <option key={m} value={m * 1e6}>{`max ${fmtM(m)}`}</option>
+                          <option key={m} value={Math.round(m * 1e6)}>{`max ${fmtM(m)}`}</option>
                         ))}
                       </select>
                     </div>

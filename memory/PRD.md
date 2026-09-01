@@ -34,6 +34,10 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - **Market-overview enrichment**: Etherscan key added → ETH gas (migrated to Etherscan **V2** `chainid=1` endpoint); Blockchain.com key added → new **BTC Block height** tile (`mo-block`).
 - Verified: 8/8 backend pytest + full frontend flow (iteration_11.json), 100%.
 
+## Implemented (2026-09) — Session 2b
+- **Bot low volume bands**: min/max volume-band dropdowns now include sub-million bands `$50K / $100K / $300K / $600K / $900K / $1M` in addition to $5M–$900M (`BOT_VOL` in `BotPanel.jsx`, `fmtM` handles <1M as K, option values `Math.round(m*1e6)`).
+- **Alert-history trade volume**: every logged alert now records `tradeVol` = estimated USD volume of the counted trades (`trades × quoteVol/trades24h`), shown as `≈$X · N tr` beside the 24h volume and added as a "Trade Vol" column in the PDF export (`Scanner.jsx`). Verified live via screenshot.
+
 ## Known Gaps / Notes (Session 2)
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).

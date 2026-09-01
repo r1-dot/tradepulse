@@ -163,6 +163,7 @@ export default function Scanner() {
         rows.push({
           symbol: sym, base: sym.slice(0, sym.length - qlen), quote: qc,
           price, change, quoteVol, trades, side: sideNum ? "buy" : "sell", trades24h, dir,
+          tradeVol: trades24h > 0 ? trades * (quoteVol / trades24h) : 0,
         });
       }
       prevTrades.current = next;
@@ -198,7 +199,7 @@ export default function Scanner() {
                 kind: "threshold",
                 symbol: sym, base: r.base, threshold: th, trades: r.trades,
                 timeframe: cfg.current.timeframe, change: r.change, side: r.side,
-                volume: r.quoteVol, ts: now,
+                volume: r.quoteVol, tradeVol: r.tradeVol, ts: now,
               };
             });
             setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
@@ -251,7 +252,7 @@ export default function Scanner() {
                 kind: "algo",
                 symbol: sym, base: r.base, trades: r.trades,
                 timeframe: cfg.current.timeframe, change: r.change, side: r.side,
-                volume: r.quoteVol, ts: now,
+                volume: r.quoteVol, tradeVol: r.tradeVol, ts: now,
                 reason: `${r.algoBurst >= 99 ? "99+" : r.algoBurst.toFixed(1)}× normal rate · ~$${Math.round(r.algoAvg)}/trade`,
               };
             });
@@ -288,7 +289,7 @@ export default function Scanner() {
               id: `vol-${r.symbol}-${now}-${Math.random().toString(36).slice(2, 7)}`,
               kind: "volume", symbol: r.symbol, base: r.base, trades: r.trades,
               timeframe: cfg.current.timeframe, change: r.change, side: r.side,
-              volume: r.quoteVol, threshold: vth, ts: now,
+              volume: r.quoteVol, tradeVol: r.tradeVol, threshold: vth, ts: now,
               reason: `above ${label} 24h volume`,
             }));
             setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
@@ -313,7 +314,7 @@ export default function Scanner() {
                 id: `vol-${sym}-${now}-${Math.random().toString(36).slice(2, 7)}`,
                 kind: "volume", symbol: sym, base: r.base, trades: r.trades,
                 timeframe: cfg.current.timeframe, change: r.change, side: r.side,
-                volume: r.quoteVol, threshold: vth, ts: now,
+                volume: r.quoteVol, tradeVol: r.tradeVol, threshold: vth, ts: now,
                 reason: `24h volume crossed ${label}`,
               };
             });
@@ -357,7 +358,7 @@ export default function Scanner() {
               id: `flip-${r.symbol}-${now}-${Math.random().toString(36).slice(2, 7)}`,
               kind: "flip", symbol: r.symbol, base: r.base, trades: r.trades,
               timeframe: cfg.current.timeframe, change: r.change, side: r.side,
-              volume: r.quoteVol, ts: now,
+              volume: r.quoteVol, tradeVol: r.tradeVol, ts: now,
               reason: `flipped to ${r.side === "buy" ? "buying" : "selling"}`,
             }));
             setAlertHistory((prev) => [...entries, ...prev].slice(0, 300));
@@ -475,6 +476,7 @@ export default function Scanner() {
       h.timeframe,
       h.side === "buy" ? "BUYING" : "SELLING",
       withCommas(h.trades),
+      compactUsd(h.tradeVol),
       h.kind === "volume" ? fmtVol((h.threshold || 0) / 1e6) : (h.threshold ?? "—"),
       compactUsd(h.volume),
       fmtPct(h.change),
@@ -483,12 +485,12 @@ export default function Scanner() {
 
     autoTable(doc, {
       startY: 70,
-      head: [["Time", "Type", "Symbol", "TF", "Side", "Trades", "Threshold", "24h Volume", "Change", "Reason"]],
+      head: [["Time", "Type", "Symbol", "TF", "Side", "Trades", "Trade Vol", "Threshold", "24h Volume", "Change", "Reason"]],
       body,
       styles: { font: "courier", fontSize: 7.5, cellPadding: 3, textColor: "#0A0A0A" },
       headStyles: { fillColor: "#18181B", textColor: "#FFFFFF", fontStyle: "bold" },
       alternateRowStyles: { fillColor: "#FAFAFA" },
-      columnStyles: { 5: { halign: "right" }, 7: { halign: "right" }, 8: { halign: "right" } },
+      columnStyles: { 5: { halign: "right" }, 6: { halign: "right" }, 8: { halign: "right" }, 9: { halign: "right" } },
       didParseCell: (data) => {
         if (data.section === "body" && data.column.index === 4) {
           data.cell.styles.textColor = data.cell.raw === "BUYING" ? "#00A004" : "#D32F2F";
@@ -1056,7 +1058,10 @@ export default function Scanner() {
                         {fmtPct(h.change)}
                       </div>
                       <div data-testid={`history-vol-${i}`} className="mono tnum text-[10px] text-zinc-400">
-                        vol {compactUsd(h.volume)}
+                        24h vol {compactUsd(h.volume)}
+                      </div>
+                      <div data-testid={`history-tradevol-${i}`} className="mono tnum text-[10px] text-[#0E7490]" title={`≈ USD volume of the ${withCommas(h.trades)} trades counted in ${h.timeframe}`}>
+                        ≈{compactUsd(h.tradeVol)} · {withCommas(h.trades)} tr
                       </div>
                     </div>
                   </div>
