@@ -112,11 +112,20 @@ BOT_DEFAULTS = {
     "exchange": "binance", # "binance" | "hyperliquid"
     "hlTestnet": False,    # Hyperliquid: use testnet
     "maxLossPerTradeUsdt": 0.0002,  # hard cap: auto-close any position at this $ loss
+    # --- STRADDLE SYSTEM: on a volume spike, arm a LONG stop above + SHORT stop below.
+    # Whichever side price hits first fills; the other is cancelled (OCO breakout).
+    "straddleEnabled": False,
+    "straddleEntryPct": 0.5,   # entry offset from mark (0.000001 - 5 %)
+    "straddleTpPct": 1.0,      # take-profit for the filled leg (0.01 - 10 %)
+    "straddleSlPct": 1.0,      # stop-loss for the filled leg (0.0001 - 5 %)
 }
+
+STRADDLE_EXPIRY = 600.0  # seconds an un-filled straddle stays armed before auto-cancel
 
 BOT = {
     "config": dict(BOT_DEFAULTS),
     "positions": {},        # symbol -> position dict
+    "straddles": {},        # symbol -> pending straddle (armed long/short stop levels)
     "journal": deque(maxlen=300),
     "dailyPnl": 0.0,
     "dailyDate": "",
@@ -204,9 +213,9 @@ def _get_hl_exchange():
     return _HL["exchange"]
 
 
-async def _hl_market_open(base_coin, size):
+async def _hl_market_open(base_coin, size, is_buy=True):
     ex = _get_hl_exchange()
-    res = await asyncio.to_thread(ex.market_open, base_coin, True, size, None, 0.01)
+    res = await asyncio.to_thread(ex.market_open, base_coin, is_buy, size, None, 0.01)
     if res.get("status") != "ok":
         raise RuntimeError(str(res)[:200])
     fills = res["response"]["data"]["statuses"]
@@ -225,8 +234,9 @@ async def _hl_market_close(base_coin):
     return {"fillPrice": float(filled["avgPx"]) if filled else 0.0}
 
 
-async def _open_position(http, sym, price, now):
+async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_price=None, source="signal"):
     cfg = BOT["config"]
+    is_long = side == "long"
     qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
     order_id = None
     if cfg["dryRun"]:
@@ -234,13 +244,18 @@ async def _open_position(http, sym, price, now):
         executed = qty
     elif cfg.get("exchange") == "hyperliquid":
         try:
-            r = await _hl_market_open(STATE["latest"][sym]["base"], qty)
+            r = await _hl_market_open(STATE["latest"][sym]["base"], qty, is_buy=is_long)
             fill = r["fillPrice"] or price
             executed = r["executedQty"] or qty
         except Exception as e:  # noqa: BLE001
-            jlog("error", symbol=sym, action="BUY", message=str(e), live=True, venue="hyperliquid")
+            jlog("error", symbol=sym, action="BUY" if is_long else "SHORT", message=str(e), live=True, venue="hyperliquid")
             return
     else:
+        if not is_long:
+            jlog("error", symbol=sym, action="SHORT",
+                 message="Short entries need Hyperliquid or simulated mode — Binance spot is long-only, short leg skipped.",
+                 live=True)
+            return
         try:
             r = await _live_market(http, sym, "BUY", quote_qty=cfg["maxPositionUsdt"])
             fill = r["fillPrice"] or price
@@ -249,19 +264,25 @@ async def _open_position(http, sym, price, now):
         except Exception as e:  # noqa: BLE001
             jlog("error", symbol=sym, action="BUY", message=str(e), live=True)
             return
+    if tp_price is None or sl_price is None:
+        if is_long:
+            tp_price = fill * (1 + cfg["tpPct"] / 100)
+            sl_price = fill * (1 - cfg["slPct"] / 100)
+        else:
+            tp_price = fill * (1 - cfg["tpPct"] / 100)
+            sl_price = fill * (1 + cfg["slPct"] / 100)
     pos = {
-        "symbol": sym, "base": sym[: -len(QUOTE)], "side": "long",
+        "symbol": sym, "base": sym[: -len(QUOTE)], "side": side,
         "entryPrice": fill, "qty": executed, "quoteSpent": fill * executed,
-        "tpPrice": fill * (1 + cfg["tpPct"] / 100),
-        "slPrice": fill * (1 - cfg["slPct"] / 100),
-        "openedTs": now, "orderId": order_id, "dryRun": cfg["dryRun"],
+        "tpPrice": tp_price, "slPrice": sl_price,
+        "openedTs": now, "orderId": order_id, "dryRun": cfg["dryRun"], "source": source,
     }
     BOT["positions"][sym] = pos
     BOT["lastTradeTs"][sym] = now
-    jlog("entry", symbol=sym, base=pos["base"], side="buy", price=fill, qty=executed,
-         spent=pos["quoteSpent"], tp=pos["tpPrice"], sl=pos["slPrice"],
+    jlog("entry", symbol=sym, base=pos["base"], side="buy" if is_long else "short", price=fill, qty=executed,
+         spent=pos["quoteSpent"], tp=pos["tpPrice"], sl=pos["slPrice"], source=source,
          mode="SIM" if cfg["dryRun"] else "LIVE")
-    await send_webhook("buy", sym, fill)
+    await send_webhook("buy" if is_long else "sell", sym, fill)
 
 
 async def _close_position(http, sym, price, reason):
@@ -283,13 +304,13 @@ async def _close_position(http, sym, price, reason):
                 fill = r["fillPrice"] or price
             except Exception as e:  # noqa: BLE001
                 jlog("error", symbol=sym, action="SELL", message=str(e), live=True)
-    pnl = (fill - pos["entryPrice"]) * pos["qty"]
+    pnl = (fill - pos["entryPrice"]) * pos["qty"] * (1 if pos.get("side", "long") == "long" else -1)
     BOT["dailyPnl"] += pnl
     BOT["lastTradeTs"][sym] = time.time()
-    jlog("exit", symbol=sym, base=pos["base"], side="sell", price=fill,
+    jlog("exit", symbol=sym, base=pos["base"], side="sell" if pos.get("side", "long") == "long" else "cover", price=fill,
          entry=pos["entryPrice"], qty=pos["qty"], pnl=pnl, reason=reason,
          mode="SIM" if pos.get("dryRun") else "LIVE")
-    await send_webhook("sell", sym, fill)
+    await send_webhook("sell" if pos.get("side", "long") == "long" else "buy", sym, fill)
     if BOT["dailyPnl"] <= -cfg["dailyLossLimit"]:
         BOT["stopped"] = True
         cfg["enabled"] = False
@@ -317,9 +338,37 @@ async def process_bot(http: httpx.AsyncClient, now: float):
             if not v:
                 continue
             pos = BOT["positions"][sym]
-            upnl = (v["price"] - pos["entryPrice"]) * pos["qty"]
+            sgn = 1 if pos.get("side", "long") == "long" else -1
+            upnl = (v["price"] - pos["entryPrice"]) * pos["qty"] * sgn
             if upnl <= -hard_cap:
                 await _close_position(http, sym, v["price"], "max-loss-cap")
+
+    # STRADDLE fills: whichever stop level price hits first fills; the other is cancelled.
+    if BOT["straddles"]:
+        for sym in list(BOT["straddles"].keys()):
+            s = BOT["straddles"][sym]
+            v = latest.get(sym)
+            if not v:
+                continue
+            price = v["price"]
+            if now - s["createdTs"] > STRADDLE_EXPIRY:
+                BOT["straddles"].pop(sym, None)
+                jlog("straddle_cancel", symbol=sym, base=s["base"], reason="expired")
+                continue
+            if price >= s["longEntry"]:
+                BOT["straddles"].pop(sym, None)
+                tp = s["longEntry"] * (1 + cfg["straddleTpPct"] / 100)
+                sl = s["longEntry"] * (1 - cfg["straddleSlPct"] / 100)
+                jlog("straddle_fill", symbol=sym, base=s["base"], side="long", entry=s["longEntry"],
+                     message="LONG leg filled — SHORT leg cancelled")
+                await _open_position(http, sym, s["longEntry"], now, side="long", tp_price=tp, sl_price=sl, source="straddle")
+            elif price <= s["shortEntry"]:
+                BOT["straddles"].pop(sym, None)
+                tp = s["shortEntry"] * (1 - cfg["straddleTpPct"] / 100)
+                sl = s["shortEntry"] * (1 + cfg["straddleSlPct"] / 100)
+                jlog("straddle_fill", symbol=sym, base=s["base"], side="short", entry=s["shortEntry"],
+                     message="SHORT leg filled — LONG leg cancelled")
+                await _open_position(http, sym, s["shortEntry"], now, side="short", tp_price=tp, sl_price=sl, source="straddle")
 
     # 1) manage TP/SL exits (only when autoExit enabled; otherwise exits happen
     #    solely on a SELL signal via handle_signal)
@@ -330,10 +379,16 @@ async def process_bot(http: httpx.AsyncClient, now: float):
                 continue
             price = v["price"]
             pos = BOT["positions"][sym]
-            if price >= pos["tpPrice"]:
-                await _close_position(http, sym, price, "take-profit")
-            elif price <= pos["slPrice"]:
-                await _close_position(http, sym, price, "stop-loss")
+            if pos.get("side", "long") == "long":
+                if price >= pos["tpPrice"]:
+                    await _close_position(http, sym, price, "take-profit")
+                elif price <= pos["slPrice"]:
+                    await _close_position(http, sym, price, "stop-loss")
+            else:  # short
+                if price <= pos["tpPrice"]:
+                    await _close_position(http, sym, price, "take-profit")
+                elif price >= pos["slPrice"]:
+                    await _close_position(http, sym, price, "stop-loss")
 
     # Entries are driven ONLY by alert-history events pushed from the dashboard
     # (see handle_signal + POST /api/bot/signal). If no alerts are enabled/feeding,
@@ -357,6 +412,27 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
     _maxv = cfg.get("maxVolumeUsd", 0) or 0
     if _maxv > 0 and volume > _maxv:  # upper bound of the volume band
         return
+
+    # STRADDLE MODE: a qualifying volume-spike alert arms a long/short breakout straddle
+    # (instead of the streak-based directional entry).
+    if cfg.get("straddleEnabled"):
+        if sym in BOT["positions"] or sym in BOT["straddles"]:
+            return
+        if (now - BOT["lastTradeTs"].get(sym, 0)) < cfg["cooldownSec"]:
+            return
+        if (len(BOT["positions"]) + len(BOT["straddles"])) >= cfg["maxOpenPositions"]:
+            return
+        eo = cfg["straddleEntryPct"] / 100
+        BOT["straddles"][sym] = {
+            "symbol": sym, "base": sym[: -len(QUOTE)], "mark": price,
+            "longEntry": price * (1 + eo), "shortEntry": price * (1 - eo),
+            "createdTs": now,
+        }
+        jlog("straddle", symbol=sym, base=sym[: -len(QUOTE)], mark=price,
+             longEntry=price * (1 + eo), shortEntry=price * (1 - eo),
+             message=f"Straddle armed ±{cfg['straddleEntryPct']}% · TP {cfg['straddleTpPct']}% / SL {cfg['straddleSlPct']}%")
+        return
+
     st = BOT["signalStreaks"].get(sym)
     if st and st["side"] == side and (now - st["startTs"]) <= 1.5:
         st["count"] += 1
@@ -691,6 +767,10 @@ class BotConfigUpdate(BaseModel):
     exchange: Optional[str] = None
     hlTestnet: Optional[bool] = None
     maxLossPerTradeUsdt: Optional[float] = None
+    straddleEnabled: Optional[bool] = None
+    straddleEntryPct: Optional[float] = None
+    straddleTpPct: Optional[float] = None
+    straddleSlPct: Optional[float] = None
 
 
 def _bot_status():
@@ -700,14 +780,22 @@ def _bot_status():
     unrealized = 0.0
     for sym, pos in BOT["positions"].items():
         price = latest.get(sym, {}).get("price", pos["entryPrice"])
-        upnl = (price - pos["entryPrice"]) * pos["qty"]
+        sgn = 1 if pos.get("side", "long") == "long" else -1
+        upnl = (price - pos["entryPrice"]) * pos["qty"] * sgn
         unrealized += upnl
         positions.append({
-            "symbol": sym, "base": pos["base"], "entryPrice": pos["entryPrice"],
+            "symbol": sym, "base": pos["base"], "side": pos.get("side", "long"),
+            "entryPrice": pos["entryPrice"],
             "currentPrice": price, "qty": pos["qty"], "quoteSpent": pos["quoteSpent"],
-            "tpPrice": pos["tpPrice"], "slPrice": pos["slPrice"],
+            "tpPrice": pos["tpPrice"], "slPrice": pos["slPrice"], "source": pos.get("source", "signal"),
             "uPnl": upnl, "openedTs": pos["openedTs"], "mode": "SIM" if pos.get("dryRun") else "LIVE",
         })
+    straddles = [
+        {"symbol": s["symbol"], "base": s["base"], "mark": s["mark"],
+         "longEntry": s["longEntry"], "shortEntry": s["shortEntry"],
+         "currentPrice": latest.get(sym2, {}).get("price", s["mark"]), "createdTs": s["createdTs"]}
+        for sym2, s in BOT["straddles"].items()
+    ]
     now = time.time()
     alerts_feeding = (now - BOT["lastSignalTs"]) < 6 and BOT["lastSignalTs"] > 0
     return {
@@ -717,6 +805,7 @@ def _bot_status():
         "dailyDate": BOT["dailyDate"],
         "unrealizedPnl": unrealized,
         "openPositions": positions,
+        "pendingStraddles": straddles,
         "journal": list(BOT["journal"])[:100],
         "keysConfigured": bool(BINANCE_API_KEY and BINANCE_API_SECRET),
         "hlKeyConfigured": bool(os.environ.get("HYPERLIQUID_PRIVATE_KEY")),
@@ -760,6 +849,12 @@ async def bot_config(update: BotConfigUpdate):
         data["maxVolumeUsd"] = max(0.0, float(data["maxVolumeUsd"]))
     if "maxLossPerTradeUsdt" in data:
         data["maxLossPerTradeUsdt"] = max(0.0, float(data["maxLossPerTradeUsdt"]))
+    if "straddleEntryPct" in data:
+        data["straddleEntryPct"] = max(0.000001, min(5.0, float(data["straddleEntryPct"])))
+    if "straddleTpPct" in data:
+        data["straddleTpPct"] = max(0.01, min(10.0, float(data["straddleTpPct"])))
+    if "straddleSlPct" in data:
+        data["straddleSlPct"] = max(0.0001, min(5.0, float(data["straddleSlPct"])))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)
@@ -801,7 +896,9 @@ async def bot_close_all():
         price = latest.get(sym, {}).get("price", BOT["positions"][sym]["entryPrice"])
         await _close_position(app.state.http, sym, price, "manual-close")
         closed += 1
-    jlog("kill_switch", message=f"Manually closed {closed} position(s)")
+    straddle_n = len(BOT["straddles"])
+    BOT["straddles"].clear()
+    jlog("kill_switch", message=f"Manually closed {closed} position(s) · cancelled {straddle_n} straddle(s)")
     return _bot_status()
 
 

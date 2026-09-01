@@ -75,6 +75,9 @@ export default function BotPanel({ open, onClose }) {
     maxOpenPositions: parseInt(form.maxOpenPositions, 10),
     cooldownSec: parseInt(form.cooldownSec, 10),
     maxLossPerTradeUsdt: parseFloat(form.maxLossPerTradeUsdt),
+    straddleEntryPct: parseFloat(form.straddleEntryPct),
+    straddleTpPct: parseFloat(form.straddleTpPct),
+    straddleSlPct: parseFloat(form.straddleSlPct),
     webhookUrl: form.webhookUrl || "",
     webhookBuyMsg: form.webhookBuyMsg || "",
     webhookSellMsg: form.webhookSellMsg || "",
@@ -271,6 +274,29 @@ export default function BotPanel({ open, onClose }) {
                     <span>Auto exit on TP / SL</span>
                     <span className="font-semibold">{st.config.autoExit ? "ON" : "OFF — sell-signal only"}</span>
                   </button>
+
+                  {/* STRADDLE SYSTEM */}
+                  <div className="space-y-2 border border-[#7C3AED]/25 bg-[#7C3AED]/[0.03] p-2.5" data-testid="bot-straddle-section">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] font-semibold uppercase tracking-wider text-[#7C3AED]">Straddle system</span>
+                      <button
+                        data-testid="bot-straddle-toggle"
+                        onClick={() => patch({ straddleEnabled: !st.config.straddleEnabled })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.straddleEnabled ? "border-[#7C3AED] bg-[#7C3AED] text-white" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.straddleEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <p className="mono text-[9px] leading-relaxed text-zinc-500">
+                      On a volume spike, arm a LONG stop <b className="text-[#00A004]">+{form.straddleEntryPct}%</b> above and a SHORT stop <b className="text-[#FF3B30]">−{form.straddleEntryPct}%</b> below the mark. Whichever price hits first fills; the other is cancelled (OCO breakout). Overrides streak entries while ON. Shorts execute in Sim + Hyperliquid only.
+                    </p>
+                    <div className="grid grid-cols-3 gap-2">
+                      <NumField testid="bot-straddle-entry" label="Entry ±" step="0.000001" value={form.straddleEntryPct} onChange={(v) => setForm({ ...form, straddleEntryPct: v })} suffix="%" />
+                      <NumField testid="bot-straddle-tp" label="TP" step="0.01" value={form.straddleTpPct} onChange={(v) => setForm({ ...form, straddleTpPct: v })} suffix="%" />
+                      <NumField testid="bot-straddle-sl" label="SL" step="0.0001" value={form.straddleSlPct} onChange={(v) => setForm({ ...form, straddleSlPct: v })} suffix="%" />
+                    </div>
+                  </div>
+
                   <button
                     data-testid="bot-save"
                     onClick={saveSettings}
@@ -340,7 +366,10 @@ export default function BotPanel({ open, onClose }) {
                   <div className="space-y-1">
                     {st.openPositions.map((p) => (
                       <div key={p.symbol} data-testid={`bot-pos-${p.symbol}`} className="flex items-center justify-between border border-zinc-100 px-2 py-1.5">
-                        <div className="mono text-[12px] font-semibold text-zinc-900">{p.base}<span className="text-[9px] text-zinc-300">/USDT</span></div>
+                        <div className="mono text-[12px] font-semibold text-zinc-900 flex items-center gap-1">
+                          <span className={`rounded-sm px-1 text-[8px] font-bold uppercase ${p.side === "short" ? "bg-[#FF3B30] text-white" : "bg-[#00A004] text-white"}`}>{p.side === "short" ? "S" : "L"}</span>
+                          {p.base}<span className="text-[9px] text-zinc-300">/USDT</span>
+                        </div>
                         <div className="mono text-[10px] text-zinc-400">e {p.entryPrice.toPrecision(5)} · tp {p.tpPrice.toPrecision(5)} · sl {p.slPrice.toPrecision(5)}</div>
                         <div className={`mono text-[11px] font-semibold ${p.uPnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}`}>{p.uPnl >= 0 ? "+" : ""}{p.uPnl.toFixed(4)}</div>
                       </div>
@@ -348,6 +377,25 @@ export default function BotPanel({ open, onClose }) {
                   </div>
                 )}
               </div>
+
+              {/* armed straddles */}
+              {st.pendingStraddles && st.pendingStraddles.length > 0 && (
+                <div className="border-t border-zinc-100 pt-3" data-testid="bot-straddles">
+                  <span className="mono text-[10px] uppercase tracking-wider text-[#7C3AED]">Armed straddles ({st.pendingStraddles.length})</span>
+                  <div className="mt-2 space-y-1">
+                    {st.pendingStraddles.map((s) => (
+                      <div key={s.symbol} data-testid={`bot-straddle-${s.symbol}`} className="flex items-center justify-between border border-[#7C3AED]/30 bg-[#7C3AED]/[0.04] px-2 py-1.5">
+                        <div className="mono text-[12px] font-semibold text-zinc-900">{s.base}<span className="text-[9px] text-zinc-300">/USDT</span></div>
+                        <div className="mono text-[10px]">
+                          <span className="text-[#00A004]">↑{s.longEntry.toPrecision(5)}</span>
+                          <span className="text-zinc-300"> / </span>
+                          <span className="text-[#FF3B30]">↓{s.shortEntry.toPrecision(5)}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* journal */}
               <div className="border-t border-zinc-100 pt-3">
@@ -379,8 +427,11 @@ const Stat = ({ label, value, color, testid }) => (
 );
 
 const JournalLine = ({ j }) => {
-  if (j.kind === "entry") return <span className="text-[#00A004]">BUY {j.base} @ {Number(j.price).toPrecision(5)} · {j.mode}</span>;
-  if (j.kind === "exit") return <span className={j.pnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}>SELL {j.base} @ {Number(j.price).toPrecision(5)} · {j.reason} · pnl {j.pnl >= 0 ? "+" : ""}{Number(j.pnl).toFixed(4)}</span>;
+  if (j.kind === "entry") return <span className={j.side === "short" ? "text-[#FF3B30]" : "text-[#00A004]"}>{j.side === "short" ? "SHORT" : "BUY"} {j.base} @ {Number(j.price).toPrecision(5)}{j.source === "straddle" ? " · straddle" : ""} · {j.mode}</span>;
+  if (j.kind === "exit") return <span className={j.pnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}>{j.side === "cover" ? "COVER" : "SELL"} {j.base} @ {Number(j.price).toPrecision(5)} · {j.reason} · pnl {j.pnl >= 0 ? "+" : ""}{Number(j.pnl).toFixed(4)}</span>;
+  if (j.kind === "straddle") return <span className="text-[#7C3AED]">STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
+  if (j.kind === "straddle_fill") return <span className="text-[#7C3AED] font-semibold">{j.side === "short" ? "SHORT" : "LONG"} leg filled {j.base} — opposite cancelled</span>;
+  if (j.kind === "straddle_cancel") return <span className="text-zinc-400">straddle {j.base} cancelled ({j.reason})</span>;
   if (j.kind === "halt") return <span className="text-[#FF3B30] font-semibold">⛔ {j.message}</span>;
   if (j.kind === "power") return <span className="text-zinc-700">{j.message} ({j.mode})</span>;
   if (j.kind === "error") return <span className="text-[#FF3B30]">ERR {j.symbol} {j.action}: {String(j.message).slice(0, 60)}</span>;

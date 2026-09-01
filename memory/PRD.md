@@ -40,6 +40,14 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - **Alert-history Buy/Sell running totals**: two summary sections at the top of the Alert History panel — Buying·total and Selling·total — each showing Σ trades + Σ traded USD across all logged alerts, plus a net-pressure bar (`Net → BUYING/SELLING %`). Accumulates over time so dominant side/direction is visible at a glance (`alertTotals` memo in `Scanner.jsx`).
 - **Alert-history per-token totals ("By token" view)**: `Log`/`By token` toggle in the panel; the By-token view keeps each token's bought vs sold totals separately (trades + USD) with a per-token net bar + BUYING/SELLING verdict, sorted by total traded volume (`tokenTotals` memo, `historyView` state). Verified live via screenshot (ETH 212/0→BUYING, BTC 60/91→SELLING).
 
+## Implemented (2026-09) — Session 2c: STRADDLE SYSTEM
+- **Straddle System** in the Auto-Trade Bot: on a volume-spike alert, arms a LONG stop-entry at `+straddleEntryPct%` and a SHORT stop-entry at `−straddleEntryPct%` of the mark. Whichever price hits first fills and opens a position; the opposite leg is cancelled (OCO). Each filled leg gets its own TP (`straddleTpPct`) / SL (`straddleSlPct`). Ranges: entry 0.000001–5%, TP 0.01–10%, SL 0.0001–5%. Un-filled straddles auto-cancel after `STRADDLE_EXPIRY`=600s.
+- Added full **short-side** support: `_open_position(side, tp_price, sl_price, source)`, side-aware PnL in `_close_position` (cover), side-aware TP/SL + hard max-loss in `process_bot`, `_hl_market_open(is_buy)`. Shorts run in Sim + Hyperliquid only (Binance spot logs "long-only, short leg skipped").
+- Backend: `BOT['straddles']`, `handle_signal` straddle-arm branch, straddle-fill loop in `process_bot`, `pendingStraddles` + position `side`/`source` in `_bot_status`, clamps + config fields, `close-all` clears straddles.
+- Frontend `BotPanel.jsx`: Straddle section (toggle + Entry±/TP/SL), position L/S side badges, "Armed straddles" block, straddle/fill/cover journal lines.
+- Verified: iteration_12.json — 7/7 backend pytest + full frontend lifecycle, 100%, no bugs. Safe defaults restored.
+- Note (backlog): pending straddles occupy `maxOpenPositions` slots until filled/expired; consider a separate `maxPendingStraddles` cap.
+
 ## Known Gaps / Notes (Session 2)
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).
