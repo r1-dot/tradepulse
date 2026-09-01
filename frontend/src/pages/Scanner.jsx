@@ -447,6 +447,19 @@ export default function Scanner() {
     return list;
   }, [tokens, pressure, onlyAlerts, alertThreshold, onlyAlgo, algoOn, onlyVol, volThreshold, onlyStarred, starred]);
 
+  // running buy/sell totals across every logged alert (accumulates over time)
+  const alertTotals = useMemo(() => {
+    let buyTr = 0, buyVol = 0, sellTr = 0, sellVol = 0;
+    for (const h of alertHistory) {
+      if (h.side === "buy") { buyTr += h.trades || 0; buyVol += h.tradeVol || 0; }
+      else { sellTr += h.trades || 0; sellVol += h.tradeVol || 0; }
+    }
+    const totVol = buyVol + sellVol;
+    const sellLead = sellVol >= buyVol;
+    const leadPct = totVol > 0 ? Math.round((sellLead ? sellVol : buyVol) / totVol * 100) : 0;
+    return { buyTr, buyVol, sellTr, sellVol, totVol, sellLead, leadPct };
+  }, [alertHistory]);
+
   const rowVirtualizer = useVirtualizer({
     count: displayTokens.length,
     getScrollElement: () => parentRef.current,
@@ -1018,6 +1031,43 @@ export default function Scanner() {
                   <X size={14} />
                 </button>
               </div>
+            </div>
+            {/* Running Buy / Sell totals across all logged alerts */}
+            <div className="grid grid-cols-2 border-b border-zinc-200" data-testid="alert-totals">
+              <div data-testid="alert-buy-total" className="border-r border-zinc-200 px-4 py-2.5">
+                <div className="mono text-[9px] uppercase tracking-wider text-[#00A004] flex items-center gap-1">
+                  <ArrowUp size={10} /> Buying · total
+                </div>
+                <div data-testid="alert-buy-trades" className="mono tnum text-[16px] font-bold text-[#00A004] leading-tight">
+                  {withCommas(alertTotals.buyTr)} <span className="text-[10px] font-normal text-zinc-400">tr</span>
+                </div>
+                <div data-testid="alert-buy-vol" className="mono tnum text-[11px] text-zinc-500">≈{compactUsd(alertTotals.buyVol)}</div>
+              </div>
+              <div data-testid="alert-sell-total" className="px-4 py-2.5">
+                <div className="mono text-[9px] uppercase tracking-wider text-[#FF3B30] flex items-center gap-1">
+                  <ArrowDown size={10} /> Selling · total
+                </div>
+                <div data-testid="alert-sell-trades" className="mono tnum text-[16px] font-bold text-[#FF3B30] leading-tight">
+                  {withCommas(alertTotals.sellTr)} <span className="text-[10px] font-normal text-zinc-400">tr</span>
+                </div>
+                <div data-testid="alert-sell-vol" className="mono tnum text-[11px] text-zinc-500">≈{compactUsd(alertTotals.sellVol)}</div>
+              </div>
+            </div>
+            {/* Net pressure bias */}
+            <div data-testid="alert-bias" className="flex items-center gap-2 border-b border-zinc-200 bg-[#FAFAFA] px-4 py-1.5">
+              {alertTotals.totVol > 0 ? (
+                <>
+                  <div className="flex h-1.5 flex-1 overflow-hidden rounded-full bg-zinc-200">
+                    <div className="h-full bg-[#00C805]" style={{ width: `${Math.round(alertTotals.buyVol / alertTotals.totVol * 100)}%` }} />
+                    <div className="h-full bg-[#FF3B30]" style={{ width: `${Math.round(alertTotals.sellVol / alertTotals.totVol * 100)}%` }} />
+                  </div>
+                  <span className={`mono text-[10px] font-semibold whitespace-nowrap ${alertTotals.sellLead ? "text-[#FF3B30]" : "text-[#00A004]"}`}>
+                    Net → {alertTotals.sellLead ? "SELLING" : "BUYING"} {alertTotals.leadPct}%
+                  </span>
+                </>
+              ) : (
+                <span className="mono text-[10px] text-zinc-400">No alerts logged yet — arm an alert to accumulate totals</span>
+              )}
             </div>
             <div className="scan-scroll flex-1 overflow-y-auto">
               {alertHistory.length === 0 ? (

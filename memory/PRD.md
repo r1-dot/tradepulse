@@ -37,6 +37,7 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 ## Implemented (2026-09) — Session 2b
 - **Bot low volume bands**: min/max volume-band dropdowns now include sub-million bands `$50K / $100K / $300K / $600K / $900K / $1M` in addition to $5M–$900M (`BOT_VOL` in `BotPanel.jsx`, `fmtM` handles <1M as K, option values `Math.round(m*1e6)`).
 - **Alert-history trade volume**: every logged alert now records `tradeVol` = estimated USD volume of the counted trades (`trades × quoteVol/trades24h`), shown as `≈$X · N tr` beside the 24h volume and added as a "Trade Vol" column in the PDF export (`Scanner.jsx`). Verified live via screenshot.
+- **Alert-history Buy/Sell running totals**: two summary sections at the top of the Alert History panel — Buying·total and Selling·total — each showing Σ trades + Σ traded USD across all logged alerts, plus a net-pressure bar (`Net → BUYING/SELLING %`). Accumulates over time so dominant side/direction is visible at a glance (`alertTotals` memo in `Scanner.jsx`). Verified live: Buy 58tr/$9.30K vs Sell 392tr/$82.41K → Net SELLING 90%.
 
 ## Known Gaps / Notes (Session 2)
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
