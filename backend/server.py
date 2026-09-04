@@ -27,6 +27,7 @@ from urllib.parse import urlencode
 from pathlib import Path
 from collections import deque
 from typing import Optional
+import hyperliquid_converter as hlconv
 import httpx
 
 ROOT_DIR = Path(__file__).parent
@@ -118,6 +119,9 @@ BOT_DEFAULTS = {
     "straddleEntryPct": 0.5,   # entry offset from mark (0.000001 - 5 %)
     "straddleTpPct": 1.0,      # take-profit for the filled leg (0.01 - 10 %)
     "straddleSlPct": 1.0,      # stop-loss for the filled leg (0.0001 - 5 %)
+    # --- HYPERLIQUID PERPS: leverage + margin mode (applied per coin before each order)
+    "hlLeverage": 1,           # target leverage (clamped to each coin's max)
+    "hlCrossMargin": True,     # True = cross margin, False = isolated
 }
 
 STRADDLE_EXPIRY = 600.0  # seconds an un-filled straddle stays armed before auto-cancel
@@ -213,9 +217,25 @@ def _get_hl_exchange():
     return _HL["exchange"]
 
 
-async def _hl_market_open(base_coin, size, is_buy=True):
+async def _ensure_hl_ready():
+    """Build the HL client and load the coin/szDecimals map (blocking calls off the loop)."""
+    def _build():
+        _get_hl_exchange()
+        if not hlconv.meta_loaded():
+            hlconv.load_hl_meta(_HL["info"])
+    await asyncio.to_thread(_build)
+
+
+async def _hl_market_open(coin, size, is_buy=True, leverage=None, is_cross=True):
     ex = _get_hl_exchange()
-    res = await asyncio.to_thread(ex.market_open, base_coin, is_buy, size, None, 0.01)
+    if leverage:
+        # perps: set leverage + margin mode per coin (clamped to the coin's max)
+        lev = max(1, min(int(leverage), hlconv.max_leverage(coin)))
+        try:
+            await asyncio.to_thread(ex.update_leverage, lev, coin, bool(is_cross))
+        except Exception as e:  # noqa: BLE001
+            jlog("warn", symbol=coin, message=f"update_leverage failed: {str(e)[:120]}", live=True)
+    res = await asyncio.to_thread(ex.market_open, coin, is_buy, size, None, 0.01)
     if res.get("status") != "ok":
         raise RuntimeError(str(res)[:200])
     fills = res["response"]["data"]["statuses"]
@@ -244,11 +264,24 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
         executed = qty
     elif cfg.get("exchange") == "hyperliquid":
         try:
-            r = await _hl_market_open(STATE["latest"][sym]["base"], qty, is_buy=is_long)
+            await _ensure_hl_ready()
+            base = STATE["latest"][sym]["base"]
+            conv = hlconv.get_rounded_size_and_price(base, qty, price)
+            if conv is None:
+                # coin not listed on Hyperliquid perps, or size rounds to 0 -> skip + log once
+                skipped = BOT.setdefault("hlSkipped", set())
+                if base not in skipped:
+                    skipped.add(base)
+                    reason = "not listed on Hyperliquid perps" if hlconv.convert_binance_to_hyperliquid(base) is None else "order size rounds to 0"
+                    jlog("skip", symbol=sym, base=base, message=f"{base}: {reason} — skipped", live=True, venue="hyperliquid")
+                return
+            hl_coin, rsize, _ = conv
+            r = await _hl_market_open(hl_coin, rsize, is_buy=is_long,
+                                      leverage=cfg.get("hlLeverage", 1), is_cross=cfg.get("hlCrossMargin", True))
             fill = r["fillPrice"] or price
-            executed = r["executedQty"] or qty
+            executed = r["executedQty"] or rsize
         except Exception as e:  # noqa: BLE001
-            jlog("error", symbol=sym, action="BUY" if is_long else "SHORT", message=str(e), live=True, venue="hyperliquid")
+            jlog("error", symbol=sym, action="LONG" if is_long else "SHORT", message=str(e)[:200], live=True, venue="hyperliquid")
             return
     else:
         if not is_long:
@@ -294,10 +327,12 @@ async def _close_position(http, sym, price, reason):
     if not cfg["dryRun"] and not pos.get("dryRun"):
         if cfg.get("exchange") == "hyperliquid":
             try:
-                r = await _hl_market_close(pos["base"])
+                await _ensure_hl_ready()
+                hl_coin = hlconv.convert_binance_to_hyperliquid(pos["base"]) or pos["base"]
+                r = await _hl_market_close(hl_coin)
                 fill = r["fillPrice"] or price
             except Exception as e:  # noqa: BLE001
-                jlog("error", symbol=sym, action="SELL", message=str(e), live=True, venue="hyperliquid")
+                jlog("error", symbol=sym, action="CLOSE", message=str(e)[:200], live=True, venue="hyperliquid")
         else:
             try:
                 r = await _live_market(http, sym, "SELL", base_qty=pos["qty"])
@@ -441,12 +476,15 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
         BOT["signalStreaks"][sym] = st
     if st["count"] >= cfg["streak"]:
         cd = now - BOT["lastTradeTs"].get(sym, 0) >= cfg["cooldownSec"]
-        if side == "buy":
-            if sym not in BOT["positions"] and cd and len(BOT["positions"]) < cfg["maxOpenPositions"]:
-                await _open_position(http, sym, price, now)
-        else:  # sell closes an open position early
-            if sym in BOT["positions"]:
-                await _close_position(http, sym, price, "sell-signal")
+        want = "long" if side == "buy" else "short"
+        pos = BOT["positions"].get(sym)
+        if pos is None:
+            # flat: BUY opens LONG, SELL opens SHORT (perps)
+            if cd and len(BOT["positions"]) < cfg["maxOpenPositions"]:
+                await _open_position(http, sym, price, now, side=want)
+        elif pos.get("side", "long") != want:
+            # opposite signal on an open position -> close it
+            await _close_position(http, sym, price, "reverse-signal")
         BOT["signalStreaks"].pop(sym, None)
 
 
@@ -771,6 +809,8 @@ class BotConfigUpdate(BaseModel):
     straddleEntryPct: Optional[float] = None
     straddleTpPct: Optional[float] = None
     straddleSlPct: Optional[float] = None
+    hlLeverage: Optional[int] = None
+    hlCrossMargin: Optional[bool] = None
 
 
 def _bot_status():
@@ -855,6 +895,8 @@ async def bot_config(update: BotConfigUpdate):
         data["straddleTpPct"] = max(0.01, min(10.0, float(data["straddleTpPct"])))
     if "straddleSlPct" in data:
         data["straddleSlPct"] = max(0.0001, min(5.0, float(data["straddleSlPct"])))
+    if "hlLeverage" in data:
+        data["hlLeverage"] = max(1, min(50, int(data["hlLeverage"])))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)

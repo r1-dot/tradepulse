@@ -178,7 +178,31 @@ export default function BotPanel({ open, onClose }) {
                 </div>
                 {st.config.exchange === "hyperliquid" && (
                   <div data-testid="bot-hl-status" className="mono text-[9px] text-zinc-400">
-                    HL key: <b className={st.hlKeyConfigured ? "text-[#00A004]" : "text-[#B26A00]"}>{st.hlKeyConfigured ? "configured" : "missing (add HYPERLIQUID_PRIVATE_KEY)"}</b> · {st.hlAddress ? st.hlAddress.slice(0, 10) + "…" : "no address"}
+                    HL key: <b className={st.hlKeyConfigured ? "text-[#00A004]" : "text-[#B26A00]"}>{st.hlKeyConfigured ? "configured" : "missing (add HYPERLIQUID_PRIVATE_KEY)"}</b> · {st.hlAddress ? st.hlAddress.slice(0, 10) + "…" : "no address"} · PERPS
+                  </div>
+                )}
+                {st.config.exchange === "hyperliquid" && (
+                  <div className="flex items-center gap-2" data-testid="bot-hl-leverage-row">
+                    <div className="flex items-center gap-1 border border-zinc-200 px-2 py-1">
+                      <span className="mono text-[10px] text-zinc-500">Leverage</span>
+                      <input
+                        data-testid="bot-hl-leverage"
+                        type="number" min="1" max="50" step="1"
+                        value={form.hlLeverage}
+                        onChange={(e) => setForm({ ...form, hlLeverage: e.target.value })}
+                        onBlur={() => patch({ hlLeverage: parseInt(form.hlLeverage, 10) || 1 })}
+                        className="mono w-12 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
+                      />
+                      <span className="mono text-[11px] font-bold text-[#7C3AED]">x</span>
+                    </div>
+                    <button
+                      data-testid="bot-hl-margin"
+                      onClick={() => patch({ hlCrossMargin: !st.config.hlCrossMargin })}
+                      className={`mono border px-2 py-1.5 text-[11px] font-semibold transition-colors ${st.config.hlCrossMargin ? "border-zinc-900 text-zinc-900" : "border-[#F5A623] text-[#B26A00]"}`}
+                    >
+                      {st.config.hlCrossMargin ? "Cross" : "Isolated"}
+                    </button>
+                    <span className="mono text-[9px] leading-tight text-zinc-400">clamped to each coin's max (BTC 40x, ETH 25x…)</span>
                   </div>
                 )}
               </div>

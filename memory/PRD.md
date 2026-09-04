@@ -48,6 +48,14 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Verified: iteration_12.json — 7/7 backend pytest + full frontend lifecycle, 100%, no bugs. Safe defaults restored.
 - Note (backlog): pending straddles occupy `maxOpenPositions` slots until filled/expired; consider a separate `maxPendingStraddles` cap.
 
+## Implemented (2026-09) — Session 2d: Hyperliquid PERPS live trading
+- **Hyperliquid keys added** to backend/.env (HYPERLIQUID_ACCOUNT_ADDRESS `0x8117…1856`, HYPERLIQUID_PRIVATE_KEY, mainnet). `/api/hyperliquid/account` authenticates OK. NOTE: account balance is $0 USDC — must deposit before live orders fill (HL ~$10 min notional).
+- **PERPS confirmed** (coin names via `Info.meta()` perp universe, not spot pairs).
+- **`hyperliquid_converter.py`** (new): `load_hl_meta` (coin→szDecimals + maxLeverage), `convert_binance_to_hyperliquid` (filters coins not on HL, maps 1000X→kX), `round_size`/`round_price` (fixes `float_to_wire` — size→szDecimals, price→5 sig-fig & ≤6-szDecimals dp), `get_rounded_size_and_price`. 233 coins loaded; unlisted (ARKM/DIA/RED/OPEN/XAUT/NEIRO/DEXE) skipped + logged once.
+- **Long/short entries**: BUY→LONG, SELL→SHORT (perps), market orders; opposite signal on an open position closes it (reverse-signal). Verified SIM (sell BTC→short, buy SOL→long).
+- **Leverage + margin**: config `hlLeverage` (1–40, clamped to each coin's max) + `hlCrossMargin` (default Cross). Applied per-coin via `exchange.update_leverage` before each order. UI controls in BotPanel (Hyperliquid → Leverage input + Cross/Isolated toggle). User sets leverage manually.
+- Verified: converter unit-tested, backend starts clean, SIM long/short works, UI renders. Live execution pending USDC deposit.
+
 ## Known Gaps / Notes (Session 2)
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).
