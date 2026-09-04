@@ -56,6 +56,12 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - **Leverage + margin**: config `hlLeverage` (1–40, clamped to each coin's max) + `hlCrossMargin` (default Cross). Applied per-coin via `exchange.update_leverage` before each order. UI controls in BotPanel (Hyperliquid → Leverage input + Cross/Isolated toggle). User sets leverage manually.
 - Verified: converter unit-tested, backend starts clean, SIM long/short works, UI renders. Live execution pending USDC deposit.
 
+## Bug RCA (2026-09) — "User or API Wallet 0x8117… does not exist"
+- **Not a key swap.** `_get_hl_exchange` init is correct (signer=private key, account_address=main). Verified via new `/api/hyperliquid/diagnose`: the wallet derived from HYPERLIQUID_PRIVATE_KEY == HYPERLIQUID_ACCOUNT_ADDRESS == 0x8117…1856, and that address has **no Hyperliquid account (accountValue 0.0, "does not exist")**.
+- **Root cause**: the configured wallet has no funded HL account. Either 0x8117 is an API/agent wallet whose real MAIN funded wallet address is different & missing, or 0x8117 is the user's main wallet that was never funded.
+- **Fixes** (verified iteration_13.json, backend 100%): (1) `/api/hyperliquid/diagnose` endpoint with actionable hint; (2) HL-init debug log (Main vs derived, net); (3) env fallbacks HYPERLIQUID_SECRET_KEY / HYPERLIQUID_MAIN_WALLET; (4) mainnet enforced; (5) graceful journal 'error' on live HL failure (bot never crashes); (6) throttled 'skip' journal log when a live signal is dropped by the volume band (observability).
+- **User action required**: fund 0x8117 on Hyperliquid, OR set HYPERLIQUID_ACCOUNT_ADDRESS to the correct funded MAIN wallet if 0x8117 is an agent key. Rotate the key (shared in chat).
+
 ## Known Gaps / Notes (Session 2)
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).

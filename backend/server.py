@@ -194,23 +194,29 @@ async def _live_market(http, symbol, side, quote_qty=None, base_qty=None):
     return {"executedQty": executed, "quote": cq, "fillPrice": fill, "orderId": res.get("orderId")}
 
 
-_HL = {"exchange": None, "info": None, "net": None}
+_HL = {"exchange": None, "info": None, "net": None, "agentAddr": None, "mainAddr": None}
 
 
 def _get_hl_exchange():
-    """Lazily build a Hyperliquid Exchange from env (agent key + master address)."""
+    """Build a Hyperliquid Exchange. signer = API/agent private key; account_address = MAIN
+    funded wallet that approved the agent. These are NOT the same address for agent wallets."""
     import eth_account
     from hyperliquid.exchange import Exchange
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
-    key = os.environ.get("HYPERLIQUID_PRIVATE_KEY", "")
-    addr = os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "")
+    key = os.environ.get("HYPERLIQUID_PRIVATE_KEY", "") or os.environ.get("HYPERLIQUID_SECRET_KEY", "")
+    addr = os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "") or os.environ.get("HYPERLIQUID_MAIN_WALLET", "")
     if not key or not addr:
         raise RuntimeError("Hyperliquid key/address not configured")
     net = "testnet" if BOT["config"].get("hlTestnet") else "mainnet"
     base = constants.TESTNET_API_URL if net == "testnet" else constants.MAINNET_API_URL
+    signer = eth_account.Account.from_key(key)
+    _HL["agentAddr"] = signer.address
+    _HL["mainAddr"] = addr
+    # DEBUG: verify the wallet derived from the secret is the expected API/agent wallet
+    logger.info("Hyperliquid init | net=%s | Main(account_address)=%s | API wallet derived from secret=%s | same=%s",
+                net, addr, signer.address, signer.address.lower() == addr.lower())
     if _HL["exchange"] is None or _HL["net"] != net:
-        signer = eth_account.Account.from_key(key)
         _HL["info"] = Info(base, skip_ws=True)
         _HL["exchange"] = Exchange(signer, base, account_address=addr)
         _HL["net"] = net
@@ -442,10 +448,15 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
         return
     price = info["price"]
     volume = info["quoteVol"]
-    if price <= 0 or volume < cfg.get("minVolumeUsd", 0):  # server-side volume gate (anti-spoof)
-        return
     _maxv = cfg.get("maxVolumeUsd", 0) or 0
-    if _maxv > 0 and volume > _maxv:  # upper bound of the volume band
+    _minv = cfg.get("minVolumeUsd", 0) or 0
+    if price <= 0 or volume < _minv or (_maxv > 0 and volume > _maxv):
+        # volume outside the configured band -> drop. Log (throttled, LIVE only) so operators
+        # can see WHY a live signal produced no order instead of it silently vanishing.
+        if cfg.get("enabled") and not cfg.get("dryRun") and price > 0 and (now - BOT.get("_volSkipTs", 0)) > 15:
+            BOT["_volSkipTs"] = now
+            jlog("skip", symbol=sym, base=sym[: -len(QUOTE)],
+                 message=f"{sym} vol ${volume:,.0f} outside band [${_minv:,.0f} – {('$'+format(_maxv, ',.0f')) if _maxv else '∞'}] — no trade")
         return
 
     # STRADDLE MODE: a qualifying volume-spike alert arms a long/short breakout straddle
@@ -987,6 +998,42 @@ async def hyperliquid_account():
         }
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Hyperliquid info failed: {e}")
+
+
+@api_router.get("/hyperliquid/diagnose")
+async def hyperliquid_diagnose():
+    """Diagnose the 'User or API Wallet' error: derive the wallet from the secret, compare to
+    the configured main account, and report which address actually holds a funded HL account."""
+    import eth_account
+    key = os.environ.get("HYPERLIQUID_PRIVATE_KEY", "") or os.environ.get("HYPERLIQUID_SECRET_KEY", "")
+    main = os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "") or os.environ.get("HYPERLIQUID_MAIN_WALLET", "")
+    net = "testnet" if BOT["config"].get("hlTestnet") else "mainnet"
+    out = {"network": net, "mainWallet": main, "secretConfigured": bool(key)}
+    if not key:
+        return {**out, "error": "no secret configured"}
+    derived = eth_account.Account.from_key(key).address
+    out["apiWalletDerivedFromSecret"] = derived
+    out["mainEqualsApiWallet"] = derived.lower() == (main or "").lower()
+    try:
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+        base = constants.MAINNET_API_URL if net == "mainnet" else constants.TESTNET_API_URL
+        info = await asyncio.to_thread(Info, base, True)
+        for label, a in [("mainWallet", main), ("apiWallet", derived)]:
+            try:
+                st = await asyncio.to_thread(info.user_state, a)
+                out[f"{label}_accountValue"] = float(st.get("marginSummary", {}).get("accountValue", 0) or 0)
+            except Exception as e:  # noqa: BLE001
+                out[f"{label}_accountValue"] = f"error: {str(e)[:80]}"
+    except Exception as e:  # noqa: BLE001
+        out["infoError"] = str(e)[:120]
+    if out["mainEqualsApiWallet"]:
+        out["hint"] = ("account_address equals the wallet derived from your secret. If 0x8117… is an "
+                       "API/agent wallet, set HYPERLIQUID_ACCOUNT_ADDRESS to your MAIN funded wallet "
+                       "(the one that approved this agent). If 0x8117… IS your main wallet, just deposit USDC into it.")
+    else:
+        out["hint"] = "Main wallet differs from the API wallet (correct agent setup). Ensure the agent is approved and the main wallet is funded."
+    return out
 
 
 

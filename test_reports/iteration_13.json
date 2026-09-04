@@ -1,0 +1,31 @@
+{
+  "summary": "Backend-only testing of Hyperliquid diagnose endpoint + graceful LIVE error handling. All 6 pytest tests PASS: GET /api/hyperliquid/diagnose correctly returns mainnet, mainWallet==apiWalletDerivedFromSecret==0x8117...1856, mainEqualsApiWallet=true, mainWallet_accountValue=0.0, and a non-empty hint. GET /api/hyperliquid/account returns mainnet + 0.0 + keyConfigured=true. LIVE HL signal on BTCUSDT is handled gracefully: bot journal contains an 'error' entry with venue='hyperliquid' and message 'User or API Wallet 0x811702818aa45e40de2317b4e044e7e8cd911856 does not exist.' and the API remains responsive. Backend log line 'Hyperliquid init | net=mainnet | Main(account_address)=0x8117... | API wallet derived from secret=0x8117... | same=True' is present. Regression: /api/bot/status still exposes hlLeverage/hlCrossMargin; /api/tokens returns tokens list. SIM safe defaults restored at end.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/bot/signal", "issue": "Signals for symbols with quoteVol > cfg.maxVolumeUsd (default 1e8) are silently dropped in handle_signal — no journal entry. Caused the initial live-signal test on BTCUSDT (~$1.6B vol) to appear as a no-op. Consider logging a 'skip' journal entry when a signal is filtered by min/max volume, so operators can see why nothing happened."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_hl_diagnose.py",
+    "/app/test_reports/pytest/hl_diagnose.xml"
+  ],
+  "action_items": [
+    "(Optional) Add a journal 'skip' entry in handle_signal when a signal is dropped due to minVolumeUsd/maxVolumeUsd bounds — improves observability for live-order debugging.",
+    "(Main context) The HL account 0x811702818AA45e40dE2317b4E044E7E8cD911856 is empty ($0) and Hyperliquid returns 'User or API Wallet ... does not exist.' — this is the real root cause surfaced by the new diagnose endpoint. User must either fund this exact wallet on Hyperliquid or provide the correct MAIN wallet address (if the current secret is an API/agent key, HYPERLIQUID_ACCOUNT_ADDRESS should be set to the funded MAIN wallet, not the same address as the derived key)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is ~1174 lines — consider splitting into modules (bot, hyperliquid, binance, tokens) per the >700-line guideline.",
+    "handle_signal drops signals for volume-band mismatch without any observability (no jlog). This masked the live-order test until maxVolumeUsd was set to 0.",
+    "_get_hl_exchange caches the exchange keyed only by net; changes to HYPERLIQUID_PRIVATE_KEY / HYPERLIQUID_ACCOUNT_ADDRESS at runtime won't take effect until process restart. Fine for prod, but worth noting."
+  ],
+  "updated_files": ["/app/backend/tests/test_hl_diagnose.py"],
+  "success_rate": {"backend": "100%", "frontend": "N/A (skipped per request)"},
+  "test_credentials": "N/A (no auth)",
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "test_hl_diagnose.py covers diagnose + account + LIVE graceful failure + regression + SIM restore. Note: for live signal to reach _open_position, config must set maxVolumeUsd=0 (or > BTC's 24h quoteVol ~$1.6B), otherwise handle_signal drops it silently. HL init log lives in /var/log/supervisor/backend.err.log.",
+  "rca of the issue": "User's reported 'User or API Wallet 0x8117... does not exist' error is NOT caused by swapped keys. The private key in HYPERLIQUID_PRIVATE_KEY derives to exactly 0x811702818AA45e40dE2317b4E044E7E8cD911856, which equals HYPERLIQUID_ACCOUNT_ADDRESS (diagnose confirms mainEqualsApiWallet=true). Root cause: that address has no Hyperliquid account (accountValue=0.0, HL says 'does not exist'). Either the user's main wallet was never funded on Hyperliquid, or (more likely) the configured key is an API/agent wallet and the funded MAIN wallet address is different and missing from env. Mitigation implemented and verified: (1) /api/hyperliquid/diagnose endpoint returns actionable hint; (2) HL init debug log; (3) graceful error journal entry with venue='hyperliquid' so bot never crashes. User action required: either fund 0x8117... on Hyperliquid, or set HYPERLIQUID_ACCOUNT_ADDRESS/HYPERLIQUID_MAIN_WALLET to the correct funded MAIN wallet address."
+}
