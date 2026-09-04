@@ -265,13 +265,14 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     is_long = side == "long"
     qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
     order_id = None
+    # base coin, stripped of USDT/USDC (safe even if sym dropped out of the latest snapshot)
+    base = (STATE["latest"].get(sym) or {}).get("base") or hlconv.strip_quote(sym)
     if cfg["dryRun"]:
         fill = price
         executed = qty
     elif cfg.get("exchange") == "hyperliquid":
         try:
             await _ensure_hl_ready()
-            base = STATE["latest"][sym]["base"]
             conv = hlconv.get_rounded_size_and_price(base, qty, price)
             if conv is None:
                 # coin not listed on Hyperliquid perps, or size rounds to 0 -> skip + log once
@@ -287,7 +288,10 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
             fill = r["fillPrice"] or price
             executed = r["executedQty"] or rsize
         except Exception as e:  # noqa: BLE001
-            jlog("error", symbol=sym, action="LONG" if is_long else "SHORT", message=str(e)[:200], live=True, venue="hyperliquid")
+            # show the actual Hyperliquid coin sent (e.g. CRV), not the Binance pair (CRVUSDT)
+            hl_coin = locals().get("hl_coin") or hlconv.convert_binance_to_hyperliquid(base) or base
+            jlog("error", symbol=hl_coin, action="LONG" if is_long else "SHORT",
+                 message=f"HL sent coin '{hl_coin}': {str(e)[:180]}", live=True, venue="hyperliquid")
             return
     else:
         if not is_long:
@@ -311,7 +315,7 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
             tp_price = fill * (1 - cfg["tpPct"] / 100)
             sl_price = fill * (1 + cfg["slPct"] / 100)
     pos = {
-        "symbol": sym, "base": sym[: -len(QUOTE)], "side": side,
+        "symbol": sym, "base": base, "side": side,
         "entryPrice": fill, "qty": executed, "quoteSpent": fill * executed,
         "tpPrice": tp_price, "slPrice": sl_price,
         "openedTs": now, "orderId": order_id, "dryRun": cfg["dryRun"], "source": source,
@@ -998,6 +1002,17 @@ async def hyperliquid_account():
         }
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Hyperliquid info failed: {e}")
+
+
+@api_router.get("/hyperliquid/resolve")
+async def hyperliquid_resolve(symbols: str = Query("BTCUSDT,ETHUSDT,SOLUSDT")):
+    """Show exactly which Hyperliquid coin each Binance symbol maps to (base only, no USDT).
+    Returns None for coins not listed on Hyperliquid perps."""
+    await _ensure_hl_ready()
+    out = {}
+    for s in [x.strip() for x in symbols.split(",") if x.strip()]:
+        out[s] = hlconv.convert_binance_to_hyperliquid(s)
+    return {"coinsLoaded": len(hlconv.hl_coins()), "resolved": out}
 
 
 @api_router.get("/hyperliquid/diagnose")

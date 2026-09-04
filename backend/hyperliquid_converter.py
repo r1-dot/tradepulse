@@ -53,24 +53,43 @@ def hl_coins():
     return set(_META["universe"].keys())
 
 
-def convert_binance_to_hyperliquid(base):
+_QUOTES = ("USDT", "USDC", "BUSD", "FDUSD", "TUSD", "USD")
+
+
+def _strip_quote(sym):
+    """Strip a trailing Binance quote asset so BTCUSDT -> BTC, ETHUSDT -> ETH, etc."""
+    s = str(sym).upper()
+    for q in _QUOTES:
+        if s.endswith(q) and len(s) > len(q):
+            return s[: -len(q)]
+    return s
+
+
+def strip_quote(sym):
+    """Public alias for _strip_quote."""
+    return _strip_quote(sym)
+
+
+def convert_binance_to_hyperliquid(symbol):
     """
-    Map a Binance base asset (e.g. 'BTC', 'ARKM', '1000PEPE') to its Hyperliquid coin
-    name, or return None if the coin is not tradable on Hyperliquid perps.
+    Map a Binance symbol OR base ('BTCUSDT' or 'BTC') to its Hyperliquid perp coin name,
+    or None if the coin is not tradable on Hyperliquid perps. Hyperliquid only accepts the
+    base coin name (BTC, ETH, SOL) — never the BTCUSDT pair.
     """
-    if not base:
+    if not symbol:
         return None
-    b = str(base).upper()
     uni = _META["universe"]
     if not uni:
         return None
-    if b in uni:
+    b = str(symbol).upper()
+    if b in uni:                       # already a base coin ('BTC')
         return b
+    stripped = _strip_quote(b)         # 'BTCUSDT' -> 'BTC'
+    if stripped in uni:
+        return stripped
     # Binance "1000X" leverage tokens map to Hyperliquid "kX"
-    if b.startswith("1000") and ("K" + b[4:]) in uni:
-        return "K" + b[4:]
-    if b.startswith("K") and b in uni:
-        return b
+    if stripped.startswith("1000") and ("K" + stripped[4:]) in uni:
+        return "K" + stripped[4:]
     return None
 
 

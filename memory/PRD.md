@@ -62,6 +62,14 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - **Fixes** (verified iteration_13.json, backend 100%): (1) `/api/hyperliquid/diagnose` endpoint with actionable hint; (2) HL-init debug log (Main vs derived, net); (3) env fallbacks HYPERLIQUID_SECRET_KEY / HYPERLIQUID_MAIN_WALLET; (4) mainnet enforced; (5) graceful journal 'error' on live HL failure (bot never crashes); (6) throttled 'skip' journal log when a live signal is dropped by the volume band (observability).
 - **User action required**: fund 0x8117 on Hyperliquid, OR set HYPERLIQUID_ACCOUNT_ADDRESS to the correct funded MAIN wallet if 0x8117 is an agent key. Rotate the key (shared in chat).
 
+## Bug fix (2026-09) — Symbol format + KeyError crash
+- Report: bot appeared to send Binance pairs (CRVUSDT) to Hyperliquid. Reality: base was already extracted; the journal LABEL showed the pair, and the actual error was the unchanged unfunded-wallet error. Fixes (verified iteration_14.json, 100%):
+  - `hyperliquid_converter.convert_binance_to_hyperliquid` now strips trailing quote assets (USDT/USDC/BUSD/FDUSD/TUSD/USD) so a full pair maps to the base; added public `strip_quote`.
+  - New `GET /api/hyperliquid/resolve?symbols=` shows the exact HL coin per Binance symbol (BTCUSDT→BTC … 1000PEPEUSDT→KPEPE, unlisted→null).
+  - Fixed a real `KeyError('UNIUSDT')` crash: `_open_position` now derives base safely (`STATE.latest.get(sym).base or strip_quote(sym)`).
+  - Live HL error journal now shows the base coin ('CRV') + "HL sent coin 'CRV'" instead of the Binance pair.
+- Still blocked by the unfunded/incorrect wallet — real fills need the correct funded MAIN wallet.
+
 ## Known Gaps / Notes (Session 2)
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).

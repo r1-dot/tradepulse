@@ -1,0 +1,31 @@
+{
+  "summary": "Backend testing for Hyperliquid symbol-format fixes. All 6 tests PASSED. Verified: (1) /api/hyperliquid/resolve correctly strips USDT/quote suffix for all 12 example symbols (BTCUSDT->BTC, ETHUSDT->ETH, SOLUSDT->SOL, BNBUSDT->BNB, XRPUSDT->XRP, LINKUSDT->LINK, ARBUSDT->ARB, CRVUSDT->CRV, UNIUSDT->UNI, 1000PEPEUSDT->KPEPE) and returns null for coins not on HL (ARKMUSDT, ENSOUSDT); coinsLoaded > 150 (~233). (2) Bot loop remains alive & responsive for 20s+ with no new KeyError lines in backend.err.log (only steady httpx polling logs observed). (3) Live HL error journal for a routed CRVUSDT signal correctly uses the base coin: symbol='CRV' and message contains \"HL sent coin 'CRV'\" — proving the base (not the pair) is what's sent to Hyperliquid. (4) Regression: /api/hyperliquid/diagnose still returns mainnet + mainEqualsApiWallet=true, /api/bot/status returns full config, /api/tokens returns tokens. Bot config restored to sensible values (streak:2, minVolumeUsd:5000000, maxVolumeUsd:0, cooldownSec:30) after test as instructed.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_hl_symbol_fix.py",
+    "/app/test_reports/pytest/hl_symbol_fix.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now ~1194 lines — approaching the 700-line guideline threshold; consider splitting bot loop / HL trading / signal handling into modules for maintainability.",
+    "In _open_position exception handler (line ~292), `locals().get('hl_coin')` works but is fragile; setting hl_coin explicitly to None before the try block would be clearer.",
+    "handle_signal ignores request-supplied price/volume and re-reads from STATE['latest'] (line 453-454) — this is intentional but means the API contract for /api/bot/signal is misleading; consider documenting or renaming the fields."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_hl_symbol_fix.py (new test file)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "N/A (skipped per request)"},
+  "seed_data_creation": "None. Temporarily relaxed bot config to route a signal, then restored to sensible values (streak:2, minVolumeUsd:5000000, maxVolumeUsd:0, cooldownSec:30) with straddleEnabled preserved.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "test_hl_symbol_fix.py covers the resolve endpoint, KeyError regression, base-coin error logging, and diagnose/status/tokens regression. Bot is intentionally LIVE per user (enabled=true, dryRun=false, exchange=hyperliquid) with an unfunded $0 wallet — live orders will keep failing with the wallet error; that's expected. Journal entries use key `kind` (not `type`). /api/bot/signal expects {events:[{symbol,side,price,volume}]}, and handle_signal overwrites price/volume from STATE['latest']. Straddle is enabled by default so direct-entry tests must temporarily disable straddleEnabled to force _open_position.",
+  "rca of the issue": "Not applicable — fixes verified working."
+}
