@@ -122,6 +122,7 @@ BOT_DEFAULTS = {
     # --- HYPERLIQUID PERPS: leverage + margin mode (applied per coin before each order)
     "hlLeverage": 1,           # target leverage (clamped to each coin's max)
     "hlCrossMargin": True,     # True = cross margin, False = isolated
+    "hlNativeTpsl": True,      # place native TP/SL trigger orders on Hyperliquid at entry
 }
 
 STRADDLE_EXPIRY = 600.0  # seconds an un-filled straddle stays armed before auto-cancel
@@ -260,6 +261,51 @@ async def _hl_market_close(base_coin):
     return {"fillPrice": float(filled["avgPx"]) if filled else 0.0}
 
 
+async def _hl_place_tpsl(coin, is_long, sz, tp_px, sl_px):
+    """Place reduce-only TP + SL trigger orders on Hyperliquid so the EXCHANGE closes the
+    position when target/stop is hit (survives server downtime, executes instantly)."""
+    def _place():
+        ex = _get_hl_exchange()
+        close_is_buy = not is_long  # close a LONG -> sell; close a SHORT -> buy
+        out = []
+        for tag, trig in (("tp", tp_px), ("sl", sl_px)):
+            trig_r = hlconv.round_price(coin, trig) or trig
+            lim = trig_r * (1.08 if close_is_buy else 0.92)  # aggressive limit so market trigger fills
+            lim_r = hlconv.round_price(coin, lim) or trig_r
+            ot = {"trigger": {"triggerPx": trig_r, "isMarket": True, "tpsl": tag}}
+            try:
+                r = ex.order(coin, close_is_buy, sz, lim_r, ot, reduce_only=True)
+                out.append((tag, r.get("status") if isinstance(r, dict) else "ok"))
+            except Exception as e:  # noqa: BLE001
+                out.append((tag, f"err:{str(e)[:80]}"))
+        return out
+    return await asyncio.to_thread(_place)
+
+
+async def _hl_cancel_coin(coin):
+    """Cancel all resting orders for a coin (clears orphaned TP/SL triggers). Best-effort."""
+    def _cxl():
+        ex = _get_hl_exchange()
+        addr = os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "")
+        try:
+            oo = _HL["info"].open_orders(addr) or []
+        except Exception:  # noqa: BLE001
+            return 0
+        n = 0
+        for o in oo:
+            if o.get("coin") == coin:
+                try:
+                    ex.cancel(coin, o["oid"])
+                    n += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        return n
+    try:
+        return await asyncio.to_thread(_cxl)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_price=None, source="signal"):
     cfg = BOT["config"]
     is_long = side == "long"
@@ -322,6 +368,19 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     }
     BOT["positions"][sym] = pos
     BOT["lastTradeTs"][sym] = now
+    # LIVE Hyperliquid: register TP + SL as native reduce-only trigger orders on the exchange
+    # so the position is closed by Hyperliquid itself when target/stop is reached.
+    if not cfg["dryRun"] and cfg.get("exchange") == "hyperliquid" and cfg.get("hlNativeTpsl", True):
+        hl_coin = hlconv.convert_binance_to_hyperliquid(base)
+        if hl_coin:
+            try:
+                await _hl_cancel_coin(hl_coin)  # clear any stale triggers first
+                res = await _hl_place_tpsl(hl_coin, is_long, hlconv.round_size(hl_coin, executed) or executed, tp_price, sl_price)
+                jlog("tpsl", symbol=hl_coin, base=base, tp=tp_price, sl=sl_price,
+                     message=f"Native TP {tp_price:.6g} / SL {sl_price:.6g} placed on Hyperliquid: {res}", live=True)
+            except Exception as e:  # noqa: BLE001
+                jlog("warn", symbol=hl_coin, base=base, live=True,
+                     message=f"native TP/SL failed ({str(e)[:100]}) — software monitor will close on target/stop")
     jlog("entry", symbol=sym, base=pos["base"], side="buy" if is_long else "short", price=fill, qty=executed,
          spent=pos["quoteSpent"], tp=pos["tpPrice"], sl=pos["slPrice"], source=source,
          mode="SIM" if cfg["dryRun"] else "LIVE")
@@ -341,6 +400,7 @@ async def _close_position(http, sym, price, reason):
                 hl_coin = hlconv.convert_binance_to_hyperliquid(pos["base"]) or pos["base"]
                 r = await _hl_market_close(hl_coin)
                 fill = r["fillPrice"] or price
+                await _hl_cancel_coin(hl_coin)  # remove the sibling TP/SL trigger
             except Exception as e:  # noqa: BLE001
                 jlog("error", symbol=sym, action="CLOSE", message=str(e)[:200], live=True, venue="hyperliquid")
         else:
@@ -416,24 +476,27 @@ async def process_bot(http: httpx.AsyncClient, now: float):
                 await _open_position(http, sym, s["shortEntry"], now, side="short", tp_price=tp, sl_price=sl, source="straddle")
 
     # 1) manage TP/SL exits (only when autoExit enabled; otherwise exits happen
-    #    solely on a SELL signal via handle_signal)
-    if cfg.get("autoExit", True):
-        for sym in list(BOT["positions"].keys()):
-            v = latest.get(sym)
-            if not v:
-                continue
-            price = v["price"]
-            pos = BOT["positions"][sym]
-            if pos.get("side", "long") == "long":
-                if price >= pos["tpPrice"]:
-                    await _close_position(http, sym, price, "take-profit")
-                elif price <= pos["slPrice"]:
-                    await _close_position(http, sym, price, "stop-loss")
-            else:  # short
-                if price <= pos["tpPrice"]:
-                    await _close_position(http, sym, price, "take-profit")
-                elif price >= pos["slPrice"]:
-                    await _close_position(http, sym, price, "stop-loss")
+    #    solely on a SELL signal via handle_signal). STRADDLE positions ALWAYS get TP/SL
+    #    enforced regardless of the autoExit toggle (their target/stop is the whole point).
+    _auto = cfg.get("autoExit", True)
+    for sym in list(BOT["positions"].keys()):
+        pos = BOT["positions"][sym]
+        if not (_auto or pos.get("source") == "straddle"):
+            continue
+        v = latest.get(sym)
+        if not v:
+            continue
+        price = v["price"]
+        if pos.get("side", "long") == "long":
+            if price >= pos["tpPrice"]:
+                await _close_position(http, sym, price, "take-profit")
+            elif price <= pos["slPrice"]:
+                await _close_position(http, sym, price, "stop-loss")
+        else:  # short
+            if price <= pos["tpPrice"]:
+                await _close_position(http, sym, price, "take-profit")
+            elif price >= pos["slPrice"]:
+                await _close_position(http, sym, price, "stop-loss")
 
     # Entries are driven ONLY by alert-history events pushed from the dashboard
     # (see handle_signal + POST /api/bot/signal). If no alerts are enabled/feeding,
@@ -826,6 +889,7 @@ class BotConfigUpdate(BaseModel):
     straddleSlPct: Optional[float] = None
     hlLeverage: Optional[int] = None
     hlCrossMargin: Optional[bool] = None
+    hlNativeTpsl: Optional[bool] = None
 
 
 def _bot_status():

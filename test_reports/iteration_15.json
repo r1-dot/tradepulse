@@ -1,0 +1,23 @@
+{
+  "summary": "Backend testing of the Straddle TP/SL always-on fix. Verified: (1) PRIMARY — a straddle position closes via take-profit/stop-loss even with autoExit=false. Confirmed run: DOGEUSDT straddle armed -> straddle_fill(short) -> entry(source=straddle) -> exit(reason='take-profit', side='cover') while autoExit was false. (2) REGRESSION — a normal (non-straddle) position with autoExit=false did NOT auto-close via TP/SL for 18s, then after flipping autoExit=true it correctly closed via take-profit — proving the always-on TP/SL is scoped to source=='straddle' only. (3) /api/bot/status returns hlNativeTpsl (default true), hlLeverage, hlCrossMargin. (4) /api/tokens returns tokens; /api/hyperliquid/diagnose returns mainnet. (5) No new Traceback/KeyError/'bot error' lines appeared in backend.err.log; /api/bot/status stayed 200 throughout. Bot restored to safe SIM defaults at end (enabled:false, dryRun:true, straddleEnabled:false, straddleEntryPct:0.5, straddleTpPct:1.0, straddleSlPct:1.0, streak:2, minVolumeUsd:5000000, cooldownSec:30, maxOpenPositions:3, autoExit:true, maxLossPerTradeUsdt:0.0002). Note: on the re-run the two market-timing tests skipped because DOGEUSDT stayed flat within the 60s window — expected per problem statement; the passing evidence from the first full run stands.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_straddle_tpsl.py",
+    "/app/test_reports/pytest/straddle_tpsl.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py has grown to ~1200 lines — the bot loop, HL trading helpers, and signal/straddle handling should be split into separate modules for maintainability.",
+    "process_bot TP/SL loop uses `if not (_auto or pos.get('source')=='straddle'): continue` — clear and correct, but consider a per-position `force_tpsl` flag instead of hardcoding a source-string check so future entry sources (e.g. 'manual') can opt in without editing the condition.",
+    "_hl_place_tpsl failures are logged but non-fatal — good; ensure a journal entry is written on trigger placement failure so users know native TP/SL isn't armed when hlNativeTpsl=true (currently only exceptions are printed).",
+    "Native HL TP/SL trigger orders could not be exercised end-to-end here (account balance is $0 so live entry fails before triggers are placed) — only the SIM software-monitor path was validated as the problem statement acknowledges."
+  ],
+  "updated_files": ["/app/backend/tests/test_straddle_tpsl.py (new)"],
+  "success_rate": {"backend": "100% of testable cases", "frontend": "N/A (skipped per request)"},
+  "seed_data_creation": "None (config toggled during tests then restored to safe defaults).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "test_straddle_tpsl.py covers: hlNativeTpsl config presence, tokens+diagnose regression, primary straddle-closes-with-autoExit-off flow, non-straddle position obeys autoExit toggle (uses start_ts/flip_ts filtering to ignore stale journal entries), and a final cleanup test that restores safe SIM defaults. If a straddle/normal test skips due to market being flat, re-run — DOGEUSDT/XRPUSDT usually satisfies a 0.02% move within 60s. Journal entries use key 'kind'; /api/bot/signal expects {events:[{symbol,side,price,volume}]} but handle_signal re-reads price/volume from STATE['latest']. Native HL trigger orders on entry cannot be verified until the HL wallet is funded.",
+  "rca of the issue": "Not applicable — fix verified working. Original bug: process_bot's TP/SL loop was gated by `if not _auto: continue`, so when autoExit was off no exits were evaluated, and straddle positions (which have their own TP/SL) were never closed. Fix: condition changed to `if not (_auto or pos.get('source')=='straddle'): continue`, ensuring straddle positions always evaluate TP/SL regardless of the global autoExit toggle."
+}
