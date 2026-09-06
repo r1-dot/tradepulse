@@ -77,6 +77,9 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
   - LIVE entries now also place NATIVE reduce-only TP/SL **trigger orders** on Hyperliquid (`order(order_type={'trigger':{triggerPx,isMarket:True,tpsl}}, reduce_only=True)`) via `_hl_place_tpsl`, so the exchange itself closes at target/stop. `_hl_cancel_coin` clears orphaned triggers on close/before re-entry. New config `hlNativeTpsl` (default true).
   - Verified in SIM: DOGEUSDT straddle SHORT closed via `cover take-profit` with autoExit OFF. Native trigger orders can't be exercised until the HL wallet is funded ($0).
 
+## Feature (2026-09) — Configurable entry price buffer (slippage)
+- New `hlSlippagePct` config (percent, default 0.0001, clamped 0–5%) passed as `slippage` to Hyperliquid `market_open`, so the market order is priced aggressively enough to fill within milliseconds. Adjustable box in BotPanel → Hyperliquid ("Entry buffer %", data-testid `bot-hl-slippage`). Verified: config round-trips + clamps (99→5.0); UI box renders. Applies to LIVE entries (exits keep a safe default so they always fill).
+
 ## Known Gaps / Notes (Session 2)
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).

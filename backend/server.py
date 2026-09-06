@@ -123,6 +123,7 @@ BOT_DEFAULTS = {
     "hlLeverage": 1,           # target leverage (clamped to each coin's max)
     "hlCrossMargin": True,     # True = cross margin, False = isolated
     "hlNativeTpsl": True,      # place native TP/SL trigger orders on Hyperliquid at entry
+    "hlSlippagePct": 0.0001,   # extra % added to the signal price for instant marketable fill
 }
 
 STRADDLE_EXPIRY = 600.0  # seconds an un-filled straddle stays armed before auto-cancel
@@ -233,7 +234,7 @@ async def _ensure_hl_ready():
     await asyncio.to_thread(_build)
 
 
-async def _hl_market_open(coin, size, is_buy=True, leverage=None, is_cross=True):
+async def _hl_market_open(coin, size, is_buy=True, leverage=None, is_cross=True, slippage=0.01):
     ex = _get_hl_exchange()
     if leverage:
         # perps: set leverage + margin mode per coin (clamped to the coin's max)
@@ -242,7 +243,7 @@ async def _hl_market_open(coin, size, is_buy=True, leverage=None, is_cross=True)
             await asyncio.to_thread(ex.update_leverage, lev, coin, bool(is_cross))
         except Exception as e:  # noqa: BLE001
             jlog("warn", symbol=coin, message=f"update_leverage failed: {str(e)[:120]}", live=True)
-    res = await asyncio.to_thread(ex.market_open, coin, is_buy, size, None, 0.01)
+    res = await asyncio.to_thread(ex.market_open, coin, is_buy, size, None, slippage)
     if res.get("status") != "ok":
         raise RuntimeError(str(res)[:200])
     fills = res["response"]["data"]["statuses"]
@@ -330,7 +331,8 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
                 return
             hl_coin, rsize, _ = conv
             r = await _hl_market_open(hl_coin, rsize, is_buy=is_long,
-                                      leverage=cfg.get("hlLeverage", 1), is_cross=cfg.get("hlCrossMargin", True))
+                                      leverage=cfg.get("hlLeverage", 1), is_cross=cfg.get("hlCrossMargin", True),
+                                      slippage=max(0.0, cfg.get("hlSlippagePct", 0.0001)) / 100.0)
             fill = r["fillPrice"] or price
             executed = r["executedQty"] or rsize
         except Exception as e:  # noqa: BLE001
@@ -890,6 +892,7 @@ class BotConfigUpdate(BaseModel):
     hlLeverage: Optional[int] = None
     hlCrossMargin: Optional[bool] = None
     hlNativeTpsl: Optional[bool] = None
+    hlSlippagePct: Optional[float] = None
 
 
 def _bot_status():
@@ -976,6 +979,8 @@ async def bot_config(update: BotConfigUpdate):
         data["straddleSlPct"] = max(0.0001, min(5.0, float(data["straddleSlPct"])))
     if "hlLeverage" in data:
         data["hlLeverage"] = max(1, min(50, int(data["hlLeverage"])))
+    if "hlSlippagePct" in data:
+        data["hlSlippagePct"] = max(0.0, min(5.0, float(data["hlSlippagePct"])))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)

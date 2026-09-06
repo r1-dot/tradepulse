@@ -205,6 +205,23 @@ export default function BotPanel({ open, onClose }) {
                     <span className="mono text-[9px] leading-tight text-zinc-400">clamped to each coin's max (BTC 40x, ETH 25x…)</span>
                   </div>
                 )}
+                {st.config.exchange === "hyperliquid" && (
+                  <div className="flex items-center gap-2" data-testid="bot-hl-slippage-row">
+                    <div className="flex items-center gap-1 border border-zinc-200 px-2 py-1">
+                      <span className="mono text-[10px] text-zinc-500">Entry buffer</span>
+                      <input
+                        data-testid="bot-hl-slippage"
+                        type="number" min="0" max="5" step="0.0001"
+                        value={form.hlSlippagePct}
+                        onChange={(e) => setForm({ ...form, hlSlippagePct: e.target.value })}
+                        onBlur={() => patch({ hlSlippagePct: parseFloat(form.hlSlippagePct) || 0 })}
+                        className="mono w-16 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
+                      />
+                      <span className="mono text-[11px] font-bold text-[#7C3AED]">%</span>
+                    </div>
+                    <span className="mono text-[9px] leading-tight text-zinc-400">extra % on the signal price for instant marketable fill (0 = at mark)</span>
+                  </div>
+                )}
               </div>
 
               {/* status grid */}
