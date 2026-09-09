@@ -80,6 +80,14 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 ## Feature (2026-09) — Configurable entry price buffer (slippage)
 - New `hlSlippagePct` config (percent, default 0.0001, clamped 0–5%) passed as `slippage` to Hyperliquid `market_open`, so the market order is priced aggressively enough to fill within milliseconds. Adjustable box in BotPanel → Hyperliquid ("Entry buffer %", data-testid `bot-hl-slippage`). Verified: config round-trips + clamps (99→5.0); UI box renders. Applies to LIVE entries (exits keep a safe default so they always fill).
 
+## Feature (2026-09) — HYBRID POWER SYSTEM
+- New module `backend/hybrid_power.py`: 300s per-coin trade buffer, `NORMAL_AVG={BTC:800,ETH:600,HYPE:200,PURR:80,JEFF:60}`, `update(coin,amount_usd,side,ts,count)`, `get_signal(coin,vol_24h,params)` → power_1m/power_1s/power_5s/avg_1m/buy_1m/buy_1s + LONG/SHORT/None per spec thresholds.
+- Fed each second in `_process_hybrid` from scanner deltas (estimated per-second USD, dominant side, count) for a top-40-by-vol + NORMAL_AVG watchlist.
+- Config (clamped): `hybrid_toggle` (default ON), `sl_percent` 0.3–1.5/0.8, `tp_percent` 0.8–4.0/2.0, `min_power_1m` 0.4–1.0/0.6, `max_power_1m` 1.2–2.5/1.8, `burst_power` 0.03–0.15/0.06. `GET /api/hybrid` returns config+rows+normalAvg.
+- Execution (only when toggle ON + bot enabled): opens **Isolated 3x** via `_open_position(source='hybrid', leverage=3, is_cross=False)` with slider SL/TP; hybrid positions get always-on TP/SL enforcement.
+- Dashboard: `HybridPanel.jsx` (via "Hybrid Power" header button) — header, toggle, 5 live sliders, table Coin|pwr1m|pwr1s|pwr5s|avg|buy%|SIGNAL (top 40, 1s refresh).
+- Verified: iteration_16.json 13/13 backend + UI screenshot. Organic signals need a real volume burst (rare); live execution also pending HL wallet funding.
+
 ## Known Gaps / Notes (Session 2)
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).

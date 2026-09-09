@@ -28,6 +28,7 @@ from pathlib import Path
 from collections import deque
 from typing import Optional
 import hyperliquid_converter as hlconv
+import hybrid_power as hybrid
 import httpx
 
 ROOT_DIR = Path(__file__).parent
@@ -124,6 +125,13 @@ BOT_DEFAULTS = {
     "hlCrossMargin": True,     # True = cross margin, False = isolated
     "hlNativeTpsl": True,      # place native TP/SL trigger orders on Hyperliquid at entry
     "hlSlippagePct": 0.0001,   # extra % added to the signal price for instant marketable fill
+    # --- HYBRID POWER SYSTEM (short-window power/flow signal engine, Isolated 3x)
+    "hybrid_toggle": True,
+    "sl_percent": 0.8,
+    "tp_percent": 2.0,
+    "min_power_1m": 0.6,
+    "max_power_1m": 1.8,
+    "burst_power": 0.06,
 }
 
 STRADDLE_EXPIRY = 600.0  # seconds an un-filled straddle stays armed before auto-cancel
@@ -307,11 +315,13 @@ async def _hl_cancel_coin(coin):
         return 0
 
 
-async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_price=None, source="signal"):
+async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_price=None, source="signal", leverage=None, is_cross=None):
     cfg = BOT["config"]
     is_long = side == "long"
     qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
     order_id = None
+    lev = leverage if leverage is not None else cfg.get("hlLeverage", 1)
+    cross = is_cross if is_cross is not None else cfg.get("hlCrossMargin", True)
     # base coin, stripped of USDT/USDC (safe even if sym dropped out of the latest snapshot)
     base = (STATE["latest"].get(sym) or {}).get("base") or hlconv.strip_quote(sym)
     if cfg["dryRun"]:
@@ -331,7 +341,7 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
                 return
             hl_coin, rsize, _ = conv
             r = await _hl_market_open(hl_coin, rsize, is_buy=is_long,
-                                      leverage=cfg.get("hlLeverage", 1), is_cross=cfg.get("hlCrossMargin", True),
+                                      leverage=lev, is_cross=cross,
                                       slippage=max(0.0, cfg.get("hlSlippagePct", 0.0001)) / 100.0)
             fill = r["fillPrice"] or price
             executed = r["executedQty"] or rsize
@@ -425,6 +435,63 @@ async def _close_position(http, sym, price, reason):
         await save_bot_config()
 
 
+HYBRID_STATE = {"watch": [], "watch_ts": 0.0, "rows": []}
+
+
+def _hybrid_watchlist(latest, now):
+    """Refresh (~every 30s) the coin set fed into the hybrid engine: top-40 by 24h volume
+    plus the NORMAL_AVG coins, as (base, symbol) pairs (USDT quote only)."""
+    if now - HYBRID_STATE["watch_ts"] < 30 and HYBRID_STATE["watch"]:
+        return HYBRID_STATE["watch"]
+    usdt = [(v["base"], sym, v.get("quoteVol", 0)) for sym, v in latest.items() if v.get("quote") == "USDT"]
+    usdt.sort(key=lambda x: x[2], reverse=True)
+    watch = {b: (b, s) for b, s, _ in usdt[:40]}
+    for b, s, _ in usdt:
+        if b in hybrid.NORMAL_AVG:
+            watch[b] = (b, s)
+    HYBRID_STATE["watch"] = list(watch.values())
+    HYBRID_STATE["watch_ts"] = now
+    return HYBRID_STATE["watch"]
+
+
+async def _process_hybrid(http, now):
+    cfg = BOT["config"]
+    latest = STATE["latest"]
+    watch = _hybrid_watchlist(latest, now)
+    trades_1s, _ = compute_trades(1)
+    params = {k: cfg.get(k) for k in ("min_power_1m", "max_power_1m", "burst_power")}
+    rows = []
+    for base, sym in watch:
+        v = latest.get(sym)
+        if not v:
+            continue
+        cell = trades_1s.get(sym)
+        tc = cell["trades"] if cell else 0
+        if tc > 0 and v.get("count24h"):
+            tick_usd = tc * (v["quoteVol"] / v["count24h"])
+            hybrid.update(base, tick_usd, cell["side"], now, count=tc)
+        sig = hybrid.get_signal(base, v["quoteVol"], params, now)
+        sig["symbol"] = sym
+        sig["price"] = v["price"]
+        rows.append(sig)
+        # execution: hybrid signals -> Isolated 3x with slider SL/TP (only when toggle ON)
+        if cfg.get("hybrid_toggle") and cfg.get("enabled") and not BOT["stopped"] and sig["signal"]:
+            if sym in BOT["positions"] or (now - BOT["lastTradeTs"].get(sym, 0)) < cfg["cooldownSec"]:
+                continue
+            if len(BOT["positions"]) >= cfg["maxOpenPositions"]:
+                continue
+            long = sig["signal"] == "LONG"
+            px = v["price"]
+            tp = px * (1 + cfg["tp_percent"] / 100) if long else px * (1 - cfg["tp_percent"] / 100)
+            sl = px * (1 - cfg["sl_percent"] / 100) if long else px * (1 + cfg["sl_percent"] / 100)
+            jlog("hybrid", symbol=sym, base=base, side=sig["signal"], power=sig["power_1m"], buy=sig["buy"],
+                 message=f"HYBRID {sig['signal']} {base} · pwr1m {sig['power_1m']} buy {sig['buy']}%")
+            await _open_position(http, sym, px, now, side="long" if long else "short",
+                                 tp_price=tp, sl_price=sl, source="hybrid", leverage=3, is_cross=False)
+    rows.sort(key=lambda r: (r["signal"] is None, -r["power_1m"]))
+    HYBRID_STATE["rows"] = rows[:40]
+
+
 async def process_bot(http: httpx.AsyncClient, now: float):
     cfg = BOT["config"]
     latest = STATE["latest"]
@@ -483,7 +550,7 @@ async def process_bot(http: httpx.AsyncClient, now: float):
     _auto = cfg.get("autoExit", True)
     for sym in list(BOT["positions"].keys()):
         pos = BOT["positions"][sym]
-        if not (_auto or pos.get("source") == "straddle"):
+        if not (_auto or pos.get("source") in ("straddle", "hybrid")):
             continue
         v = latest.get(sym)
         if not v:
@@ -503,6 +570,12 @@ async def process_bot(http: httpx.AsyncClient, now: float):
     # Entries are driven ONLY by alert-history events pushed from the dashboard
     # (see handle_signal + POST /api/bot/signal). If no alerts are enabled/feeding,
     # the bot stays inactive. process_bot only handles daily reset + protective exits.
+
+    # HYBRID POWER SYSTEM: feed per-second power metrics + fire its own LONG/SHORT entries.
+    try:
+        await _process_hybrid(http, now)
+    except Exception as he:  # noqa: BLE001
+        logger.error("hybrid error: %s", he)
 
 
 async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: float, now: float, volume: float = 0.0):
@@ -893,6 +966,12 @@ class BotConfigUpdate(BaseModel):
     hlCrossMargin: Optional[bool] = None
     hlNativeTpsl: Optional[bool] = None
     hlSlippagePct: Optional[float] = None
+    hybrid_toggle: Optional[bool] = None
+    sl_percent: Optional[float] = None
+    tp_percent: Optional[float] = None
+    min_power_1m: Optional[float] = None
+    max_power_1m: Optional[float] = None
+    burst_power: Optional[float] = None
 
 
 def _bot_status():
@@ -981,6 +1060,11 @@ async def bot_config(update: BotConfigUpdate):
         data["hlLeverage"] = max(1, min(50, int(data["hlLeverage"])))
     if "hlSlippagePct" in data:
         data["hlSlippagePct"] = max(0.0, min(5.0, float(data["hlSlippagePct"])))
+    for k, lo, hi in (("sl_percent", 0.3, 1.5), ("tp_percent", 0.8, 4.0),
+                      ("min_power_1m", 0.4, 1.0), ("max_power_1m", 1.2, 2.5),
+                      ("burst_power", 0.03, 0.15)):
+        if k in data:
+            data[k] = max(lo, min(hi, float(data[k])))
     if data.get("enabled"):
         BOT["stopped"] = False  # re-enabling clears the halt
     cfg.update(data)
@@ -1071,6 +1155,17 @@ async def hyperliquid_account():
         }
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"Hyperliquid info failed: {e}")
+
+
+@api_router.get("/hybrid")
+async def hybrid_status():
+    cfg = BOT["config"]
+    return {
+        "config": {k: cfg.get(k) for k in ("hybrid_toggle", "sl_percent", "tp_percent",
+                                           "min_power_1m", "max_power_1m", "burst_power")},
+        "rows": HYBRID_STATE["rows"],
+        "normalAvg": hybrid.NORMAL_AVG,
+    }
 
 
 @api_router.get("/hyperliquid/resolve")

@@ -1,0 +1,24 @@
+{
+  "summary": "Hybrid Power System backend tested end-to-end: 13/13 pytest passed. Unit tests confirm LONG/SHORT signal derivation, no-signal on low power, 300s buffer prune, and NORMAL_AVG lookup. API tests confirm GET /api/hybrid shape (config + rows[<=40] + normalAvg), config clamps via POST /api/bot/config (sl->1.5, tp->4.0, min_power_1m->1.0, max_power_1m->2.5, burst->0.15), toggle persistence, no new 'hybrid' journal entries while hybrid_toggle=false, backend log clean of hybrid errors, and safe defaults restored at teardown. Execution wiring exercised in dryRun for ~30s — organic bursts did not trigger a LONG/SHORT during the window (expected; noted per spec), but /api/bot/status and /api/tokens stayed 200 throughout so the loop is healthy.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_hybrid_power.py",
+    "/app/test_reports/pytest/hybrid_power.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "hybrid_power.get_signal: buy_1s is computed as bc1/tc1*100, and when tc1==0 buy_1s stays 0.0. That means the SHORT branch (buy_1s<25) can technically pass with an empty last-1s window — but that is prevented by the power_1s>burst gate (which requires actual volume in the last 1s), so it is safe. Consider documenting this coupling.",
+    "server.py _process_hybrid feeds hybrid.update once per second using estimated per-second USD (avgTradeSize*trades). The 'side' comes from compute_trades(1) dominant aggressor. Works, but a single-side estimate for the whole second may bias buy%/sell% metrics under mixed flow. Not a bug; note for future refinement.",
+    "server.py:1063-1065 clamps are one-sided as configured (min/max_power_1m ranges 0.4-1.0 / 1.2-2.5 respectively); ensure UI slider ranges match the clamp ranges exactly — spec says min_power_1m 0.4-1.0 and max_power_1m 1.2-2.5, which the backend enforces. OK.",
+    "Hybrid TP/SL enforcement now covered in the always-on watcher via source in ('straddle','hybrid') at server.py:553 — good; means autoExit=false still safely closes hybrid positions on TP/SL."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "not tested (backend-only)"},
+  "test_credentials": "none required",
+  "seed_data_creation": "In-memory hybrid buffers only, keyed on TESTLONG/TESTSHORT/TESTNONE/TESTPRUNE coin names. No DB writes.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Reuse /app/backend/tests/test_hybrid_power.py. It handles env-var lookup by reading /app/frontend/.env when REACT_APP_BACKEND_URL is not exported. Execution firing is not asserted (organic bursts are rare); only wiring health is verified.",
+  "rca of the issue": "N/A — no defects found."
+}
