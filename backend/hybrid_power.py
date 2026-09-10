@@ -52,6 +52,15 @@ def normal_avg(coin):
     return NORMAL_AVG.get(coin, DEFAULT_AVG)
 
 
+def trail_stop_offset(peak_pct, secure, be, step):
+    """Locked SL offset (% from entry) for a trailing stop given the peak profit %.
+    None until peak reaches `secure`. Matches: +0.40->BE+ (be), +0.90->+0.45, +1.40->+0.95
+    with secure=0.40, be=0.05, step=0.5."""
+    if peak_pct < secure:
+        return None
+    return max(be, peak_pct - step + be)
+
+
 def get_signal(coin, vol_24h, params, now=None):
     """Compute power metrics + LONG/SHORT/None for a coin."""
     now = now or time.time()

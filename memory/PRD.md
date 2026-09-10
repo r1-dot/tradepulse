@@ -89,6 +89,14 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Verified: iteration_16.json 13/13 backend + UI screenshot. Organic signals need a real volume burst (rare); live execution also pending HL wallet funding.
 
 ## Known Gaps / Notes (Session 2)
+
+## Feature/Fix (2026-09) — Whale Orderbook-Delta Filter + Smart Trailing TP
+- Fixed fake-trade losses on hybrid signals by adding a real orderbook confirmation + trailing exits.
+- **Orderbook Delta filter** (`_orderbook_delta` via data-api.binance.vision /api/v3/depth top-10): buy_wall=Σbid$, sell_wall=Σask$; LONG needs delta_long=buy/sell ≥ `minDeltaLong`(1.5), SHORT needs delta_short=sell/buy ≥ `minDeltaShort`(1.5). Hybrid entry gated by `minPwr1m`(0.65) + buy/sell%≥75 + delta. Config `obDeltaFilter`(ON). Journal: `HYBRID LONG TRX pwr1m .. buy ..% delta 2.1 -> TRADE|SKIP`; SKIP also logs `SKIP <coin> .. - WEAK WALL` and does NOT enter. Debug: `GET /api/hybrid/orderbook?symbol=`.
+- **Smart Trailing TP** (replaces fixed TP; `_update_trailing` + `hybrid_power.trail_stop_offset`): initial SL −`trailInitialSlPct`(0.30%); at peak≥`trailSecure`(0.40%) → SL=entry+`trailBE`(0.05%) ("SECURED BE+"); then trail up in `trailStep`(0.5%) increments (offset=max(be, peak−step+be)) → +0.90%→+0.45%, +1.40%→+0.95%; exit on `trailCallback`(0.30%) drop from peak → reason `trail-exit +X%`. Config `trailEnabled`(ON), `trailLock`(50, informational). Applies to all bot positions where tpPrice is None.
+- UI: HybridPanel gains "Enable Orderbook Delta Filter" checkbox + Min Delta LONG/SHORT + Min PWR1m, and a Smart Trailing TP section (Initial SL/Secure/BE/Step/Lock/Callback); fixed TP slider removed.
+- Verified: iteration_17.json 15/15 backend (orderbook endpoint, trailing math, config+clamps, no-crash) + UI screenshot. Organic hybrid signals are burst-dependent; live fills still pending HL wallet funding.
+
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).
 

@@ -1,0 +1,21 @@
+{
+  "summary": "Iteration 17 — hybrid orderbook delta filter + smart trailing TP. Backend-only pytest suite (15 tests) all PASSED. Verified: /api/hybrid/orderbook returns numeric buyWall/sellWall/deltaLong/deltaShort for BTC/ETH/SOL with deltaLong≈1/deltaShort; hybrid_power.trail_stop_offset math matches spec (0.30->None, 0.40->0.05, 0.90->0.45, 1.40->0.95); /api/hybrid config exposes all 11 new keys; obDeltaFilter toggles+persists; server-side clamps apply (999->100 for deltas, 9->5 for pwr/trail pct, 999->100 for trailLock); defaults restore cleanly; /api/bot/status and /api/tokens remain 200 during a 30s SIM run; no Traceback/hybrid error in backend.err.log. Organic hybrid signal did not fire during 30s window (burst-dependent, expected/acceptable per request).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_hybrid_trailing.py",
+    "/app/test_reports/pytest/iteration_17.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is >1200 lines — consider splitting hybrid processing, trailing, and config clamp logic into modules for maintainability.",
+    "trail_stop_offset uses max(be, peak-step+be); note this means SL only advances in step increments (e.g. peak 0.85 still yields 0.40; peak 0.90 -> 0.45). That matches spec but user should be aware SL is discrete, not continuous."
+  ],
+  "updated_files": ["/app/backend/tests/test_hybrid_trailing.py"],
+  "success_rate": {"backend": "100%", "frontend": "n/a"},
+  "test_credentials": "none (no auth)",
+  "seed_data_creation": "none",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Full regression suite at /app/backend/tests/test_hybrid_trailing.py covers orderbook endpoint, trail_stop_offset math, config keys, clamps, defaults, and short SIM run. Run with: python -m pytest backend/tests/test_hybrid_trailing.py -v -o addopts=''. Organic hybrid TRADE/SKIP journal firing was NOT observed in a 30s window — this is burst-dependent and not a defect."
+}

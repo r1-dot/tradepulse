@@ -132,6 +132,19 @@ BOT_DEFAULTS = {
     "min_power_1m": 0.6,
     "max_power_1m": 1.8,
     "burst_power": 0.06,
+    # --- Orderbook Delta (whale wall) filter for hybrid entries
+    "obDeltaFilter": True,
+    "minDeltaLong": 1.5,
+    "minDeltaShort": 1.5,
+    "minPwr1m": 0.65,
+    # --- Smart Trailing TP/SL (replaces fixed TP)
+    "trailEnabled": True,
+    "trailInitialSlPct": 0.30,
+    "trailSecure": 0.40,
+    "trailBE": 0.05,
+    "trailStep": 0.5,
+    "trailLock": 50,
+    "trailCallback": 0.30,
 }
 
 STRADDLE_EXPIRY = 600.0  # seconds an un-filled straddle stays armed before auto-cancel
@@ -454,6 +467,26 @@ def _hybrid_watchlist(latest, now):
     return HYBRID_STATE["watch"]
 
 
+_OB_CACHE = {}
+
+
+async def _orderbook_delta(http, sym):
+    """Fetch top-10 bids/asks; return (buy_wall_usd, sell_wall_usd). Cached ~2s per symbol."""
+    now = time.time()
+    c = _OB_CACHE.get(sym)
+    if c and now - c[0] < 2:
+        return c[1], c[2]
+    try:
+        r = await http.get(f"{BINANCE_BASE}/api/v3/depth", params={"symbol": sym, "limit": 10}, timeout=5)
+        d = r.json()
+        bw = sum(float(p) * float(q) for p, q in d.get("bids", [])[:10])
+        sw = sum(float(p) * float(q) for p, q in d.get("asks", [])[:10])
+    except Exception:  # noqa: BLE001
+        return 0.0, 0.0
+    _OB_CACHE[sym] = (now, bw, sw)
+    return bw, sw
+
+
 async def _process_hybrid(http, now):
     cfg = BOT["config"]
     latest = STATE["latest"]
@@ -474,7 +507,7 @@ async def _process_hybrid(http, now):
         sig["symbol"] = sym
         sig["price"] = v["price"]
         rows.append(sig)
-        # execution: hybrid signals -> Isolated 3x with slider SL/TP (only when toggle ON)
+        # execution: hybrid signals -> Isolated 3x, gated by PWR + flow + real orderbook wall
         if cfg.get("hybrid_toggle") and cfg.get("enabled") and not BOT["stopped"] and sig["signal"]:
             if sym in BOT["positions"] or (now - BOT["lastTradeTs"].get(sym, 0)) < cfg["cooldownSec"]:
                 continue
@@ -482,14 +515,81 @@ async def _process_hybrid(http, now):
                 continue
             long = sig["signal"] == "LONG"
             px = v["price"]
-            tp = px * (1 + cfg["tp_percent"] / 100) if long else px * (1 - cfg["tp_percent"] / 100)
-            sl = px * (1 - cfg["sl_percent"] / 100) if long else px * (1 + cfg["sl_percent"] / 100)
-            jlog("hybrid", symbol=sym, base=base, side=sig["signal"], power=sig["power_1m"], buy=sig["buy"],
-                 message=f"HYBRID {sig['signal']} {base} · pwr1m {sig['power_1m']} buy {sig['buy']}%")
+            pwr = sig["power_1m"]
+            flow = sig["buy"] if long else (100 - sig["buy"])
+            # orderbook delta = wall in our direction / opposite wall
+            bw, sw = await _orderbook_delta(http, sym)
+            delta = (bw / sw if sw else 0.0) if long else (sw / bw if bw else 0.0)
+            min_delta = cfg.get("minDeltaLong", 1.5) if long else cfg.get("minDeltaShort", 1.5)
+            ok_pwr = pwr >= cfg.get("minPwr1m", 0.65)
+            ok_flow = flow >= 75
+            ok_delta = (not cfg.get("obDeltaFilter", True)) or (delta >= min_delta)
+            trade = ok_pwr and ok_flow and ok_delta
+            jlog("hybrid", symbol=sym, base=base, side=sig["signal"], power=pwr, buy=sig["buy"], delta=round(delta, 2),
+                 decision="TRADE" if trade else "SKIP",
+                 message=f"HYBRID {sig['signal']} {base} pwr1m {pwr} buy {sig['buy']}% delta {delta:.2f} -> {'TRADE' if trade else 'SKIP'}")
+            if not trade:
+                jlog("skip", symbol=sym, base=base,
+                     message=f"SKIP {base} pwr1m {pwr} buy {sig['buy']}% delta {delta:.2f} - WEAK WALL")
+                continue
+            # trailing entry: tight initial SL (-trailInitialSlPct), no fixed TP (trailing manages upside)
+            isl = cfg.get("trailInitialSlPct", 0.30)
+            sl = px * (1 - isl / 100) if long else px * (1 + isl / 100)
             await _open_position(http, sym, px, now, side="long" if long else "short",
-                                 tp_price=tp, sl_price=sl, source="hybrid", leverage=3, is_cross=False)
+                                 tp_price=None, sl_price=sl, source="hybrid", leverage=3, is_cross=False)
     rows.sort(key=lambda r: (r["signal"] is None, -r["power_1m"]))
     HYBRID_STATE["rows"] = rows[:40]
+
+
+async def _update_trailing(http, sym, pos, price):
+    """Smart trailing exit: tight initial stop, secure to BE+ at trailSecure, then trail the
+    SL up in trailStep increments (locking >= trailLock% of profit), and exit on a
+    trailCallback% drop from peak. Works for long & short."""
+    cfg = BOT["config"]
+    e = pos["entryPrice"]
+    if e <= 0:
+        return
+    long = pos.get("side", "long") == "long"
+    profit_pct = ((price - e) / e * 100.0) if long else ((e - price) / e * 100.0)
+    peak = pos.get("peakPct", 0.0)
+    if profit_pct > peak:
+        peak = profit_pct
+        pos["peakPct"] = peak
+    secure = cfg.get("trailSecure", 0.40)
+    be = cfg.get("trailBE", 0.05)
+    step = cfg.get("trailStep", 0.5)
+    cb = cfg.get("trailCallback", 0.30)
+    base_sl_off = pos.get("slOffPct")  # locked SL offset in % from entry (None until secured)
+
+    new_off = hybrid.trail_stop_offset(peak, secure, be, step)
+    if new_off is not None and (base_sl_off is None or new_off > base_sl_off + 1e-9):
+        first = base_sl_off is None
+        pos["slOffPct"] = new_off
+        base_sl_off = new_off
+        if first:
+            jlog("trail", symbol=sym, base=pos["base"],
+                 message=f"{pos['base']} +{peak:.2f}% -> SECURED BE+{be:.2f}%")
+        else:
+            jlog("trail", symbol=sym, base=pos["base"],
+                 message=f"{pos['base']} +{peak:.2f}% -> TRAIL SL to +{new_off:.2f}%")
+
+    # effective stop price
+    if base_sl_off is not None:
+        step_sl = e * (1 + base_sl_off / 100.0) if long else e * (1 - base_sl_off / 100.0)
+        peak_price = e * (1 + peak / 100.0) if long else e * (1 - peak / 100.0)
+        cb_sl = peak_price * (1 - cb / 100.0) if long else peak_price * (1 + cb / 100.0)
+        stop = max(step_sl, cb_sl) if long else min(step_sl, cb_sl)
+        pos["slPrice"] = stop
+        hit = price <= stop if long else price >= stop
+        if hit:
+            await _close_position(http, sym, price, f"trail-exit +{peak:.2f}%")
+            return
+    else:
+        # not yet secured -> initial tight stop
+        stop = pos["slPrice"]
+        hit = price <= stop if long else price >= stop
+        if hit:
+            await _close_position(http, sym, price, "stop-loss")
 
 
 async def process_bot(http: httpx.AsyncClient, now: float):
@@ -544,10 +644,10 @@ async def process_bot(http: httpx.AsyncClient, now: float):
                      message="SHORT leg filled — LONG leg cancelled")
                 await _open_position(http, sym, s["shortEntry"], now, side="short", tp_price=tp, sl_price=sl, source="straddle")
 
-    # 1) manage TP/SL exits (only when autoExit enabled; otherwise exits happen
-    #    solely on a SELL signal via handle_signal). STRADDLE positions ALWAYS get TP/SL
-    #    enforced regardless of the autoExit toggle (their target/stop is the whole point).
+    # 1) manage exits. If trailEnabled, use SMART TRAILING (dynamic SL that locks profit);
+    #    else fixed TP/SL. Straddle/hybrid always managed regardless of the autoExit toggle.
     _auto = cfg.get("autoExit", True)
+    _trail = cfg.get("trailEnabled", True)
     for sym in list(BOT["positions"].keys()):
         pos = BOT["positions"][sym]
         if not (_auto or pos.get("source") in ("straddle", "hybrid")):
@@ -556,13 +656,17 @@ async def process_bot(http: httpx.AsyncClient, now: float):
         if not v:
             continue
         price = v["price"]
+        if _trail and pos.get("tpPrice") is None:
+            await _update_trailing(http, sym, pos, price)
+            continue
+        # fixed TP/SL fallback (used when trailing off or a fixed TP was set, e.g. straddle)
         if pos.get("side", "long") == "long":
-            if price >= pos["tpPrice"]:
+            if pos.get("tpPrice") and price >= pos["tpPrice"]:
                 await _close_position(http, sym, price, "take-profit")
             elif price <= pos["slPrice"]:
                 await _close_position(http, sym, price, "stop-loss")
-        else:  # short
-            if price <= pos["tpPrice"]:
+        else:
+            if pos.get("tpPrice") and price <= pos["tpPrice"]:
                 await _close_position(http, sym, price, "take-profit")
             elif price >= pos["slPrice"]:
                 await _close_position(http, sym, price, "stop-loss")
@@ -972,6 +1076,17 @@ class BotConfigUpdate(BaseModel):
     min_power_1m: Optional[float] = None
     max_power_1m: Optional[float] = None
     burst_power: Optional[float] = None
+    obDeltaFilter: Optional[bool] = None
+    minDeltaLong: Optional[float] = None
+    minDeltaShort: Optional[float] = None
+    minPwr1m: Optional[float] = None
+    trailEnabled: Optional[bool] = None
+    trailInitialSlPct: Optional[float] = None
+    trailSecure: Optional[float] = None
+    trailBE: Optional[float] = None
+    trailStep: Optional[float] = None
+    trailLock: Optional[float] = None
+    trailCallback: Optional[float] = None
 
 
 def _bot_status():
@@ -1063,6 +1178,11 @@ async def bot_config(update: BotConfigUpdate):
     for k, lo, hi in (("sl_percent", 0.3, 1.5), ("tp_percent", 0.8, 4.0),
                       ("min_power_1m", 0.4, 1.0), ("max_power_1m", 1.2, 2.5),
                       ("burst_power", 0.03, 0.15)):
+        if k in data:
+            data[k] = max(lo, min(hi, float(data[k])))
+    for k, lo, hi in (("minDeltaLong", 0.1, 100.0), ("minDeltaShort", 0.1, 100.0), ("minPwr1m", 0.0, 5.0),
+                      ("trailInitialSlPct", 0.05, 5.0), ("trailSecure", 0.05, 5.0), ("trailBE", 0.0, 2.0),
+                      ("trailStep", 0.05, 5.0), ("trailLock", 0.0, 100.0), ("trailCallback", 0.05, 5.0)):
         if k in data:
             data[k] = max(lo, min(hi, float(data[k])))
     if data.get("enabled"):
@@ -1157,12 +1277,22 @@ async def hyperliquid_account():
         raise HTTPException(502, f"Hyperliquid info failed: {e}")
 
 
+@api_router.get("/hybrid/orderbook")
+async def hybrid_orderbook(symbol: str = Query("BTCUSDT")):
+    bw, sw = await _orderbook_delta(app.state.http, symbol)
+    return {"symbol": symbol, "buyWall": bw, "sellWall": sw,
+            "deltaLong": (bw / sw if sw else 0.0), "deltaShort": (sw / bw if bw else 0.0)}
+
+
 @api_router.get("/hybrid")
 async def hybrid_status():
     cfg = BOT["config"]
     return {
         "config": {k: cfg.get(k) for k in ("hybrid_toggle", "sl_percent", "tp_percent",
-                                           "min_power_1m", "max_power_1m", "burst_power")},
+                                           "min_power_1m", "max_power_1m", "burst_power",
+                                           "obDeltaFilter", "minDeltaLong", "minDeltaShort", "minPwr1m",
+                                           "trailEnabled", "trailInitialSlPct", "trailSecure", "trailBE",
+                                           "trailStep", "trailLock", "trailCallback")},
         "rows": HYBRID_STATE["rows"],
         "normalAvg": hybrid.NORMAL_AVG,
     }

@@ -5,11 +5,24 @@ import { X, Zap } from "lucide-react";
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
 const SLIDERS = [
-  { key: "sl_percent", label: "SL %", min: 0.3, max: 1.5, step: 0.1 },
-  { key: "tp_percent", label: "TP %", min: 0.8, max: 4.0, step: 0.1 },
   { key: "min_power_1m", label: "Min Power 1m", min: 0.4, max: 1.0, step: 0.05 },
   { key: "max_power_1m", label: "Max Power 1m", min: 1.2, max: 2.5, step: 0.1 },
   { key: "burst_power", label: "Burst 1s", min: 0.03, max: 0.15, step: 0.01 },
+];
+
+const NUMFIELDS_FILTER = [
+  { key: "minDeltaLong", label: "Min Delta LONG", step: 0.1 },
+  { key: "minDeltaShort", label: "Min Delta SHORT", step: 0.1 },
+  { key: "minPwr1m", label: "Min PWR1m", step: 0.05 },
+];
+
+const NUMFIELDS_TRAIL = [
+  { key: "trailInitialSlPct", label: "Initial SL %", step: 0.05 },
+  { key: "trailSecure", label: "Secure at %", step: 0.05 },
+  { key: "trailBE", label: "BE Buffer %", step: 0.01 },
+  { key: "trailStep", label: "Trail Step %", step: 0.05 },
+  { key: "trailLock", label: "Lock %", step: 5 },
+  { key: "trailCallback", label: "Callback %", step: 0.05 },
 ];
 
 export const HybridPanel = ({ open, onClose }) => {
@@ -84,6 +97,62 @@ export const HybridPanel = ({ open, onClose }) => {
             </span>
           </div>
         ))}
+      </div>
+
+      {/* Whale filter: orderbook delta + PWR */}
+      <div className="border-b border-zinc-200 px-4 py-3">
+        <label className="mb-2 flex cursor-pointer items-center gap-2" data-testid="hybrid-ob-filter-row">
+          <input
+            type="checkbox"
+            data-testid="hybrid-obDeltaFilter"
+            checked={!!c.obDeltaFilter}
+            onChange={(e) => patch({ obDeltaFilter: e.target.checked })}
+            className="h-3.5 w-3.5 accent-[#7C3AED]"
+          />
+          <span className="mono text-[11px] font-semibold text-zinc-800">Enable Orderbook Delta Filter (real whale wall)</span>
+        </label>
+        <div className="grid grid-cols-3 gap-2">
+          {NUMFIELDS_FILTER.map((f) => (
+            <div key={f.key} className="flex flex-col gap-0.5">
+              <span className="mono text-[9px] text-zinc-500">{f.label}</span>
+              <input
+                type="number" step={f.step}
+                data-testid={`hybrid-${f.key}`}
+                value={c[f.key] ?? ""}
+                onChange={(e) => patch({ [f.key]: parseFloat(e.target.value) })}
+                className="mono w-full border border-zinc-200 px-1.5 py-1 text-[12px] font-bold text-zinc-900 outline-none focus:border-[#7C3AED]"
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Smart Trailing TP (replaces fixed TP) */}
+      <div className="border-b border-zinc-200 px-4 py-3">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="mono text-[11px] font-semibold text-zinc-800">Smart Trailing TP</span>
+          <button
+            data-testid="hybrid-trailEnabled"
+            onClick={() => patch({ trailEnabled: !c.trailEnabled })}
+            className={`mono border px-2 py-0.5 text-[10px] font-semibold ${c.trailEnabled ? "border-[#00A004] text-[#00A004]" : "border-zinc-300 text-zinc-500"}`}
+          >
+            {c.trailEnabled ? "ON" : "OFF"}
+          </button>
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          {NUMFIELDS_TRAIL.map((f) => (
+            <div key={f.key} className="flex flex-col gap-0.5">
+              <span className="mono text-[9px] text-zinc-500">{f.label}</span>
+              <input
+                type="number" step={f.step}
+                data-testid={`hybrid-${f.key}`}
+                value={c[f.key] ?? ""}
+                onChange={(e) => patch({ [f.key]: parseFloat(e.target.value) })}
+                className="mono w-full border border-zinc-200 px-1.5 py-1 text-[12px] font-bold text-zinc-900 outline-none focus:border-[#7C3AED]"
+              />
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* table */}
