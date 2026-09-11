@@ -269,8 +269,16 @@ async def _hl_market_open(coin, size, is_buy=True, leverage=None, is_cross=True,
         raise RuntimeError(str(res)[:200])
     fills = res["response"]["data"]["statuses"]
     filled = next((s["filled"] for s in fills if "filled" in s), None)
-    return {"fillPrice": float(filled["avgPx"]) if filled else 0.0,
-            "executedQty": float(filled["totalSz"]) if filled else size}
+    fill_px = float(filled["avgPx"]) if (filled and filled.get("avgPx")) else 0.0
+    if not fill_px:
+        # fallback: read the current mid price from Hyperliquid so we never store a 0/None fill
+        try:
+            mids = _HL["info"].all_mids()
+            fill_px = float(mids.get(coin) or 0.0)
+        except Exception:  # noqa: BLE001
+            fill_px = 0.0
+    return {"fillPrice": fill_px,
+            "executedQty": float(filled["totalSz"]) if (filled and filled.get("totalSz")) else size}
 
 
 async def _hl_market_close(base_coin):
@@ -285,12 +293,15 @@ async def _hl_market_close(base_coin):
 
 async def _hl_place_tpsl(coin, is_long, sz, tp_px, sl_px):
     """Place reduce-only TP + SL trigger orders on Hyperliquid so the EXCHANGE closes the
-    position when target/stop is hit (survives server downtime, executes instantly)."""
+    position when target/stop is hit (survives server downtime, executes instantly).
+    Either leg may be None (e.g. trailing positions have no fixed TP) — skip those."""
     def _place():
         ex = _get_hl_exchange()
         close_is_buy = not is_long  # close a LONG -> sell; close a SHORT -> buy
         out = []
         for tag, trig in (("tp", tp_px), ("sl", sl_px)):
+            if trig is None:
+                continue  # no fixed level for this leg (trailing manages it in software)
             trig_r = hlconv.round_price(coin, trig) or trig
             lim = trig_r * (1.08 if close_is_buy else 0.92)  # aggressive limit so market trigger fills
             lim_r = hlconv.round_price(coin, lim) or trig_r
@@ -405,8 +416,10 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
             try:
                 await _hl_cancel_coin(hl_coin)  # clear any stale triggers first
                 res = await _hl_place_tpsl(hl_coin, is_long, hlconv.round_size(hl_coin, executed) or executed, tp_price, sl_price)
+                _tp_s = f"{tp_price:.6g}" if tp_price is not None else "trail"
+                _sl_s = f"{sl_price:.6g}" if sl_price is not None else "—"
                 jlog("tpsl", symbol=hl_coin, base=base, tp=tp_price, sl=sl_price,
-                     message=f"Native TP {tp_price:.6g} / SL {sl_price:.6g} placed on Hyperliquid: {res}", live=True)
+                     message=f"Native TP {_tp_s} / SL {_sl_s} placed on Hyperliquid: {res}", live=True)
             except Exception as e:  # noqa: BLE001
                 jlog("warn", symbol=hl_coin, base=base, live=True,
                      message=f"native TP/SL failed ({str(e)[:100]}) — software monitor will close on target/stop")

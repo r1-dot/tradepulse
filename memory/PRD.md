@@ -109,6 +109,15 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Note: straddleTpPct/straddleSlPct still declared in BOT_DEFAULTS/BotConfigUpdate but are now DEAD (unused on fill) — harmless.
 - Verified: iteration_18.json — 27/27 backend pytest (5 new straddle-trailing + 22 regression) + straddle UI spec 100%.
 
+## Bug fix (2026-06) — LIVE straddle short: native TP/SL crash ("NoneType * float")
+- Report: a LIVE straddle SHORT opened but native TP/SL failed with "unsupported operand type(s) for *: 'NoneType' and 'float'", leaving the position protected only by the software monitor.
+- Root cause: the Smart Trailing TP change passes `tp_price=None` (trailing manages upside). `_open_position` still called `_hl_place_tpsl(..., tp_px=None, sl_px=...)`, and inside it computed `trig_r * float` on the None TP leg → crash. Native SL never placed.
+- Fixes (verified test_hl_tpsl_none.py 4/4 + regression 12/12):
+  - `_hl_place_tpsl` now SKIPS any None leg — places only the provided trigger(s). Trailing positions get a native SL (initial stop) on the exchange for downtime protection; the software monitor trails tighter.
+  - `_hl_market_open` fill price falls back to `_HL['info'].all_mids()` when `avgPx` is missing/0 (never stores a 0/None fill).
+  - Null-safe TP/SL journal logging ("trail" / "—").
+- NOTE: the position already open before this fix has no exchange-side SL — only the software monitor. Fix applies to all subsequent entries.
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections
