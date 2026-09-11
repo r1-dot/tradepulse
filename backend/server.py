@@ -378,7 +378,11 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
         except Exception as e:  # noqa: BLE001
             jlog("error", symbol=sym, action="BUY", message=str(e), live=True)
             return
-    if tp_price is None or sl_price is None:
+    # Only apply the FIXED tpPct/slPct defaults when the caller passed neither.
+    # Straddle & hybrid explicitly pass tp_price=None (trailing manages upside) with
+    # a computed sl_price — we MUST preserve tp_price=None so process_bot routes them
+    # through _update_trailing() instead of hitting the fixed take-profit.
+    if tp_price is None and sl_price is None:
         if is_long:
             tp_price = fill * (1 + cfg["tpPct"] / 100)
             sl_price = fill * (1 - cfg["slPct"] / 100)
@@ -629,20 +633,21 @@ async def process_bot(http: httpx.AsyncClient, now: float):
                 BOT["straddles"].pop(sym, None)
                 jlog("straddle_cancel", symbol=sym, base=s["base"], reason="expired")
                 continue
+            # Filled legs use the SMART TRAILING TP system (same as Hybrid): no fixed TP,
+            # just a tight initial stop; _update_trailing() then secures BE+ and trails the SL.
+            isl = cfg.get("trailInitialSlPct", 0.30)
             if price >= s["longEntry"]:
                 BOT["straddles"].pop(sym, None)
-                tp = s["longEntry"] * (1 + cfg["straddleTpPct"] / 100)
-                sl = s["longEntry"] * (1 - cfg["straddleSlPct"] / 100)
+                sl = s["longEntry"] * (1 - isl / 100)
                 jlog("straddle_fill", symbol=sym, base=s["base"], side="long", entry=s["longEntry"],
                      message="LONG leg filled — SHORT leg cancelled")
-                await _open_position(http, sym, s["longEntry"], now, side="long", tp_price=tp, sl_price=sl, source="straddle")
+                await _open_position(http, sym, s["longEntry"], now, side="long", tp_price=None, sl_price=sl, source="straddle")
             elif price <= s["shortEntry"]:
                 BOT["straddles"].pop(sym, None)
-                tp = s["shortEntry"] * (1 - cfg["straddleTpPct"] / 100)
-                sl = s["shortEntry"] * (1 + cfg["straddleSlPct"] / 100)
+                sl = s["shortEntry"] * (1 + isl / 100)
                 jlog("straddle_fill", symbol=sym, base=s["base"], side="short", entry=s["shortEntry"],
                      message="SHORT leg filled — LONG leg cancelled")
-                await _open_position(http, sym, s["shortEntry"], now, side="short", tp_price=tp, sl_price=sl, source="straddle")
+                await _open_position(http, sym, s["shortEntry"], now, side="short", tp_price=None, sl_price=sl, source="straddle")
 
     # 1) manage exits. If trailEnabled, use SMART TRAILING (dynamic SL that locks profit);
     #    else fixed TP/SL. Straddle/hybrid always managed regardless of the autoExit toggle.
@@ -722,7 +727,7 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
         }
         jlog("straddle", symbol=sym, base=sym[: -len(QUOTE)], mark=price,
              longEntry=price * (1 + eo), shortEntry=price * (1 - eo),
-             message=f"Straddle armed ±{cfg['straddleEntryPct']}% · TP {cfg['straddleTpPct']}% / SL {cfg['straddleSlPct']}%")
+             message=f"Straddle armed ±{cfg['straddleEntryPct']}% · Smart Trailing TP (init SL {cfg.get('trailInitialSlPct', 0.30)}%)")
         return
 
     st = BOT["signalStreaks"].get(sym)

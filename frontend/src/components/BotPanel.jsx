@@ -76,8 +76,6 @@ export default function BotPanel({ open, onClose }) {
     cooldownSec: parseInt(form.cooldownSec, 10),
     maxLossPerTradeUsdt: parseFloat(form.maxLossPerTradeUsdt),
     straddleEntryPct: parseFloat(form.straddleEntryPct),
-    straddleTpPct: parseFloat(form.straddleTpPct),
-    straddleSlPct: parseFloat(form.straddleSlPct),
     webhookUrl: form.webhookUrl || "",
     webhookBuyMsg: form.webhookBuyMsg || "",
     webhookSellMsg: form.webhookSellMsg || "",
@@ -331,10 +329,25 @@ export default function BotPanel({ open, onClose }) {
                     <p className="mono text-[9px] leading-relaxed text-zinc-500">
                       On a volume spike, arm a LONG stop <b className="text-[#00A004]">+{form.straddleEntryPct}%</b> above and a SHORT stop <b className="text-[#FF3B30]">−{form.straddleEntryPct}%</b> below the mark. Whichever price hits first fills; the other is cancelled (OCO breakout). Overrides streak entries while ON. Shorts execute in Sim + Hyperliquid only.
                     </p>
-                    <div className="grid grid-cols-3 gap-2">
+                    <div className="grid grid-cols-1 gap-2">
                       <NumField testid="bot-straddle-entry" label="Entry ±" step="0.000001" value={form.straddleEntryPct} onChange={(v) => setForm({ ...form, straddleEntryPct: v })} suffix="%" />
-                      <NumField testid="bot-straddle-tp" label="TP" step="0.01" value={form.straddleTpPct} onChange={(v) => setForm({ ...form, straddleTpPct: v })} suffix="%" />
-                      <NumField testid="bot-straddle-sl" label="SL" step="0.0001" value={form.straddleSlPct} onChange={(v) => setForm({ ...form, straddleSlPct: v })} suffix="%" />
+                    </div>
+                    <div className="border border-[#7C3AED]/20 bg-white/50 p-2" data-testid="bot-straddle-trailing-summary">
+                      <div className="mono text-[9px] font-semibold uppercase tracking-wider text-[#7C3AED]">Exits · Smart Trailing TP</div>
+                      <p className="mono text-[9px] leading-relaxed text-zinc-500 mt-1">
+                        Filled legs use the <b className="text-[#7C3AED]">Smart Trailing TP</b> — no fixed TP/SL. Tight initial stop, secures to BE+ once in profit, then trails the stop up locking gains. Uses the shared trailing settings below.
+                      </p>
+                      <div className="mt-1.5 grid grid-cols-3 gap-x-2 gap-y-1 mono text-[9px] text-zinc-600" data-testid="bot-straddle-trailing-values">
+                        <div>Init SL <b className="text-[#FF3B30]">{st.config.trailInitialSlPct}%</b></div>
+                        <div>Secure <b>{st.config.trailSecure}%</b></div>
+                        <div>BE+ <b>{st.config.trailBE}%</b></div>
+                        <div>Step <b>{st.config.trailStep}%</b></div>
+                        <div>Callback <b>{st.config.trailCallback}%</b></div>
+                        <div>Trail <b className={st.config.trailEnabled ? "text-[#00A004]" : "text-zinc-400"}>{st.config.trailEnabled ? "ON" : "OFF"}</b></div>
+                      </div>
+                      <p className="mono text-[8px] leading-relaxed text-zinc-400 mt-1.5">
+                        Adjust these in the <b>Hybrid Power → Smart Trailing TP</b> panel (shared across Straddle &amp; Hybrid).
+                      </p>
                     </div>
                   </div>
 
@@ -411,7 +424,7 @@ export default function BotPanel({ open, onClose }) {
                           <span className={`rounded-sm px-1 text-[8px] font-bold uppercase ${p.side === "short" ? "bg-[#FF3B30] text-white" : "bg-[#00A004] text-white"}`}>{p.side === "short" ? "S" : "L"}</span>
                           {p.base}<span className="text-[9px] text-zinc-300">/USDT</span>
                         </div>
-                        <div className="mono text-[10px] text-zinc-400">e {p.entryPrice.toPrecision(5)} · tp {p.tpPrice.toPrecision(5)} · sl {p.slPrice.toPrecision(5)}</div>
+                        <div className="mono text-[10px] text-zinc-400">e {p.entryPrice.toPrecision(5)} · tp {p.tpPrice ? p.tpPrice.toPrecision(5) : "trail"} · sl {p.slPrice ? p.slPrice.toPrecision(5) : "—"}</div>
                         <div className={`mono text-[11px] font-semibold ${p.uPnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}`}>{p.uPnl >= 0 ? "+" : ""}{p.uPnl.toFixed(4)}</div>
                       </div>
                     ))}

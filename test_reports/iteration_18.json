@@ -1,0 +1,38 @@
+{
+  "summary": "Iteration 18 — Straddle System now shares Hybrid's Smart Trailing TP. Wrote & ran /app/backend/tests/test_straddle_trailing.py (5 tests). Found & fixed one CRITICAL backend bug: in _open_position (server.py L381) the condition `if tp_price is None OR sl_price is None` overwrote the caller-supplied tp_price=None with the fixed tpPct, so BOTH straddle- and hybrid-source positions were still getting a fixed TP (never routed through _update_trailing). Changed OR → AND so straddle/hybrid callers keep tp_price=None and get routed to smart trailing. After the fix: all 5 new tests + 22 existing regression tests (test_straddle.py + test_hybrid_trailing.py) PASS. Frontend BotPanel verified via Playwright: old bot-straddle-tp / bot-straddle-sl fields are GONE; only bot-straddle-entry remains editable; bot-straddle-trailing-summary shows 'Exits · Smart Trailing TP' text + reference to Hybrid panel; bot-straddle-trailing-values renders Init SL / Secure / BE+ / Step / Callback / Trail with the live shared trail* config values.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "BotPanel open positions row", "issue": "Renders `p.tpPrice.toPrecision(5)` directly — will throw TypeError when a straddle/hybrid position lands (tpPrice is now null). Needs a null guard (e.g. p.tpPrice ? p.tpPrice.toPrecision(5) : '—').", "selector": "bot-pos-{symbol}", "priority": "HIGH"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_straddle_trailing.py",
+    "/app/test_reports/pytest/iteration_18.xml"
+  ],
+  "action_items": [
+    "Add null-safe render for tpPrice in BotPanel open-positions row (line ~427) — currently `p.tpPrice.toPrecision(5)` crashes when tpPrice=null (straddle/hybrid).",
+    "Optional: remove now-DEAD straddleTpPct / straddleSlPct fields from BOT_DEFAULTS + BotConfigUpdate + clamp block to reduce confusion (per user request they should be entirely replaced)."
+  ],
+  "critical_code_review_comments": [
+    "CRITICAL bug fixed by testing agent in _open_position: `tp_price is None OR sl_price is None` was overwriting the explicit tp_price=None passed by both straddle and hybrid callers, defeating the Smart Trailing TP routing. Now `AND`. Main agent should code-review the fix.",
+    "server.py is now >1400 lines — worth splitting bot execution (_open_position/_close_position/_update_trailing/process_bot) into its own module.",
+    "straddleTpPct/straddleSlPct still declared in BOT_DEFAULTS + BotConfigUpdate but never read on fill — dead state; user asked for full replacement, consider deletion."
+  ],
+  "updated_files": [
+    "/app/backend/server.py (fixed _open_position tp/sl default guard: OR → AND)",
+    "/app/backend/tests/test_straddle_trailing.py (new)"
+  ],
+  "success_rate": {"backend": "100% (27/27 tests after fix)", "frontend": "100% (straddle UI spec)"},
+  "test_credentials": "none (no auth)",
+  "seed_data_creation": "none",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Run `python -m pytest backend/tests/test_straddle_trailing.py backend/tests/test_straddle.py backend/tests/test_hybrid_trailing.py -v -o addopts=''` for full straddle+hybrid+trailing coverage (~55s). Known follow-up: BotPanel line ~427 renders p.tpPrice.toPrecision(5) without a null check — will crash the panel when a straddle or hybrid position is open (tpPrice=null). Not fixed here because it's a UI rendering fix that main agent owns.",
+  "rca of the issue": "Root cause of the initial straddle-trailing failure: in server.py _open_position the guard `if tp_price is None or sl_price is None: <set both to fixed tpPct/slPct>` was written for the signal-driven code path (which passes neither), but the newly-added straddle & hybrid callers pass tp_price=None + a concrete sl_price. Because the guard is OR, the None tp_price triggered the block and BOTH values were overwritten to the fixed defaults, so the position was created with a fixed tpPrice and process_bot's `if _trail and pos.get('tpPrice') is None: _update_trailing(...)` branch was never entered. Fix: change OR → AND so defaults only fire when neither was supplied. Reproduction: enable straddle in SIM with straddleEntryPct=1e-6, feed a /api/bot/signal, then GET /api/bot/status — before fix openPositions[0].tpPrice was ~entry*1.02 (fixed +2% tpPct); after fix it is null."
+}

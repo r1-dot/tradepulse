@@ -100,6 +100,15 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - User-supplied Binance/Hyperliquid values from last prompt were partial (Binance single key w/o secret; HL value was an address, not a private key). Existing working Binance key+secret in `.env` left untouched; live trading still requires deploy (api.binance.com 451 on preview) + funded HL collateral.
 - `_TOKEN_SESSIONS` pruned at 120s; consider LRU cap if many idle tabs (low priority).
 
+## Feature (2026-06) — Straddle System uses Smart Trailing TP (shared with Hybrid)
+- Straddle filled legs no longer use fixed straddleTpPct/straddleSlPct. On fill they open with `tp_price=None` + a tight initial stop (`trailInitialSlPct`), then route through `_update_trailing()` — same Smart Trailing TP as Hybrid, using the SHARED global trail* config (trailInitialSlPct/trailSecure/trailBE/trailStep/trailCallback/trailEnabled). Works for both long & short legs.
+- Straddle-arm journal message now says "Smart Trailing TP (init SL X%)" instead of fixed TP/SL.
+- Frontend BotPanel Straddle section: removed the fixed TP/SL NumFields (kept Entry±); added read-only "Exits · Smart Trailing TP" summary (`bot-straddle-trailing-summary` / `bot-straddle-trailing-values`) showing the live shared trail params + a note pointing to the Hybrid panel's Smart Trailing controls.
+- CRITICAL bug fixed (testing agent, iteration_18): `_open_position` default-TP guard was `tp_price is None OR sl_price is None` → overwrote the explicit `tp_price=None` from straddle/hybrid callers with a fixed TP, so trailing never engaged. Changed to `AND` (defaults only when neither supplied). Both straddle & hybrid now correctly trail.
+- Fixed BotPanel open-positions row crash: `p.tpPrice.toPrecision(5)` → null-guarded (`tpPrice ? … : "trail"`, `slPrice ? … : "—"`) since trailing positions have null tpPrice.
+- Note: straddleTpPct/straddleSlPct still declared in BOT_DEFAULTS/BotConfigUpdate but are now DEAD (unused on fill) — harmless.
+- Verified: iteration_18.json — 27/27 backend pytest (5 new straddle-trailing + 22 regression) + straddle UI spec 100%.
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections
