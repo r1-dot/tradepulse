@@ -237,6 +237,15 @@ export default function BotPanel({ open, onClose }) {
                 <Stat label="Alerts feed" value={st.alertsFeeding ? "feeding" : "no alerts"}
                   color={st.alertsFeeding ? "#00A004" : "#B26A00"} testid="bot-feed" />
                 <Stat label="Open positions" value={`${st.openPositions.length} / ${st.config.maxOpenPositions}`} />
+                {st.exchangeUnrealizedPnl != null ? (
+                  <Stat label="Unrealized (exch)" testid="bot-exch-upnl"
+                    value={`${st.exchangeUnrealizedPnl >= 0 ? "+" : ""}${st.exchangeUnrealizedPnl.toFixed(4)} USDT`}
+                    color={st.exchangeUnrealizedPnl >= 0 ? "#00A004" : "#FF3B30"} />
+                ) : (
+                  <Stat label="Unrealized" testid="bot-upnl"
+                    value={`${st.unrealizedPnl >= 0 ? "+" : ""}${st.unrealizedPnl.toFixed(4)} USDT`}
+                    color={st.unrealizedPnl >= 0 ? "#00A004" : "#FF3B30"} />
+                )}
                 <Stat label="API keys" value={st.keysConfigured ? "configured" : "missing"}
                   color={st.keysConfigured ? "#00A004" : "#B26A00"} />
               </div>
@@ -435,8 +444,17 @@ export default function BotPanel({ open, onClose }) {
                           <span className={`rounded-sm px-1 text-[8px] font-bold uppercase ${p.side === "short" ? "bg-[#FF3B30] text-white" : "bg-[#00A004] text-white"}`}>{p.side === "short" ? "S" : "L"}</span>
                           {p.base}<span className="text-[9px] text-zinc-300">/USDT</span>
                         </div>
-                        <div className="mono text-[10px] text-zinc-400">e {p.entryPrice.toPrecision(5)} · tp {p.tpPrice ? p.tpPrice.toPrecision(5) : "trail"} · sl {p.slPrice ? p.slPrice.toPrecision(5) : "—"}</div>
-                        <div className={`mono text-[11px] font-semibold ${p.uPnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}`}>{p.uPnl >= 0 ? "+" : ""}{p.uPnl.toFixed(4)}</div>
+                        <div className="mono text-[10px] text-zinc-400">e {p.entryPrice.toPrecision(5)} · tp {p.tpPrice ? p.tpPrice.toPrecision(5) : "trail"} · sl {p.slPrice ? p.slPrice.toPrecision(5) : "—"}{p.source === "adopted" ? " · adopted" : ""}</div>
+                        <div className="flex flex-col items-end leading-tight">
+                          {p.exUPnl != null ? (
+                            <>
+                              <div data-testid={`bot-pos-expnl-${p.symbol}`} className={`mono text-[11px] font-semibold ${p.exUPnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}`}>{p.exUPnl >= 0 ? "+" : ""}{p.exUPnl.toFixed(4)}<span className="ml-1 text-[7px] font-bold uppercase text-zinc-400">exch</span></div>
+                              <div className="mono text-[8px] text-zinc-300">paper {p.uPnl >= 0 ? "+" : ""}{p.uPnl.toFixed(4)}</div>
+                            </>
+                          ) : (
+                            <div className={`mono text-[11px] font-semibold ${p.uPnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}`}>{p.uPnl >= 0 ? "+" : ""}{p.uPnl.toFixed(4)}</div>
+                          )}
+                        </div>
                       </div>
                     ))}
                   </div>

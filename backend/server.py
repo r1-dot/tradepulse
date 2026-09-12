@@ -125,6 +125,8 @@ BOT_DEFAULTS = {
     "hlCrossMargin": True,     # True = cross margin, False = isolated
     "hlNativeTpsl": True,      # place native TP/SL trigger orders on Hyperliquid at entry
     "hlSlippagePct": 0.0001,   # extra % added to the signal price for instant marketable fill
+    "hlReconcile": True,       # periodically reconcile bot state vs the exchange (detect/fix desync)
+    "hlReconcileSec": 10,      # reconcile cadence in seconds
     # --- HYBRID POWER SYSTEM (short-window power/flow signal engine, Isolated 3x)
     "hybrid_toggle": True,
     "sl_percent": 0.8,
@@ -160,6 +162,8 @@ BOT = {
     "signalStreaks": {},    # symbol -> {"side","count","startTs"}
     "lastSignalTs": 0.0,    # last alert event received from dashboard
     "lastTradeTs": {},      # symbol -> ts (cooldown)
+    "closeIntents": {},     # hl_coin -> ts: positions the bot tried to close but may not be flat yet
+    "reconcileTs": 0.0,     # last exchange reconciliation time
 }
 
 
@@ -298,9 +302,46 @@ async def _hl_market_close(base_coin):
     res = await asyncio.to_thread(ex.market_close, base_coin)
     if res and res.get("status") != "ok":
         raise RuntimeError(str(res)[:200])
-    fills = (res or {}).get("response", {}).get("data", {}).get("statuses", [])
-    filled = next((s["filled"] for s in fills if "filled" in s), None)
-    return {"fillPrice": float(filled["avgPx"]) if filled else 0.0}
+    statuses = (res or {}).get("response", {}).get("data", {}).get("statuses", []) or []
+    # a reduce-only close can be REJECTED while top-level status is still "ok" -> surface it
+    for s in statuses:
+        if isinstance(s, dict) and s.get("error"):
+            raise RuntimeError(str(s["error"])[:200])
+    filled = next((s["filled"] for s in statuses if isinstance(s, dict) and "filled" in s), None)
+    return {"fillPrice": float(filled["avgPx"]) if (filled and filled.get("avgPx")) else 0.0}
+
+
+def _hl_addr():
+    return os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "") or os.environ.get("HYPERLIQUID_MAIN_WALLET", "")
+
+
+async def _hl_positions_map():
+    """Return {COIN(upper): {'szi': signed_size, 'entryPx': float, 'upnl': float}} from the
+    exchange (source of truth). Returns None if the query fails (unknown state)."""
+    def _q():
+        st = _HL["info"].user_state(_hl_addr())
+        out = {}
+        for ap in st.get("assetPositions", []) or []:
+            p = ap.get("position", {}) or {}
+            coin = str(p.get("coin", "")).upper()
+            szi = float(p.get("szi") or 0.0)
+            if not coin or szi == 0:
+                continue
+            out[coin] = {"szi": szi,
+                         "entryPx": float(p.get("entryPx") or 0.0),
+                         "upnl": float(p.get("unrealizedPnl") or 0.0)}
+        return out
+    try:
+        return await asyncio.to_thread(_q)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _hl_position_size(coin):
+    m = await _hl_positions_map()
+    if m is None:
+        return None
+    return m.get(str(coin).upper(), {}).get("szi", 0.0)
 
 
 async def _hl_place_tpsl(coin, is_long, sz, tp_px, sl_px):
@@ -547,27 +588,49 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
 
 
 async def _close_position(http, sym, price, reason):
-    pos = BOT["positions"].pop(sym, None)
+    pos = BOT["positions"].get(sym)
     if not pos:
         return
     cfg = BOT["config"]
     fill = price
     if not cfg["dryRun"] and not pos.get("dryRun"):
         if cfg.get("exchange") == "hyperliquid":
+            hl_coin = hlconv.convert_binance_to_hyperliquid(pos["base"]) or pos["base"]
             try:
                 await _ensure_hl_ready()
-                hl_coin = hlconv.convert_binance_to_hyperliquid(pos["base"]) or pos["base"]
+                # 1) cancel triggers FIRST — resting reduce-only SL/TP can block the market close
+                await _hl_cancel_coin(hl_coin)
+                # 2) send the real market close to the exchange
                 r = await _hl_market_close(hl_coin)
                 fill = r["fillPrice"] or price
-                await _hl_cancel_coin(hl_coin)  # remove the sibling TP/SL trigger
+                # 3) VERIFY the exchange is actually flat; retry once, then re-cancel stragglers
+                sz = await _hl_position_size(hl_coin)
+                if sz is not None and abs(sz) > 1e-12:
+                    r = await _hl_market_close(hl_coin)
+                    fill = r["fillPrice"] or fill
+                    sz = await _hl_position_size(hl_coin)
+                await _hl_cancel_coin(hl_coin)
+                if sz is not None and abs(sz) > 1e-12:
+                    # STILL open -> keep tracking + flag for the reconciler; do NOT emit a false exit
+                    BOT["closeIntents"][hl_coin.upper()] = time.time()
+                    jlog("error", symbol=sym, base=pos["base"], action="CLOSE", live=True, venue="hyperliquid",
+                         message=f"CLOSE FAILED to flatten {hl_coin} — {abs(sz)} still open on exchange; kept in tracking, reconciler will retry ({reason})")
+                    return
+                BOT["closeIntents"].pop(hl_coin.upper(), None)
             except Exception as e:  # noqa: BLE001
-                jlog("error", symbol=sym, action="CLOSE", message=str(e)[:200], live=True, venue="hyperliquid")
+                BOT["closeIntents"][hl_coin.upper()] = time.time()
+                jlog("error", symbol=sym, base=pos["base"], action="CLOSE", live=True, venue="hyperliquid",
+                     message=f"close error ({str(e)[:150]}) — kept in tracking, reconciler will retry")
+                return  # keep position; next tick / reconciler retries (no false exit)
         else:
             try:
                 r = await _live_market(http, sym, "SELL", base_qty=pos["qty"])
                 fill = r["fillPrice"] or price
             except Exception as e:  # noqa: BLE001
                 jlog("error", symbol=sym, action="SELL", message=str(e), live=True)
+                return
+    # confirmed closed (or SIM) -> now remove from tracking and record the exit
+    BOT["positions"].pop(sym, None)
     pnl = (fill - pos["entryPrice"]) * pos["qty"] * (1 if pos.get("side", "long") == "long" else -1)
     BOT["dailyPnl"] += pnl
     BOT["lastTradeTs"][sym] = time.time()
@@ -580,6 +643,68 @@ async def _close_position(http, sym, price, reason):
         cfg["enabled"] = False
         jlog("halt", message=f"Daily loss limit hit ({BOT['dailyPnl']:.2f} USDT). Bot stopped.")
         await save_bot_config()
+
+
+async def reconcile_hl(now):
+    """Compare bot's tracked positions against the Hyperliquid account (source of truth) and
+    fix any DESYNC: (a) bot thinks open but exchange is flat -> record the real exit; (b) a
+    close we attempted never flattened -> force-close again; (c) untracked exchange position
+    -> adopt it so the bot can manage/close it; (d) orphan triggers on flat coins -> cancel."""
+    cfg = BOT["config"]
+    if cfg["dryRun"] or cfg.get("exchange") != "hyperliquid" or not cfg.get("hlReconcile", True):
+        return
+    try:
+        await _ensure_hl_ready()
+    except Exception:  # noqa: BLE001
+        return
+    ex_map = await _hl_positions_map()
+    if ex_map is None:
+        return  # couldn't read exchange; skip this cycle
+    BOT["exPositions"] = ex_map  # cache real exchange positions for _bot_status PnL
+
+    # map tracked LIVE positions by their HL coin
+    tracked = {}
+    for sym, pos in list(BOT["positions"].items()):
+        if pos.get("dryRun"):
+            continue
+        hc = (hlconv.convert_binance_to_hyperliquid(pos["base"]) or pos["base"]).upper()
+        tracked[hc] = (sym, pos)
+
+    # (a/b) tracked but flat on exchange -> it closed externally (native SL/TP fired or manual)
+    for hc, (sym, pos) in list(tracked.items()):
+        if hc not in ex_map:
+            fill = pos.get("nativeSlPrice") or pos.get("slPrice") or pos["entryPrice"]
+            v = STATE["latest"].get(sym)
+            if v:
+                fill = v["price"]
+            pnl = (fill - pos["entryPrice"]) * pos["qty"] * (1 if pos.get("side", "long") == "long" else -1)
+            BOT["positions"].pop(sym, None)
+            BOT["dailyPnl"] += pnl
+            BOT["lastTradeTs"][sym] = now
+            BOT["closeIntents"].pop(hc, None)
+            await _hl_cancel_coin(hc)  # clear any orphan triggers left behind
+            jlog("desync", symbol=sym, base=pos["base"], live=True, pnl=pnl,
+                 message=f"DESYNC DETECTED — {hc} flat on exchange but tracked as open; reconciled exit @ {fill:.6g} (pnl {pnl:+.4f})")
+
+    # (c) open on exchange but NOT tracked -> adopt so the bot manages/closes it
+    for hc, info in ex_map.items():
+        if hc in tracked:
+            continue
+        szi = info["szi"]
+        is_long = szi > 0
+        entry = info["entryPx"] or 0.0
+        sym = hc + QUOTE  # best-effort Binance symbol for mark lookups
+        isl = cfg.get("trailInitialSlPct", 0.30)
+        sl = entry * (1 - isl / 100) if is_long else entry * (1 + isl / 100)
+        BOT["positions"][sym] = {
+            "symbol": sym, "base": hc, "side": "long" if is_long else "short",
+            "entryPrice": entry, "qty": abs(szi), "quoteSpent": entry * abs(szi),
+            "tpPrice": None, "slPrice": sl if entry else None,
+            "openedTs": now, "orderId": None, "dryRun": False, "source": "adopted",
+        }
+        BOT["closeIntents"].pop(hc, None)
+        jlog("desync", symbol=sym, base=hc, live=True,
+             message=f"DESYNC DETECTED — untracked {('LONG' if is_long else 'SHORT')} {hc} ({abs(szi)}@{entry:.6g}) on exchange; adopted into tracking (Smart Trailing will manage)")
 
 
 HYBRID_STATE = {"watch": [], "watch_ts": 0.0, "rows": []}
@@ -741,6 +866,16 @@ async def process_bot(http: httpx.AsyncClient, now: float):
         BOT["dailyPnl"] = 0.0
         BOT["stopped"] = False
         jlog("daily_reset", date=today)
+
+    # Periodic exchange reconciliation — detect/fix desync between bot state and Hyperliquid.
+    rsec = max(5, int(cfg.get("hlReconcileSec", 10) or 10))
+    if cfg.get("hlReconcile", True) and not cfg["dryRun"] and cfg.get("exchange") == "hyperliquid" \
+            and now - BOT.get("reconcileTs", 0.0) >= rsec:
+        BOT["reconcileTs"] = now
+        try:
+            await reconcile_hl(now)
+        except Exception as re:  # noqa: BLE001
+            logger.error("reconcile error: %s", re)
 
     # HARD per-trade max-loss cap — overrides autoExit and every other rule.
     # Runs every poll regardless of autoExit so a position can never bleed past it.
@@ -1209,6 +1344,8 @@ class BotConfigUpdate(BaseModel):
     hlLeverage: Optional[int] = None
     hlCrossMargin: Optional[bool] = None
     hlNativeTpsl: Optional[bool] = None
+    hlReconcile: Optional[bool] = None
+    hlReconcileSec: Optional[int] = None
     hlSlippagePct: Optional[float] = None
     hybrid_toggle: Optional[bool] = None
     sl_percent: Optional[float] = None
@@ -1234,17 +1371,24 @@ def _bot_status():
     latest = STATE["latest"]
     positions = []
     unrealized = 0.0
+    ex_map = BOT.get("exPositions") or {}
+    ex_upnl_total = 0.0
     for sym, pos in BOT["positions"].items():
         price = latest.get(sym, {}).get("price", pos["entryPrice"])
         sgn = 1 if pos.get("side", "long") == "long" else -1
         upnl = (price - pos["entryPrice"]) * pos["qty"] * sgn
         unrealized += upnl
+        hc = (hlconv.convert_binance_to_hyperliquid(pos["base"]) or pos["base"]).upper()
+        ex_upnl = ex_map.get(hc, {}).get("upnl") if not pos.get("dryRun") else None
+        if ex_upnl is not None:
+            ex_upnl_total += ex_upnl
         positions.append({
             "symbol": sym, "base": pos["base"], "side": pos.get("side", "long"),
             "entryPrice": pos["entryPrice"],
             "currentPrice": price, "qty": pos["qty"], "quoteSpent": pos["quoteSpent"],
             "tpPrice": pos["tpPrice"], "slPrice": pos["slPrice"], "source": pos.get("source", "signal"),
-            "uPnl": upnl, "openedTs": pos["openedTs"], "mode": "SIM" if pos.get("dryRun") else "LIVE",
+            "uPnl": upnl, "exUPnl": ex_upnl, "openedTs": pos["openedTs"],
+            "mode": "SIM" if pos.get("dryRun") else "LIVE",
         })
     straddles = [
         {"symbol": s["symbol"], "base": s["base"], "mark": s["mark"],
@@ -1260,6 +1404,7 @@ def _bot_status():
         "dailyPnl": BOT["dailyPnl"],
         "dailyDate": BOT["dailyDate"],
         "unrealizedPnl": unrealized,
+        "exchangeUnrealizedPnl": ex_upnl_total if ex_map else None,
         "openPositions": positions,
         "pendingStraddles": straddles,
         "journal": list(BOT["journal"])[:100],
@@ -1315,6 +1460,8 @@ async def bot_config(update: BotConfigUpdate):
         data["hlLeverage"] = max(1, min(50, int(data["hlLeverage"])))
     if "hlSlippagePct" in data:
         data["hlSlippagePct"] = max(0.0, min(5.0, float(data["hlSlippagePct"])))
+    if "hlReconcileSec" in data:
+        data["hlReconcileSec"] = max(5, min(300, int(data["hlReconcileSec"])))
     for k, lo, hi in (("sl_percent", 0.3, 1.5), ("tp_percent", 0.8, 4.0),
                       ("min_power_1m", 0.4, 1.0), ("max_power_1m", 1.2, 2.5),
                       ("burst_power", 0.03, 0.15)):

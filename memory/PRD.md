@@ -144,6 +144,15 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
   - `_hl_sync_stop` = CANCEL-REPLACE: cancel all stale triggers → place ONE fresh SL → `_hl_dedupe_sl()` verifies only one SL survives (cancels any extra, keeps newest oid).
   - Logs the requested line: `CANCELED old SL {price} -> PLACED new SL {price} (cancelled N stale, oid=…)`. Works for ALL coins.
 
+## Bug fix (2026-06) — CRITICAL desync: bot logged COVER but position still open on exchange
+- Report + screenshot (METUSD): journal showed "COVER MET @ 0.23740 pnl +0.0208 trail-exit" yet the short was still LIVE on Hyperliquid with 2 SL triggers.
+- Root causes in `_close_position`: (1) it popped the position from tracking BEFORE confirming the close, so a failed close left an orphan + a FALSE exit log; (2) `_hl_market_close` only checked the top-level `status`, not inner `statuses[].error` — a reduce-only close REJECTED by the exchange (blocked by the resting SL triggers) looked "ok"; (3) triggers were cancelled AFTER the close instead of before, so they blocked the reduce-only market close.
+- Fixes (tests/test_desync_reconcile.py 6/6 + regression 15/15, fully mocked — NO real orders):
+  - `_close_position`: cancel triggers FIRST → send real market close → VERIFY flat via `user_state` (retry once) → re-cancel stragglers. Only removes tracking + logs exit AFTER confirmed flat. If still open: keeps tracking, sets `closeIntents`, logs a clear error (no false exit).
+  - `_hl_market_close` now raises on inner `statuses[].error`.
+  - New `reconcile_hl()` runs every `hlReconcileSec` (default 10s, LIVE HL only): compares bot vs exchange (`user_state`) and logs `DESYNC DETECTED` while fixing — tracked-but-flat → reconciled exit; untracked-open → adopted into tracking (Smart Trailing manages); orphan triggers on flat coins → cancelled. Config: `hlReconcile` / `hlReconcileSec`.
+  - Real exchange PnL: `_bot_status` now exposes per-position `exUPnl` + top-level `exchangeUnrealizedPnl` from `user_state`; BotPanel shows exchange PnL (with paper PnL secondary) and an "Unrealized (exch)" stat.
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections
