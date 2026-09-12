@@ -21,7 +21,7 @@ def test_place_tpsl_skips_none_tp(monkeypatch):
     monkeypatch.setattr(server, "_get_hl_exchange", lambda: fake)
     # trailing SHORT: tp is None, sl is a real price -> must place ONLY the SL leg, no crash
     out = asyncio.run(server._hl_place_tpsl("XYZ", is_long=False, sz=10.0, tp_px=None, sl_px=0.00370))
-    tags = [t for t, _ in out]
+    tags = [r["tag"] for r in out]
     assert tags == ["sl"], f"expected only sl leg, got {tags}"
     assert len(fake.orders) == 1
     assert fake.orders[0]["reduce_only"] is True
@@ -32,7 +32,7 @@ def test_place_tpsl_both_legs(monkeypatch):
     fake = FakeExchange()
     monkeypatch.setattr(server, "_get_hl_exchange", lambda: fake)
     out = asyncio.run(server._hl_place_tpsl("XYZ", is_long=True, sz=10.0, tp_px=1.10, sl_px=0.90))
-    tags = sorted(t for t, _ in out)
+    tags = sorted(r["tag"] for r in out)
     assert tags == ["sl", "tp"], f"expected both legs, got {tags}"
     assert len(fake.orders) == 2
 

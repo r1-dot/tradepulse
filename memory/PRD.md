@@ -118,6 +118,32 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
   - Null-safe TP/SL journal logging ("trail" / "—").
 - NOTE: the position already open before this fix has no exchange-side SL — only the software monitor. Fix applies to all subsequent entries.
 
+## Feature (2026-06) — Trailing stop mirrored ON-EXCHANGE (Hyperliquid)
+- Each time the software trail steps the locked stop UP (SECURED BE+ and every TRAIL SL step), the native reduce-only SL trigger on Hyperliquid is cancelled and re-placed at the new stop via `_hl_sync_stop()`, so the exchange always holds the latest trailed stop (survives app/server downtime). Longs & shorts.
+- Only fires on discrete lock step-ups (not the continuous callback drift) to avoid spamming the exchange every tick. LIVE Hyperliquid only; no-op in SIM. Stored on `pos['nativeSlPrice']`.
+- Verified: tests/test_trailing_native_sync.py 2/2 + tests/test_hl_tpsl_none.py 4/4 (fully mocked exchange, NO real orders).
+
+## Bug fix (2026-06) — BIGTIME live: duplicate SLs + NoneType fill (cancel-replace)
+- Report + screenshot: BIGTIME-USDC short had 5 stacked native SL triggers on Hyperliquid, plus a "native TP/SL failed (NoneType and float)" log.
+- Root causes:
+  1. Duplicate SLs: `_hl_cancel_coin` used `info.open_orders()`, which does NOT return untriggered trigger/stop orders — so old SLs were never cancelled and stacked as the short trailed down.
+  2. NoneType fill: fill price could resolve to None/0 in some SDK response shapes and downstream `fill * pct` / trigger math could hit a None.
+- Fixes (verified tests/test_bigtime_fixes.py 3/3 + regression 9/9, fully mocked — NO real orders):
+  - `_hl_cancel_coin` now queries `frontend_open_orders()` (includes trigger orders) with `open_orders()` fallback, dedupes oids, cancels ALL orders for the coin → true CANCEL-REPLACE. Called before every native SL placement (entry + trailing move + sync).
+  - `_hl_market_open` fill price parsed robustly: `filled.avgPx` → `data.fills[0].px` → `data.avgPx` → `all_mids()` fallback → mark; always returns a float, never None/0-as-None.
+  - `_hl_place_tpsl` casts each trigger to float and skips None/≤0 legs (no more `None * float`).
+  - New `POST /api/bot/sync-stops` + BotPanel "Sync native stop" button (`bot-sync-stops`): for each LIVE HL position, cancel-replace to leave exactly ONE native SL at the current stop price. SIM/non-HL = safe no-op.
+- NOTE: the fix prevents future stacking. Already-stacked SLs on the exchange can be cleared by "Close all", by "Sync native stop" (once the bot tracks the position), or manually in the Hyperliquid app.
+
+## Bug fix (2026-06) — BABYUSD: duplicate SLs STILL stacking (bulletproof cancel-replace)
+- Report + screenshot: BABYUSD short had 3 stacked native SLs (0.011705 / 0.011685 / 0.01166) despite the prior frontend_open_orders fix.
+- Deeper root cause: (a) `frontend_open_orders` items can be FLAT or nested under `"order"` depending on SDK route — the coin match only checked the flat `o["coin"]`, so it silently matched nothing; (b) coin case could differ; (c) no deterministic per-order tracking and no post-place verification, so any missed cancel stacked.
+- Bulletproof fix (tests/test_bigtime_fixes.py 5/5 + regression 10/10, fully mocked — NO real orders):
+  - `_hl_place_tpsl` now returns `[{tag,status,oid}]`; the SL `oid` is tracked on the position (`pos['nativeSlOid']`, `pos['nativeSlPrice']`) at entry AND on every trailing move.
+  - New `_hl_list_orders(coin)` matches coin CASE-INSENSITIVELY and handles BOTH flat and `{'order':{...}}` shapes; `_hl_cancel_coin` uses it to cancel all resting+trigger orders for the coin.
+  - `_hl_sync_stop` = CANCEL-REPLACE: cancel all stale triggers → place ONE fresh SL → `_hl_dedupe_sl()` verifies only one SL survives (cancels any extra, keeps newest oid).
+  - Logs the requested line: `CANCELED old SL {price} -> PLACED new SL {price} (cancelled N stale, oid=…)`. Works for ALL coins.
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

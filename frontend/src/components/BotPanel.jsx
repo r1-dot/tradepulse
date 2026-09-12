@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import axios from "axios";
-import { X, Power, ShieldAlert, Bot, Trash2, RotateCcw, TriangleAlert } from "lucide-react";
+import { X, Power, ShieldAlert, Bot, Trash2, RotateCcw, TriangleAlert, ShieldCheck } from "lucide-react";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 const BOT_VOL = [0.05, 0.1, 0.3, 0.6, 0.9, 1, 5, 10, 30, 50, 70, 100, 200, 300, 400, 500, 600, 700, 800, 900]; // USD millions
@@ -85,6 +85,12 @@ export default function BotPanel({ open, onClose }) {
 
   const closeAll = async () => { await axios.post(`${API}/bot/close-all`); load(); };
   const resetDaily = async () => { await axios.post(`${API}/bot/reset-daily`); load(); };
+  const syncStops = async () => {
+    const r = await axios.post(`${API}/bot/sync-stops`);
+    const d = r.data || {};
+    window.alert(`Synced native stops on ${d.synced ?? 0} position(s)` + ((d.skipped ?? 0) ? ` · skipped ${d.skipped}` : "") + ((d.config && (d.config.dryRun || d.config.exchange !== "hyperliquid")) ? " (bot is in SIM / not on Hyperliquid — no exchange orders placed)" : ""));
+    load();
+  };
 
   if (!open) return null;
   const running = st?.config?.enabled;
@@ -409,9 +415,14 @@ export default function BotPanel({ open, onClose }) {
                 <div className="mb-2 flex items-center justify-between">
                   <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Open positions</span>
                   {st.openPositions.length > 0 && (
-                    <button data-testid="bot-close-all" onClick={closeAll} className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[10px] text-[#FF3B30] hover:border-[#FF3B30]">
-                      <Trash2 size={11} /> Close all
-                    </button>
+                    <div className="flex items-center gap-1.5">
+                      <button data-testid="bot-sync-stops" onClick={syncStops} title="Cancel stale native stops and place exactly one SL per position on Hyperliquid at its current stop price" className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[10px] text-[#7C3AED] hover:border-[#7C3AED]">
+                        <ShieldCheck size={11} /> Sync native stop
+                      </button>
+                      <button data-testid="bot-close-all" onClick={closeAll} className="mono flex items-center gap-1 border border-zinc-200 px-2 py-1 text-[10px] text-[#FF3B30] hover:border-[#FF3B30]">
+                        <Trash2 size={11} /> Close all
+                      </button>
+                    </div>
                   )}
                 </div>
                 {st.openPositions.length === 0 ? (

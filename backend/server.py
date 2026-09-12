@@ -267,9 +267,20 @@ async def _hl_market_open(coin, size, is_buy=True, leverage=None, is_cross=True,
     res = await asyncio.to_thread(ex.market_open, coin, is_buy, size, None, slippage)
     if res.get("status") != "ok":
         raise RuntimeError(str(res)[:200])
-    fills = res["response"]["data"]["statuses"]
-    filled = next((s["filled"] for s in fills if "filled" in s), None)
-    fill_px = float(filled["avgPx"]) if (filled and filled.get("avgPx")) else 0.0
+    data = res.get("response", {}).get("data", {}) or {}
+    statuses = data.get("statuses", []) or []
+    filled = next((s["filled"] for s in statuses if isinstance(s, dict) and "filled" in s), None)
+    # fill price can arrive as filled.avgPx, data.fills[0].px, or data.avgPx depending on SDK/route
+    px = None
+    if filled:
+        px = filled.get("avgPx") or filled.get("px")
+    if px in (None, ""):
+        fills = data.get("fills") or []
+        if fills and isinstance(fills[0], dict):
+            px = fills[0].get("px") or fills[0].get("avgPx")
+    if px in (None, ""):
+        px = data.get("avgPx")
+    fill_px = float(px) if px not in (None, "") else 0.0
     if not fill_px:
         # fallback: read the current mid price from Hyperliquid so we never store a 0/None fill
         try:
@@ -277,8 +288,9 @@ async def _hl_market_open(coin, size, is_buy=True, leverage=None, is_cross=True,
             fill_px = float(mids.get(coin) or 0.0)
         except Exception:  # noqa: BLE001
             fill_px = 0.0
-    return {"fillPrice": fill_px,
-            "executedQty": float(filled["totalSz"]) if (filled and filled.get("totalSz")) else size}
+    exec_sz = filled.get("totalSz") if filled else None
+    exec_sz = float(exec_sz) if exec_sz not in (None, "") else float(size)
+    return {"fillPrice": fill_px, "executedQty": exec_sz}
 
 
 async def _hl_market_close(base_coin):
@@ -294,7 +306,8 @@ async def _hl_market_close(base_coin):
 async def _hl_place_tpsl(coin, is_long, sz, tp_px, sl_px):
     """Place reduce-only TP + SL trigger orders on Hyperliquid so the EXCHANGE closes the
     position when target/stop is hit (survives server downtime, executes instantly).
-    Either leg may be None (e.g. trailing positions have no fixed TP) — skip those."""
+    Either leg may be None (e.g. trailing positions have no fixed TP) — skip those.
+    Returns [{"tag","status","oid"}] so callers can track/cancel the exact order."""
     def _place():
         ex = _get_hl_exchange()
         close_is_buy = not is_long  # close a LONG -> sell; close a SHORT -> buy
@@ -302,36 +315,137 @@ async def _hl_place_tpsl(coin, is_long, sz, tp_px, sl_px):
         for tag, trig in (("tp", tp_px), ("sl", sl_px)):
             if trig is None:
                 continue  # no fixed level for this leg (trailing manages it in software)
-            trig_r = hlconv.round_price(coin, trig) or trig
+            try:
+                trig_f = float(trig)
+            except (TypeError, ValueError):
+                continue
+            if trig_f <= 0:
+                continue
+            trig_r = hlconv.round_price(coin, trig_f) or trig_f
             lim = trig_r * (1.08 if close_is_buy else 0.92)  # aggressive limit so market trigger fills
             lim_r = hlconv.round_price(coin, lim) or trig_r
             ot = {"trigger": {"triggerPx": trig_r, "isMarket": True, "tpsl": tag}}
             try:
                 r = ex.order(coin, close_is_buy, sz, lim_r, ot, reduce_only=True)
-                out.append((tag, r.get("status") if isinstance(r, dict) else "ok"))
+                out.append({"tag": tag, "status": r.get("status") if isinstance(r, dict) else "ok",
+                            "oid": _extract_oid(r)})
             except Exception as e:  # noqa: BLE001
-                out.append((tag, f"err:{str(e)[:80]}"))
+                out.append({"tag": tag, "status": f"err:{str(e)[:80]}", "oid": None})
         return out
     return await asyncio.to_thread(_place)
 
 
+def _extract_oid(r):
+    """Pull the order id out of a Hyperliquid order response (resting or filled)."""
+    try:
+        st = r["response"]["data"]["statuses"][0]
+        if isinstance(st, dict):
+            return (st.get("resting") or st.get("filled") or {}).get("oid")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _order_coin(o):
+    return (o.get("coin") or (o.get("order") or {}).get("coin") or "")
+
+
+def _order_oid(o):
+    return o.get("oid") if o.get("oid") is not None else (o.get("order") or {}).get("oid")
+
+
+def _hl_list_orders(coin):
+    """Return raw open orders (resting + trigger) for a coin, matching case-insensitively and
+    handling both the flat and {'order': {...}} response shapes across SDK routes."""
+    addr = os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "") or os.environ.get("HYPERLIQUID_MAIN_WALLET", "")
+    orders = []
+    for getter in ("frontend_open_orders", "open_orders"):
+        try:
+            fn = getattr(_HL["info"], getter, None)
+            if not fn:
+                continue
+            got = fn(addr) or []
+            if got:
+                orders = got
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    cu = str(coin).upper()
+    return [o for o in orders if str(_order_coin(o)).upper() == cu]
+
+
+async def _hl_sync_stop(pos, sym, stop_price):
+    """CANCEL-REPLACE the native reduce-only SL on Hyperliquid so the exchange always holds
+    exactly ONE stop at the latest trailed price. Cancels the tracked SL by oid, sweeps any
+    stragglers for the coin, places one fresh SL, then verifies only one remains."""
+    cfg = BOT["config"]
+    if cfg["dryRun"] or pos.get("dryRun") or cfg.get("exchange") != "hyperliquid" or not cfg.get("hlNativeTpsl", True):
+        return
+    hl_coin = hlconv.convert_binance_to_hyperliquid(pos["base"])
+    if not hl_coin:
+        return
+    is_long = pos.get("side", "long") == "long"
+    sz = hlconv.round_size(hl_coin, pos["qty"]) or pos["qty"]
+    old_px = pos.get("nativeSlPrice")
+    try:
+        await _ensure_hl_ready()
+        cancelled = await _hl_cancel_coin(hl_coin)  # kill ALL existing SL/TP triggers for this coin
+        res = await _hl_place_tpsl(hl_coin, is_long, sz, tp_px=None, sl_px=stop_price)
+        new_oid = next((r.get("oid") for r in res if r.get("tag") == "sl"), None)
+        # verify: ensure exactly ONE SL trigger survives (cancel any extra, keep the newest)
+        removed = await _hl_dedupe_sl(hl_coin, new_oid)
+        pos["nativeSlPrice"] = stop_price
+        pos["nativeSlOid"] = new_oid
+        _op = f"{old_px:.6g}" if isinstance(old_px, (int, float)) else "none"
+        jlog("tpsl", symbol=hl_coin, base=pos["base"], sl=stop_price, live=True,
+             message=f"CANCELED old SL {_op} -> PLACED new SL {stop_price:.6g} (cancelled {cancelled + removed} stale, oid={new_oid})")
+    except Exception as ex:  # noqa: BLE001
+        jlog("warn", symbol=hl_coin, base=pos["base"], live=True,
+             message=f"native SL move failed ({str(ex)[:100]}) — software monitor still active")
+
+
+async def _hl_dedupe_sl(coin, keep_oid):
+    """Safety net: cancel every SL trigger for `coin` except `keep_oid`, so only one stop ever
+    rests on the exchange. Returns the number cancelled."""
+    def _dd():
+        ex = _get_hl_exchange()
+        removed = 0
+        for o in _hl_list_orders(coin):
+            oid = _order_oid(o)
+            is_trig = o.get("isTrigger") or (o.get("order") or {}).get("isTrigger") or o.get("triggerPx") or o.get("orderType")
+            if oid is None or oid == keep_oid or not is_trig:
+                continue
+            try:
+                ex.cancel(coin, oid)
+                removed += 1
+            except Exception:  # noqa: BLE001
+                pass
+        return removed
+    try:
+        return await asyncio.to_thread(_dd)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+
 async def _hl_cancel_coin(coin):
-    """Cancel all resting orders for a coin (clears orphaned TP/SL triggers). Best-effort."""
+    """Cancel ALL resting + trigger (TP/SL) orders for a coin. Trigger orders do NOT show up
+    in open_orders — they only appear in frontend_open_orders — and item shape can be flat or
+    nested under 'order', so we handle both (prevents duplicate SLs stacking up). Best-effort."""
     def _cxl():
         ex = _get_hl_exchange()
-        addr = os.environ.get("HYPERLIQUID_ACCOUNT_ADDRESS", "")
-        try:
-            oo = _HL["info"].open_orders(addr) or []
-        except Exception:  # noqa: BLE001
-            return 0
         n = 0
-        for o in oo:
-            if o.get("coin") == coin:
-                try:
-                    ex.cancel(coin, o["oid"])
-                    n += 1
-                except Exception:  # noqa: BLE001
-                    pass
+        seen = set()
+        for o in _hl_list_orders(coin):
+            oid = _order_oid(o)
+            if oid is None or oid in seen:
+                continue
+            seen.add(oid)
+            try:
+                ex.cancel(coin, oid)
+                n += 1
+            except Exception:  # noqa: BLE001
+                pass
         return n
     try:
         return await asyncio.to_thread(_cxl)
@@ -416,6 +530,9 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
             try:
                 await _hl_cancel_coin(hl_coin)  # clear any stale triggers first
                 res = await _hl_place_tpsl(hl_coin, is_long, hlconv.round_size(hl_coin, executed) or executed, tp_price, sl_price)
+                pos["nativeSlOid"] = next((r.get("oid") for r in res if r.get("tag") == "sl"), None)
+                if sl_price is not None:
+                    pos["nativeSlPrice"] = sl_price
                 _tp_s = f"{tp_price:.6g}" if tp_price is not None else "trail"
                 _sl_s = f"{sl_price:.6g}" if sl_price is not None else "—"
                 jlog("tpsl", symbol=hl_coin, base=base, tp=tp_price, sl=sl_price,
@@ -579,10 +696,12 @@ async def _update_trailing(http, sym, pos, price):
     base_sl_off = pos.get("slOffPct")  # locked SL offset in % from entry (None until secured)
 
     new_off = hybrid.trail_stop_offset(peak, secure, be, step)
+    stepped = False
     if new_off is not None and (base_sl_off is None or new_off > base_sl_off + 1e-9):
         first = base_sl_off is None
         pos["slOffPct"] = new_off
         base_sl_off = new_off
+        stepped = True
         if first:
             jlog("trail", symbol=sym, base=pos["base"],
                  message=f"{pos['base']} +{peak:.2f}% -> SECURED BE+{be:.2f}%")
@@ -601,6 +720,9 @@ async def _update_trailing(http, sym, pos, price):
         if hit:
             await _close_position(http, sym, price, f"trail-exit +{peak:.2f}%")
             return
+        # mirror the locked stop onto the exchange whenever it steps up (LIVE HL only)
+        if stepped:
+            await _hl_sync_stop(pos, sym, stop)
     else:
         # not yet secured -> initial tight stop
         stop = pos["slPrice"]
@@ -1248,6 +1370,33 @@ async def bot_close_all():
     BOT["straddles"].clear()
     jlog("kill_switch", message=f"Manually closed {closed} position(s) · cancelled {straddle_n} straddle(s)")
     return _bot_status()
+
+
+@api_router.post("/bot/sync-stops")
+async def bot_sync_stops():
+    """Re-arm exchange-side protection: for every LIVE Hyperliquid position, cancel any
+    stale native stops and place a single fresh reduce-only SL trigger at the position's
+    current stop price. Guarantees exactly one native SL per open position."""
+    cfg = BOT["config"]
+    synced, skipped = 0, 0
+    if cfg["dryRun"] or cfg.get("exchange") != "hyperliquid":
+        jlog("kill_switch", message="Sync stops skipped — bot is in SIM or not on Hyperliquid")
+        return {**_bot_status(), "synced": 0, "skipped": 0}
+    for sym in list(BOT["positions"].keys()):
+        pos = BOT["positions"][sym]
+        if pos.get("dryRun"):
+            skipped += 1
+            continue
+        stop = pos.get("slPrice")
+        if not stop or stop <= 0:
+            skipped += 1
+            continue
+        # _hl_sync_stop cancels stale triggers (cancel-replace) then places one SL at `stop`
+        await _hl_sync_stop(pos, sym, stop)
+        synced += 1
+    jlog("kill_switch", message=f"Synced native stops on {synced} position(s) · skipped {skipped}", live=True)
+    return {**_bot_status(), "synced": synced, "skipped": skipped}
+
 
 
 @api_router.post("/bot/reset-daily")
