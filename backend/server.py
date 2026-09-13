@@ -128,6 +128,7 @@ BOT_DEFAULTS = {
     "hlReconcile": True,       # periodically reconcile bot state vs the exchange (detect/fix desync)
     "hlReconcileSec": 10,      # reconcile cadence in seconds
     "hlFastMonitorMs": 500,    # while a live position is open, poll exchange this often (ms)
+    "hlStopSyncPct": 0.05,     # re-sync native SL when the trailing stop moves this % (of entry)
     # --- HYBRID POWER SYSTEM (short-window power/flow signal engine, Isolated 3x)
     "hybrid_toggle": True,
     "sl_percent": 0.8,
@@ -678,20 +679,76 @@ async def _reconcile_flat(ex_map, now, fast=False):
     return n
 
 
+_HLWS = {"info": None, "subscribed": False, "addr": None}
+APP_STATE = {}  # holds the running event loop for thread-safe wakeups from the ws thread
+
+
+def _hl_ws_callback(_msg):
+    """Runs on the SDK's websocket thread. Just wake the async monitor so it queries the
+    authoritative position state on the loop (avoids mutating BOT state off-thread)."""
+    try:
+        loop = APP_STATE.get("loop")
+        ev = BOT.get("fillEvent")
+        if loop and ev:
+            loop.call_soon_threadsafe(ev.set)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _ensure_hl_ws():
+    """Subscribe to the userFills websocket once (per address) so exchange fills are PUSHED
+    to us instantly. The 500ms poller remains a fallback if the socket drops."""
+    addr = _hl_addr()
+    if not addr:
+        return
+    if _HLWS["subscribed"] and _HLWS["addr"] == addr:
+        return
+
+    def _sub():
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+        net = "testnet" if BOT["config"].get("hlTestnet") else "mainnet"
+        base = constants.TESTNET_API_URL if net == "testnet" else constants.MAINNET_API_URL
+        info = Info(base, skip_ws=False)
+        info.subscribe({"type": "userFills", "user": addr}, _hl_ws_callback)
+        return info
+    try:
+        _HLWS["info"] = await asyncio.to_thread(_sub)
+        _HLWS["subscribed"] = True
+        _HLWS["addr"] = addr
+        jlog("info", live=True, message="Hyperliquid userFills websocket connected — instant close detection ON")
+    except Exception as e:  # noqa: BLE001
+        logger.error("hl ws subscribe failed: %s", e)
+
+
 async def fast_position_monitor():
-    """Poll Hyperliquid positions every ~500ms WHILE a live position is open so exchange-side
-    closes (native SL/TP fills) are reconciled almost instantly — shrinks the desync window."""
+    """Reconcile exchange-side closes with near-zero latency: a userFills websocket push wakes
+    this loop instantly; otherwise it polls every hlFastMonitorMs (default 500ms) as a fallback.
+    Active only while a LIVE Hyperliquid position is open."""
     while True:
         cfg = BOT["config"]
         try:
+            live_hl = not cfg["dryRun"] and cfg.get("exchange") == "hyperliquid" and cfg.get("hlReconcile", True)
             has_live = any(not p.get("dryRun") for p in BOT["positions"].values())
-            if not cfg["dryRun"] and cfg.get("exchange") == "hyperliquid" and cfg.get("hlReconcile", True) and has_live:
+            if live_hl:
                 await _ensure_hl_ready()
+                await _ensure_hl_ws()  # subscribe once so fills are pushed
+            if live_hl and has_live:
                 ex_map = await _hl_positions_map()
                 if ex_map is not None:
                     BOT["exPositions"] = ex_map
                     await _reconcile_flat(ex_map, time.time(), fast=True)
-                await asyncio.sleep(max(0.2, cfg.get("hlFastMonitorMs", 500) / 1000.0))
+                # wait for a PUSHED fill (instant) or fall back to the poll interval
+                ev = BOT.get("fillEvent")
+                timeout = max(0.2, cfg.get("hlFastMonitorMs", 500) / 1000.0)
+                if ev is not None:
+                    try:
+                        await asyncio.wait_for(ev.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        pass
+                    ev.clear()
+                else:
+                    await asyncio.sleep(timeout)
             else:
                 await asyncio.sleep(2.0)
         except Exception as e:  # noqa: BLE001
@@ -884,8 +941,17 @@ async def _update_trailing(http, sym, pos, price):
         if hit:
             await _close_position(http, sym, price, f"trail-exit +{peak:.2f}%")
             return
-        # mirror the locked stop onto the exchange whenever it steps up (LIVE HL only)
-        if stepped:
+        # keep the EXCHANGE native SL in lockstep with the software trailing stop (LIVE HL):
+        # sync on every discrete step-up AND whenever the stop drifts favorably past a small
+        # threshold (the callback-based stop tightens continuously between step-ups).
+        last_native = pos.get("nativeSlPrice")
+        should_sync = stepped
+        if not should_sync and last_native is not None:
+            favorable = (stop > last_native) if long else (stop < last_native)
+            moved_pct = abs(stop - last_native) / e * 100.0
+            if favorable and moved_pct >= cfg.get("hlStopSyncPct", 0.05):
+                should_sync = True
+        if should_sync:
             await _hl_sync_stop(pos, sym, stop)
     else:
         # not yet secured -> initial tight stop
@@ -1386,6 +1452,7 @@ class BotConfigUpdate(BaseModel):
     hlReconcile: Optional[bool] = None
     hlReconcileSec: Optional[int] = None
     hlFastMonitorMs: Optional[int] = None
+    hlStopSyncPct: Optional[float] = None
     hlSlippagePct: Optional[float] = None
     hybrid_toggle: Optional[bool] = None
     sl_percent: Optional[float] = None
@@ -1504,6 +1571,8 @@ async def bot_config(update: BotConfigUpdate):
         data["hlReconcileSec"] = max(5, min(300, int(data["hlReconcileSec"])))
     if "hlFastMonitorMs" in data:
         data["hlFastMonitorMs"] = max(200, min(5000, int(data["hlFastMonitorMs"])))
+    if "hlStopSyncPct" in data:
+        data["hlStopSyncPct"] = max(0.01, min(2.0, float(data["hlStopSyncPct"])))
     for k, lo, hi in (("sl_percent", 0.3, 1.5), ("tp_percent", 0.8, 4.0),
                       ("min_power_1m", 0.4, 1.0), ("max_power_1m", 1.2, 2.5),
                       ("burst_power", 0.03, 0.15)):
@@ -1824,6 +1893,8 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     app.state.http = httpx.AsyncClient(headers={"User-Agent": "token-scanner/1.0"})
+    APP_STATE["loop"] = asyncio.get_running_loop()
+    BOT["fillEvent"] = asyncio.Event()  # set by the userFills ws thread to wake the monitor
     try:
         await load_bot_config()
     except Exception as e:  # noqa: BLE001

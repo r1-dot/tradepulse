@@ -32,8 +32,25 @@ def _setup_live(monkeypatch, fake):
     monkeypatch.setattr(server.hlconv, "round_price", lambda c, p: p)
     cfg = server.BOT["config"]
     for k, v in {"dryRun": False, "exchange": "hyperliquid", "hlNativeTpsl": True,
-                 "trailSecure": 0.40, "trailBE": 0.05, "trailStep": 0.5, "trailCallback": 0.30}.items():
+                 "trailSecure": 0.40, "trailBE": 0.05, "trailStep": 0.5, "trailCallback": 0.30,
+                 "hlStopSyncPct": 0.05}.items():
         cfg[k] = v
+
+
+def test_native_sl_resynced_on_callback_drift(monkeypatch):
+    """The reported LIVE bug: between discrete step-ups the callback tightens the software stop
+    but the native SL stayed put and drifted. Now a favorable move past hlStopSyncPct re-syncs it."""
+    fake = FakeExchange()
+    _setup_live(monkeypatch, fake)
+    # already secured at BE (slOffPct=0.05) with a native SL placed at the peak-0.45 stop
+    pos = {"symbol": "BTCUSDT", "base": "BTC", "side": "long", "entryPrice": 100.0, "qty": 1.0,
+           "tpPrice": None, "slPrice": 100.0988, "source": "straddle", "dryRun": False,
+           "peakPct": 0.40, "slOffPct": 0.05, "nativeSlPrice": 100.0988}
+    # price ticks up to peak +0.50% -> lock offset stays 0.05 (NO step) but callback stop rises
+    asyncio.run(server._update_trailing(None, "BTCUSDT", pos, 100.5))
+    sl_orders = [o for o in fake.orders if o["ot"]["trigger"]["tpsl"] == "sl"]
+    assert len(sl_orders) == 1, f"native SL should be re-synced on drift, got {fake.orders}"
+    assert pos["nativeSlPrice"] > 100.0988, "native SL must move up to match the software stop"
 
 
 def test_native_sl_synced_on_step_up(monkeypatch):

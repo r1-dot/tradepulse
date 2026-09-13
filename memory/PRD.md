@@ -162,6 +162,15 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
   - Config keys: `hlFastMonitorMs`; task started/stopped in app lifespan.
 - Verified: tests/test_desync_reconcile.py (grace-period + fast-reconcile cases) 8/8 + full mocked regression 17/17.
 
+## Fix + Enhancement (2026-06) — native SL drift fix + userFills WebSocket (instant closes)
+- Reported LIVE bug: Smart Trailing worked, but the NATIVE SL on Hyperliquid drifted away from the software trailing stop. Cause: `_hl_sync_stop` only fired on discrete lock STEP-UPS, while the callback-based stop tightens CONTINUOUSLY between steps.
+  - Fix: `_update_trailing` now re-syncs the native SL whenever the effective stop moves FAVORABLY past `hlStopSyncPct` (default 0.05% of entry), in addition to every step-up. Never loosens (long: only up; short: only down). Throttled by the threshold to avoid API spam. Config `hlStopSyncPct` (0.01–2.0).
+- Enhancement (userFills WebSocket, push + poll fallback):
+  - New `_ensure_hl_ws()` opens a dedicated `Info(skip_ws=False)` and subscribes `{"type":"userFills","user":addr}`. The ws-thread callback does `loop.call_soon_threadsafe(fillEvent.set)` — no off-thread state mutation.
+  - `fast_position_monitor` is now EVENT-DRIVEN: `await asyncio.wait_for(fillEvent.wait(), timeout=hlFastMonitorMs)`. A pushed fill wakes it instantly (~0 latency); otherwise it polls every 500ms as fallback. On wake it queries authoritative `user_state` and runs `_reconcile_flat`.
+  - Startup sets `APP_STATE["loop"]` + `BOT["fillEvent"]`; ws subscribes lazily once live HL is active. Active only in LIVE HL mode (no-op in SIM).
+- Verified: tests/test_trailing_native_sync.py (added callback-drift resync case) + full mocked regression 18/18. Backend healthy. NO real orders placed (bot stays DISABLED/SIM per user).
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections
