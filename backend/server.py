@@ -127,6 +127,7 @@ BOT_DEFAULTS = {
     "hlSlippagePct": 0.0001,   # extra % added to the signal price for instant marketable fill
     "hlReconcile": True,       # periodically reconcile bot state vs the exchange (detect/fix desync)
     "hlReconcileSec": 10,      # reconcile cadence in seconds
+    "hlFastMonitorMs": 500,    # while a live position is open, poll exchange this often (ms)
     # --- HYBRID POWER SYSTEM (short-window power/flow signal engine, Isolated 3x)
     "hybrid_toggle": True,
     "sl_percent": 0.8,
@@ -645,6 +646,59 @@ async def _close_position(http, sym, price, reason):
         await save_bot_config()
 
 
+async def _reconcile_flat(ex_map, now, fast=False):
+    """Book exits for LIVE positions the bot still tracks but that are already flat on the
+    exchange (a native SL/TP fired, or manual close). A short grace period after entry avoids
+    a false 'flat' from exchange propagation lag. Returns the number reconciled."""
+    n = 0
+    for sym, pos in list(BOT["positions"].items()):
+        if pos.get("dryRun"):
+            continue
+        # grace: a freshly-opened position may not appear in user_state for a moment
+        if now - pos.get("openedTs", 0) < 3.0:
+            continue
+        hc = (hlconv.convert_binance_to_hyperliquid(pos["base"]) or pos["base"]).upper()
+        if hc in ex_map:
+            continue
+        fill = pos.get("nativeSlPrice") or pos.get("slPrice") or pos["entryPrice"]
+        v = STATE["latest"].get(sym)
+        if v:
+            fill = v["price"]
+        pnl = (fill - pos["entryPrice"]) * pos["qty"] * (1 if pos.get("side", "long") == "long" else -1)
+        BOT["positions"].pop(sym, None)
+        BOT["dailyPnl"] += pnl
+        BOT["lastTradeTs"][sym] = now
+        BOT["closeIntents"].pop(hc, None)
+        await _hl_cancel_coin(hc)  # clear any orphan triggers left behind
+        jlog("exit", symbol=sym, base=pos["base"], live=True, pnl=pnl,
+             side="sell" if pos.get("side", "long") == "long" else "cover", price=fill,
+             entry=pos["entryPrice"], qty=pos["qty"], reason="exchange-close", mode="LIVE",
+             message=f"{hc} closed on exchange (native SL/TP fired) — reconciled exit @ {fill:.6g} (pnl {pnl:+.4f})")
+        n += 1
+    return n
+
+
+async def fast_position_monitor():
+    """Poll Hyperliquid positions every ~500ms WHILE a live position is open so exchange-side
+    closes (native SL/TP fills) are reconciled almost instantly — shrinks the desync window."""
+    while True:
+        cfg = BOT["config"]
+        try:
+            has_live = any(not p.get("dryRun") for p in BOT["positions"].values())
+            if not cfg["dryRun"] and cfg.get("exchange") == "hyperliquid" and cfg.get("hlReconcile", True) and has_live:
+                await _ensure_hl_ready()
+                ex_map = await _hl_positions_map()
+                if ex_map is not None:
+                    BOT["exPositions"] = ex_map
+                    await _reconcile_flat(ex_map, time.time(), fast=True)
+                await asyncio.sleep(max(0.2, cfg.get("hlFastMonitorMs", 500) / 1000.0))
+            else:
+                await asyncio.sleep(2.0)
+        except Exception as e:  # noqa: BLE001
+            logger.error("fast monitor error: %s", e)
+            await asyncio.sleep(2.0)
+
+
 async def reconcile_hl(now):
     """Compare bot's tracked positions against the Hyperliquid account (source of truth) and
     fix any DESYNC: (a) bot thinks open but exchange is flat -> record the real exit; (b) a
@@ -662,31 +716,16 @@ async def reconcile_hl(now):
         return  # couldn't read exchange; skip this cycle
     BOT["exPositions"] = ex_map  # cache real exchange positions for _bot_status PnL
 
-    # map tracked LIVE positions by their HL coin
+    # (a/b) tracked but flat on exchange -> it closed externally (native SL/TP fired or manual)
+    await _reconcile_flat(ex_map, now)
+
+    # (c) open on exchange but NOT tracked -> adopt so the bot manages/closes it
     tracked = {}
     for sym, pos in list(BOT["positions"].items()):
         if pos.get("dryRun"):
             continue
         hc = (hlconv.convert_binance_to_hyperliquid(pos["base"]) or pos["base"]).upper()
         tracked[hc] = (sym, pos)
-
-    # (a/b) tracked but flat on exchange -> it closed externally (native SL/TP fired or manual)
-    for hc, (sym, pos) in list(tracked.items()):
-        if hc not in ex_map:
-            fill = pos.get("nativeSlPrice") or pos.get("slPrice") or pos["entryPrice"]
-            v = STATE["latest"].get(sym)
-            if v:
-                fill = v["price"]
-            pnl = (fill - pos["entryPrice"]) * pos["qty"] * (1 if pos.get("side", "long") == "long" else -1)
-            BOT["positions"].pop(sym, None)
-            BOT["dailyPnl"] += pnl
-            BOT["lastTradeTs"][sym] = now
-            BOT["closeIntents"].pop(hc, None)
-            await _hl_cancel_coin(hc)  # clear any orphan triggers left behind
-            jlog("desync", symbol=sym, base=pos["base"], live=True, pnl=pnl,
-                 message=f"DESYNC DETECTED — {hc} flat on exchange but tracked as open; reconciled exit @ {fill:.6g} (pnl {pnl:+.4f})")
-
-    # (c) open on exchange but NOT tracked -> adopt so the bot manages/closes it
     for hc, info in ex_map.items():
         if hc in tracked:
             continue
@@ -1346,6 +1385,7 @@ class BotConfigUpdate(BaseModel):
     hlNativeTpsl: Optional[bool] = None
     hlReconcile: Optional[bool] = None
     hlReconcileSec: Optional[int] = None
+    hlFastMonitorMs: Optional[int] = None
     hlSlippagePct: Optional[float] = None
     hybrid_toggle: Optional[bool] = None
     sl_percent: Optional[float] = None
@@ -1462,6 +1502,8 @@ async def bot_config(update: BotConfigUpdate):
         data["hlSlippagePct"] = max(0.0, min(5.0, float(data["hlSlippagePct"])))
     if "hlReconcileSec" in data:
         data["hlReconcileSec"] = max(5, min(300, int(data["hlReconcileSec"])))
+    if "hlFastMonitorMs" in data:
+        data["hlFastMonitorMs"] = max(200, min(5000, int(data["hlFastMonitorMs"])))
     for k, lo, hi in (("sl_percent", 0.3, 1.5), ("tp_percent", 0.8, 4.0),
                       ("min_power_1m", 0.4, 1.0), ("max_power_1m", 1.2, 2.5),
                       ("burst_power", 0.03, 0.15)):
@@ -1787,14 +1829,16 @@ async def startup():
     except Exception as e:  # noqa: BLE001
         logger.error("bot config load failed: %s", e)
     app.state.poller = asyncio.create_task(poll_binance(app.state.http))
+    app.state.monitor = asyncio.create_task(fast_position_monitor())
     logger.info("scanner started, source=%s quote=%s", BINANCE_BASE, QUOTE)
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    task = getattr(app.state, "poller", None)
-    if task:
-        task.cancel()
+    for name in ("poller", "monitor"):
+        task = getattr(app.state, name, None)
+        if task:
+            task.cancel()
     http = getattr(app.state, "http", None)
     if http:
         await http.aclose()

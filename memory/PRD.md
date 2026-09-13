@@ -153,6 +153,15 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
   - New `reconcile_hl()` runs every `hlReconcileSec` (default 10s, LIVE HL only): compares bot vs exchange (`user_state`) and logs `DESYNC DETECTED` while fixing — tracked-but-flat → reconciled exit; untracked-open → adopted into tracking (Smart Trailing manages); orphan triggers on flat coins → cancelled. Config: `hlReconcile` / `hlReconcileSec`.
   - Real exchange PnL: `_bot_status` now exposes per-position `exUPnl` + top-level `exchangeUnrealizedPnl` from `user_state`; BotPanel shows exchange PnL (with paper PnL secondary) and an "Unrealized (exch)" stat.
 
+## Enhancement (2026-06) — Faster desync detection (500ms position monitor)
+- Report: occasional "DESYNC DETECTED" when a native SL/TP fires on Hyperliquid but the bot only noticed at the next 10s reconcile (trade still profited).
+- Changes:
+  - New `fast_position_monitor()` background task: while ANY live HL position is open it polls `user_state` every `hlFastMonitorMs` (default 500ms, clamp 200-5000) and reconciles exchange-side closes near-instantly — shrinks the desync window from ~10s to ~0.5s. Idle-sleeps 2s when no live position.
+  - Refactored the "tracked-but-flat" logic into shared `_reconcile_flat()` (used by both the fast monitor and the slow `reconcile_hl`), with a 3s entry GRACE period so a freshly-opened position isn't falsely reconciled due to exchange propagation lag.
+  - Re-classified a clean exchange close from an alarming `DESYNC DETECTED` error into a normal `exit` log: "{coin} closed on exchange (native SL/TP fired) — reconciled exit @ px (pnl …)". True mismatches (untracked-open adoption, failed close retries) still log clearly.
+  - Config keys: `hlFastMonitorMs`; task started/stopped in app lifespan.
+- Verified: tests/test_desync_reconcile.py (grace-period + fast-reconcile cases) 8/8 + full mocked regression 17/17.
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

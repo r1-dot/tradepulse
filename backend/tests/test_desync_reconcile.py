@@ -112,8 +112,32 @@ def test_reconcile_tracked_but_flat_books_exit(monkeypatch):
     server.BOT["positions"]["METUSDT"] = pos
     asyncio.run(server.reconcile_hl(1000.0))
     assert "METUSDT" not in server.BOT["positions"], "flat-on-exchange position must be reconciled out"
-    kinds = [j.get("kind") for j in list(server.BOT["journal"])[:5]]
-    assert "desync" in kinds
+    j = list(server.BOT["journal"])[:5]
+    assert any(e.get("kind") == "exit" and e.get("reason") == "exchange-close" for e in j)
+
+
+def test_reconcile_grace_period_skips_fresh_position(monkeypatch):
+    hl = HL(positions={})  # exchange flat (position not yet propagated)
+    _wire(monkeypatch, hl)
+    now = 1000.0
+    pos = {"symbol": "METUSDT", "base": "MET", "side": "short", "entryPrice": 0.2379,
+           "qty": 42.0, "quoteSpent": 10.0, "tpPrice": None, "slPrice": 0.238, "dryRun": False,
+           "openedTs": now - 1.0, "source": "straddle"}  # opened 1s ago -> within 3s grace
+    server.BOT["positions"]["METUSDT"] = pos
+    asyncio.run(server._reconcile_flat(hl and {}, now))
+    assert "METUSDT" in server.BOT["positions"], "must NOT reconcile a position still within entry grace"
+
+
+def test_fast_reconcile_flat_books_exit(monkeypatch):
+    hl = HL(positions={})
+    _wire(monkeypatch, hl)
+    now = 1000.0
+    pos = {"symbol": "ETHFIUSDT", "base": "ETHFI", "side": "long", "entryPrice": 0.7695,
+           "qty": 10.0, "quoteSpent": 7.7, "tpPrice": None, "slPrice": 0.766, "dryRun": False,
+           "openedTs": now - 30.0, "source": "hybrid", "nativeSlPrice": 0.7731}
+    server.BOT["positions"]["ETHFIUSDT"] = pos
+    n = asyncio.run(server._reconcile_flat({}, now, fast=True))
+    assert n == 1 and "ETHFIUSDT" not in server.BOT["positions"]
 
 
 def test_reconcile_untracked_open_adopts(monkeypatch):
