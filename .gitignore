@@ -52,6 +52,12 @@ __pycache__/
 venv/
 .venv/
 
+# Secrets — never commit .env (Binance keys, Hyperliquid wallet private key)
+.env
+*.env
+backend/.env
+frontend/.env
+
 # Development tools
 chainlit.md
 .chainlit
