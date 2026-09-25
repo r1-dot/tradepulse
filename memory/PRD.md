@@ -171,6 +171,12 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
   - Startup sets `APP_STATE["loop"]` + `BOT["fillEvent"]`; ws subscribes lazily once live HL is active. Active only in LIVE HL mode (no-op in SIM).
 - Verified: tests/test_trailing_native_sync.py (added callback-drift resync case) + full mocked regression 18/18. Backend healthy. NO real orders placed (bot stays DISABLED/SIM per user).
 
+## Feature (2026-06) — Simulated long+short on Binance + Leverage box in Binance section
+- Turned ON simulated mode with exchange=Binance (dryRun=true, exchange=binance). In SIM, BOTH long and short entries fire on Binance (spot's long-only restriction applies to LIVE Binance only; SIM has no such limit).
+- Leverage now applies to SIMULATED sizing: in `_open_position` dryRun branch, `qty *= max(1, lev)` so the Leverage box scales simulated exposure/PnL for long & short (Binance sim + HL sim). LIVE HL sizing unchanged.
+- Frontend: the Leverage `x` + Cross/Isolated box (previously Hyperliquid-only) now also shows whenever `dryRun` is true (i.e., in the Binance simulated box), with an adaptive hint ("scales simulated position size" for Binance sim vs "clamped to each coin's max" for HL). Shares the same `hlLeverage`/`hlCrossMargin` config.
+- Verified: tests/test_sim_binance_leverage.py 3/3 (long entry, short-allowed, leverage-scales-size). Frontend compiles clean.
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

@@ -185,7 +185,7 @@ export default function BotPanel({ open, onClose }) {
                     HL key: <b className={st.hlKeyConfigured ? "text-[#00A004]" : "text-[#B26A00]"}>{st.hlKeyConfigured ? "configured" : "missing (add HYPERLIQUID_PRIVATE_KEY)"}</b> · {st.hlAddress ? st.hlAddress.slice(0, 10) + "…" : "no address"} · PERPS
                   </div>
                 )}
-                {st.config.exchange === "hyperliquid" && (
+                {(st.config.exchange === "hyperliquid" || st.config.dryRun) && (
                   <div className="flex items-center gap-2" data-testid="bot-hl-leverage-row">
                     <div className="flex items-center gap-1 border border-zinc-200 px-2 py-1">
                       <span className="mono text-[10px] text-zinc-500">Leverage</span>
@@ -206,7 +206,11 @@ export default function BotPanel({ open, onClose }) {
                     >
                       {st.config.hlCrossMargin ? "Cross" : "Isolated"}
                     </button>
-                    <span className="mono text-[9px] leading-tight text-zinc-400">clamped to each coin's max (BTC 40x, ETH 25x…)</span>
+                    <span className="mono text-[9px] leading-tight text-zinc-400">
+                      {st.config.exchange === "hyperliquid"
+                        ? "clamped to each coin's max (BTC 40x, ETH 25x…)"
+                        : "scales simulated position size (long & short)"}
+                    </span>
                   </div>
                 )}
                 {st.config.exchange === "hyperliquid" && (

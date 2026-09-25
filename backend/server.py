@@ -506,6 +506,9 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     # base coin, stripped of USDT/USDC (safe even if sym dropped out of the latest snapshot)
     base = (STATE["latest"].get(sym) or {}).get("base") or hlconv.strip_quote(sym)
     if cfg["dryRun"]:
+        # simulated fill at the live price; leverage scales the simulated exposure (long AND
+        # short) so PnL reflects the chosen leverage — works for Binance sim + Hyperliquid sim.
+        qty = qty * max(1, int(lev or 1))
         fill = price
         executed = qty
     elif cfg.get("exchange") == "hyperliquid":
