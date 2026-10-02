@@ -177,6 +177,18 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Frontend: the Leverage `x` + Cross/Isolated box (previously Hyperliquid-only) now also shows whenever `dryRun` is true (i.e., in the Binance simulated box), with an adaptive hint ("scales simulated position size" for Binance sim vs "clamped to each coin's max" for HL). Shares the same `hlLeverage`/`hlCrossMargin` config.
 - Verified: tests/test_sim_binance_leverage.py 3/3 (long entry, short-allowed, leverage-scales-size). Frontend compiles clean.
 
+## Feature (2026-06) — Binance USD-M Futures (USDT-margined perps) venue
+- New execution venue `binance_futures` alongside spot (`binance`) and `hyperliquid`, reusing BINANCE_API_KEY/SECRET (Futures permission required). Does NOT disrupt spot logic.
+- Integration per verified playbook (raw REST, fapi.binance.com; testnet = testnet.binancefuture.com via `futuresTestnet`):
+  - Signing: `fapi_signed()` — HMAC-SHA256 over exact URL-encoded query, `X-MBX-APIKEY`, timestamp+recvWindow.
+  - `fapi_position_mode()` — reads `/fapi/v1/positionSide/dual` (cached 5min) → one-way (BOTH) vs hedge (LONG/SHORT). Detected, never guessed (req #3).
+  - `_fapi_set_leverage()` (per-symbol, 1–125, default `futuresLeverage`=3), `_fapi_round_qty()` (MARKET_LOT_SIZE stepSize, graceful fallback), `_fapi_market_open()` (long+short), `_fapi_market_close()` (one-way → reduceOnly=true; hedge → opposite side + positionSide leg, NO reduceOnly), `_fapi_positions()`.
+  - Env: `BINANCE_FUTURES_BASE_URL` (default fapi.binance.com). Config: `futuresLeverage`, `futuresTestnet`.
+- Wired into `_open_position`/`_close_position` as a new branch → signals, straddle, hybrid, and the Smart Trailing TP/SL all route through futures automatically, same as spot (req #4).
+- Dry-run (req #5/#6): in SIM, futures long+short simulate with leverage-scaled size; `_fapi_*` is never called. Every futures action logs a `futures` journal line (symbol, side, leverage, size, order result). NO real orders unless dryRun=false.
+- UI: venue selector now SPOT / FUTURES / PERPS; Futures shows a Leverage box (futuresLeverage, 1–125), Testnet toggle, and a status line (key configured, detected position mode, SIM/LIVE). `GET /api/futures/diagnose` reports mode + open positions; `_bot_status` exposes `futuresMode`/`futuresBase`.
+- Verified: tests/test_binance_futures.py 6/6 (signing, mode detect, one-way BOTH open, one-way reduceOnly close, hedge leg close, sim long/short no-real-orders) + full mocked regression 27/27. Live diagnose from this preview returns the expected HTTP 451 geo-block gracefully — futures execute once deployed to the Singapore VPS.
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

@@ -18,6 +18,7 @@ from pydantic import BaseModel
 import os
 import asyncio
 import time
+import math
 import json
 import hmac
 import hashlib
@@ -48,6 +49,8 @@ COINGECKO_API_KEY = os.environ.get('COINGECKO_API_KEY', '')
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '')
 BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 BINANCE_TRADE_BASE_URL = os.environ.get('BINANCE_TRADE_BASE_URL', 'https://api.binance.com')
+BINANCE_FUTURES_BASE_URL = os.environ.get('BINANCE_FUTURES_BASE_URL', 'https://fapi.binance.com')
+BINANCE_FUTURES_TESTNET_URL = 'https://testnet.binancefuture.com'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("scanner")
@@ -111,8 +114,12 @@ BOT_DEFAULTS = {
     "webhookUrl": "https://wtalerts.com/bot/runbot",
     "webhookBuyMsg": "",   # message sent on BUY (paste your WunderTrading bot signal)
     "webhookSellMsg": "",  # message sent on SELL
-    "exchange": "binance", # "binance" | "hyperliquid"
+    "exchange": "binance", # "binance" (spot) | "binance_futures" (USD-M perps) | "hyperliquid"
     "hlTestnet": False,    # Hyperliquid: use testnet
+    # --- BINANCE USD-M FUTURES (USDT-margined perps): reuses BINANCE_API_KEY/SECRET (Futures
+    # permission required). Long+short, per-trade leverage, reduce-only close, mode auto-detect.
+    "futuresLeverage": 3,          # default leverage for futures trades (1-125, per-symbol)
+    "futuresTestnet": False,       # use testnet.binancefuture.com instead of fapi.binance.com
     "maxLossPerTradeUsdt": 0.0002,  # hard cap: auto-close any position at this $ loss
     # --- STRADDLE SYSTEM: on a volume spike, arm a LONG stop above + SHORT stop below.
     # Whichever side price hits first fills; the other is cancelled (OCO breakout).
@@ -221,6 +228,111 @@ async def _live_market(http, symbol, side, quote_qty=None, base_qty=None):
     cq = float(res.get("cummulativeQuoteQty", 0) or 0)
     fill = (cq / executed) if executed else 0.0
     return {"executedQty": executed, "quote": cq, "fillPrice": fill, "orderId": res.get("orderId")}
+
+
+# ----------------------------- Binance USD-M Futures -----------------------------
+_FAPI = {"mode": None, "modeTs": 0.0, "lots": {}, "lotsTs": 0.0}  # cache: position mode + lot sizes
+
+
+def _fapi_base():
+    return BINANCE_FUTURES_TESTNET_URL if BOT["config"].get("futuresTestnet") else BINANCE_FUTURES_BASE_URL
+
+
+async def fapi_signed(http, method, path, params):
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        raise RuntimeError("Binance API key/secret not configured (Futures permission required)")
+    p = {k: (str(v).lower() if isinstance(v, bool) else str(v)) for k, v in params.items() if v is not None}
+    p["timestamp"] = int(time.time() * 1000)
+    p.setdefault("recvWindow", "5000")
+    query = urlencode(p)
+    sig = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"{_fapi_base()}{path}?{query}&signature={sig}"
+    r = await http.request(method, url, headers={"X-MBX-APIKEY": BINANCE_API_KEY}, timeout=15)
+    try:
+        data = r.json()
+    except Exception:  # noqa: BLE001
+        data = {"msg": r.text[:200]}
+    if r.status_code >= 400 or (isinstance(data, dict) and int(data.get("code", 0) or 0) < 0):
+        raise RuntimeError(f"binance-futures {r.status_code}: {str(data)[:200]}")
+    return data
+
+
+async def fapi_position_mode(http, force=False):
+    """True = Hedge mode (positionSide LONG/SHORT), False = One-way (BOTH). Detected, never guessed."""
+    now = time.time()
+    if not force and _FAPI["mode"] is not None and now - _FAPI["modeTs"] < 300:
+        return _FAPI["mode"]
+    res = await fapi_signed(http, "GET", "/fapi/v1/positionSide/dual", {})
+    _FAPI["mode"] = bool(res.get("dualSidePosition"))
+    _FAPI["modeTs"] = now
+    return _FAPI["mode"]
+
+
+async def _fapi_round_qty(http, symbol, qty):
+    """Round quantity down to the symbol's MARKET_LOT_SIZE stepSize (best-effort; falls back to
+    the raw qty if exchangeInfo can't be fetched, e.g. geo-blocked)."""
+    try:
+        now = time.time()
+        if not _FAPI["lots"] or now - _FAPI["lotsTs"] > 3600:
+            info = (await http.get(f"{_fapi_base()}/fapi/v1/exchangeInfo", timeout=15)).json()
+            lots = {}
+            for s in info.get("symbols", []):
+                step = None
+                for f in s.get("filters", []):
+                    if f.get("filterType") in ("MARKET_LOT_SIZE", "LOT_SIZE"):
+                        step = f.get("stepSize")
+                if step:
+                    lots[s["symbol"]] = float(step)
+            if lots:
+                _FAPI["lots"] = lots
+                _FAPI["lotsTs"] = now
+        step = _FAPI["lots"].get(symbol.upper())
+        if step and step > 0:
+            return math.floor(qty / step) * step
+    except Exception:  # noqa: BLE001
+        pass
+    return qty
+
+
+async def _fapi_set_leverage(http, symbol, lev):
+    lev = max(1, min(125, int(lev or 1)))
+    return await fapi_signed(http, "POST", "/fapi/v1/leverage", {"symbol": symbol.upper(), "leverage": lev})
+
+
+async def _fapi_market_open(http, symbol, is_long, qty, lev):
+    hedge = await fapi_position_mode(http)
+    await _fapi_set_leverage(http, symbol, lev)
+    qty = await _fapi_round_qty(http, symbol, qty)
+    params = {"symbol": symbol.upper(), "side": "BUY" if is_long else "SELL", "type": "MARKET",
+              "quantity": qty, "newOrderRespType": "RESULT",
+              "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
+    res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
+    executed = float(res.get("executedQty", 0) or 0) or qty
+    ap = float(res.get("avgPrice", 0) or 0)
+    return {"executedQty": executed, "fillPrice": ap, "orderId": res.get("orderId"), "raw": res}
+
+
+async def _fapi_market_close(http, symbol, is_long, qty):
+    """Close by sending the opposite side. One-way: reduceOnly=true. Hedge: positionSide leg."""
+    hedge = await fapi_position_mode(http)
+    qty = await _fapi_round_qty(http, symbol, qty)
+    params = {"symbol": symbol.upper(), "side": "SELL" if is_long else "BUY", "type": "MARKET",
+              "quantity": qty, "newOrderRespType": "RESULT"}
+    if hedge:
+        params["positionSide"] = "LONG" if is_long else "SHORT"
+    else:
+        params["positionSide"] = "BOTH"
+        params["reduceOnly"] = True
+    res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
+    ap = float(res.get("avgPrice", 0) or 0)
+    return {"fillPrice": ap, "raw": res}
+
+
+async def _fapi_positions(http, symbol=None):
+    p = {"symbol": symbol.upper()} if symbol else {}
+    rows = await fapi_signed(http, "GET", "/fapi/v2/positionRisk", p)
+    return [x for x in rows if float(x.get("positionAmt", 0) or 0) != 0]
+
 
 
 _HL = {"exchange": None, "info": None, "net": None, "agentAddr": None, "mainAddr": None}
@@ -501,7 +613,12 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     is_long = side == "long"
     qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
     order_id = None
-    lev = leverage if leverage is not None else cfg.get("hlLeverage", 1)
+    if leverage is not None:
+        lev = leverage
+    elif cfg.get("exchange") == "binance_futures":
+        lev = cfg.get("futuresLeverage", 3)
+    else:
+        lev = cfg.get("hlLeverage", 1)
     cross = is_cross if is_cross is not None else cfg.get("hlCrossMargin", True)
     # base coin, stripped of USDT/USDC (safe even if sym dropped out of the latest snapshot)
     base = (STATE["latest"].get(sym) or {}).get("base") or hlconv.strip_quote(sym)
@@ -535,10 +652,23 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
             jlog("error", symbol=hl_coin, action="LONG" if is_long else "SHORT",
                  message=f"HL sent coin '{hl_coin}': {str(e)[:180]}", live=True, venue="hyperliquid")
             return
+    elif cfg.get("exchange") == "binance_futures":
+        try:
+            r = await _fapi_market_open(http, sym, is_long, qty, lev)
+            fill = r["fillPrice"] or price
+            executed = r["executedQty"] or qty
+            order_id = r.get("orderId")
+            jlog("futures", symbol=sym, base=base, action="LONG" if is_long else "SHORT", live=True,
+                 venue="binance_futures", leverage=lev, size=executed, price=fill,
+                 message=f"FUTURES OPEN {'LONG' if is_long else 'SHORT'} {sym} {executed} @ {fill:.6g} · {lev}x · order {order_id}")
+        except Exception as e:  # noqa: BLE001
+            jlog("error", symbol=sym, action="LONG" if is_long else "SHORT", live=True, venue="binance_futures",
+                 message=f"FUTURES open failed: {str(e)[:180]}")
+            return
     else:
         if not is_long:
             jlog("error", symbol=sym, action="SHORT",
-                 message="Short entries need Hyperliquid or simulated mode — Binance spot is long-only, short leg skipped.",
+                 message="Short entries need Hyperliquid, Binance Futures, or simulated mode — Binance spot is long-only, short leg skipped.",
                  live=True)
             return
         try:
@@ -627,6 +757,17 @@ async def _close_position(http, sym, price, reason):
                 jlog("error", symbol=sym, base=pos["base"], action="CLOSE", live=True, venue="hyperliquid",
                      message=f"close error ({str(e)[:150]}) — kept in tracking, reconciler will retry")
                 return  # keep position; next tick / reconciler retries (no false exit)
+        elif cfg.get("exchange") == "binance_futures":
+            try:
+                r = await _fapi_market_close(http, sym, pos.get("side", "long") == "long", pos["qty"])
+                fill = r["fillPrice"] or price
+                jlog("futures", symbol=sym, base=pos["base"], action="CLOSE", live=True, venue="binance_futures",
+                     size=pos["qty"], price=fill,
+                     message=f"FUTURES CLOSE {pos.get('side','long').upper()} {sym} {pos['qty']} @ {fill:.6g} (reduce-only) · {reason}")
+            except Exception as e:  # noqa: BLE001
+                jlog("error", symbol=sym, base=pos["base"], action="CLOSE", live=True, venue="binance_futures",
+                     message=f"FUTURES close error ({str(e)[:150]}) — kept in tracking, will retry")
+                return
         else:
             try:
                 r = await _live_market(http, sym, "SELL", base_qty=pos["qty"])
@@ -1444,6 +1585,8 @@ class BotConfigUpdate(BaseModel):
     webhookSellMsg: Optional[str] = None
     exchange: Optional[str] = None
     hlTestnet: Optional[bool] = None
+    futuresLeverage: Optional[int] = None
+    futuresTestnet: Optional[bool] = None
     maxLossPerTradeUsdt: Optional[float] = None
     straddleEnabled: Optional[bool] = None
     straddleEntryPct: Optional[float] = None
@@ -1525,6 +1668,8 @@ def _bot_status():
         "alertsFeeding": alerts_feeding,
         "lastSignalAgo": round(now - BOT["lastSignalTs"], 1) if BOT["lastSignalTs"] else None,
         "active": bool(cfg["enabled"] and not BOT["stopped"] and alerts_feeding),
+        "futuresMode": ("hedge" if _FAPI["mode"] else "one-way") if _FAPI["mode"] is not None else None,
+        "futuresBase": _fapi_base(),
     }
 
 
@@ -1554,7 +1699,7 @@ async def bot_config(update: BotConfigUpdate):
         data["cooldownSec"] = max(0, min(3600, int(data["cooldownSec"])))
     if "minVolumeUsd" in data:
         data["minVolumeUsd"] = max(0.0, float(data["minVolumeUsd"]))
-    if "exchange" in data and data["exchange"] not in ("binance", "hyperliquid"):
+    if "exchange" in data and data["exchange"] not in ("binance", "binance_futures", "hyperliquid"):
         data.pop("exchange")
     if "maxVolumeUsd" in data:
         data["maxVolumeUsd"] = max(0.0, float(data["maxVolumeUsd"]))
@@ -1568,6 +1713,8 @@ async def bot_config(update: BotConfigUpdate):
         data["straddleSlPct"] = max(0.0001, min(5.0, float(data["straddleSlPct"])))
     if "hlLeverage" in data:
         data["hlLeverage"] = max(1, min(50, int(data["hlLeverage"])))
+    if "futuresLeverage" in data:
+        data["futuresLeverage"] = max(1, min(125, int(data["futuresLeverage"])))
     if "hlSlippagePct" in data:
         data["hlSlippagePct"] = max(0.0, min(5.0, float(data["hlSlippagePct"])))
     if "hlReconcileSec" in data:
@@ -1631,6 +1778,29 @@ async def bot_close_all():
     BOT["straddles"].clear()
     jlog("kill_switch", message=f"Manually closed {closed} position(s) · cancelled {straddle_n} straddle(s)")
     return _bot_status()
+
+
+@api_router.get("/futures/diagnose")
+async def futures_diagnose():
+    """Report Binance USD-M Futures connectivity: detected position mode (one-way vs hedge),
+    the base URL in use, and current open futures positions. Read-only — no orders."""
+    out = {"base": _fapi_base(), "testnet": BOT["config"].get("futuresTestnet", False),
+           "keyConfigured": bool(BINANCE_API_KEY and BINANCE_API_SECRET),
+           "defaultLeverage": BOT["config"].get("futuresLeverage", 3)}
+    try:
+        hedge = await fapi_position_mode(app.state.http, force=True)
+        out["positionMode"] = "hedge" if hedge else "one-way"
+        out["hedgeMode"] = hedge
+    except Exception as e:  # noqa: BLE001
+        out["positionMode"] = None
+        out["error"] = str(e)[:200]
+    try:
+        out["openPositions"] = await _fapi_positions(app.state.http)
+    except Exception as e:  # noqa: BLE001
+        out["openPositions"] = []
+        out.setdefault("error", str(e)[:200])
+    return out
+
 
 
 @api_router.post("/bot/sync-stops")

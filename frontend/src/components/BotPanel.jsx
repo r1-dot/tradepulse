@@ -157,16 +157,16 @@ export default function BotPanel({ open, onClose }) {
               <div className="space-y-1.5">
                 <div className="flex items-center gap-2">
                   <div className="flex flex-1 border border-zinc-200" data-testid="bot-exchange">
-                    {["binance", "hyperliquid"].map((x) => (
+                    {[["binance", "SPOT"], ["binance_futures", "FUTURES"], ["hyperliquid", "PERPS"]].map(([x, label], i) => (
                       <button
                         key={x}
                         data-testid={`bot-exchange-${x}`}
                         onClick={() => patch({ exchange: x })}
-                        className={`mono flex-1 py-1.5 text-[11px] font-semibold uppercase transition-colors ${x !== "binance" ? "border-l border-zinc-200" : ""} ${
+                        className={`mono flex-1 py-1.5 text-[11px] font-semibold uppercase transition-colors ${i !== 0 ? "border-l border-zinc-200" : ""} ${
                           st.config.exchange === x ? "bg-zinc-900 text-white" : "text-zinc-500 hover:bg-zinc-50"
                         }`}
                       >
-                        {x}
+                        {label}
                       </button>
                     ))}
                   </div>
@@ -179,13 +179,44 @@ export default function BotPanel({ open, onClose }) {
                       {st.config.hlTestnet ? "Testnet" : "Mainnet"}
                     </button>
                   )}
+                  {st.config.exchange === "binance_futures" && (
+                    <button
+                      data-testid="bot-futures-testnet"
+                      onClick={() => patch({ futuresTestnet: !st.config.futuresTestnet })}
+                      className={`mono border px-2 py-1.5 text-[11px] font-semibold transition-colors ${st.config.futuresTestnet ? "border-[#F5A623] text-[#B26A00]" : "border-zinc-300 text-zinc-600"}`}
+                    >
+                      {st.config.futuresTestnet ? "Testnet" : "Mainnet"}
+                    </button>
+                  )}
                 </div>
                 {st.config.exchange === "hyperliquid" && (
                   <div data-testid="bot-hl-status" className="mono text-[9px] text-zinc-400">
                     HL key: <b className={st.hlKeyConfigured ? "text-[#00A004]" : "text-[#B26A00]"}>{st.hlKeyConfigured ? "configured" : "missing (add HYPERLIQUID_PRIVATE_KEY)"}</b> · {st.hlAddress ? st.hlAddress.slice(0, 10) + "…" : "no address"} · PERPS
                   </div>
                 )}
-                {(st.config.exchange === "hyperliquid" || st.config.dryRun) && (
+                {st.config.exchange === "binance_futures" && (
+                  <div data-testid="bot-futures-status" className="mono text-[9px] text-zinc-400">
+                    USD-M Futures · key <b className={st.keysConfigured ? "text-[#00A004]" : "text-[#B26A00]"}>{st.keysConfigured ? "configured" : "missing"}</b> · mode <b className="text-zinc-600">{st.futuresMode || "detect on live/diagnose"}</b> · {st.config.dryRun ? "SIM" : "LIVE"} · USDT-margined
+                  </div>
+                )}
+                {st.config.exchange === "binance_futures" && (
+                  <div className="flex items-center gap-2" data-testid="bot-futures-leverage-row">
+                    <div className="flex items-center gap-1 border border-zinc-200 px-2 py-1">
+                      <span className="mono text-[10px] text-zinc-500">Leverage</span>
+                      <input
+                        data-testid="bot-futures-leverage"
+                        type="number" min="1" max="125" step="1"
+                        value={form.futuresLeverage}
+                        onChange={(e) => setForm({ ...form, futuresLeverage: e.target.value })}
+                        onBlur={() => patch({ futuresLeverage: parseInt(form.futuresLeverage, 10) || 1 })}
+                        className="mono w-12 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
+                      />
+                      <span className="mono text-[11px] font-bold text-[#F3BA2F]">x</span>
+                    </div>
+                    <span className="mono text-[9px] leading-tight text-zinc-400">per-trade default (1–125) · long &amp; short · reduce-only close · position side auto-detected</span>
+                  </div>
+                )}
+                {(st.config.exchange === "hyperliquid" || (st.config.dryRun && st.config.exchange !== "binance_futures")) && (
                   <div className="flex items-center gap-2" data-testid="bot-hl-leverage-row">
                     <div className="flex items-center gap-1 border border-zinc-200 px-2 py-1">
                       <span className="mono text-[10px] text-zinc-500">Leverage</span>
