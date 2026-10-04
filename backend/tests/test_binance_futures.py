@@ -16,24 +16,29 @@ class FakeResp:
 
 
 class FakeHTTP:
-    """Records signed requests and returns queued responses keyed by path substring."""
+    """Records signed requests and returns queued responses keyed by url substring.
+    A response dict with {"__status": N} simulates an HTTP status (e.g. 403)."""
     def __init__(self, routes):
-        self.routes = routes       # list of (path_substr, response_dict)
+        self.routes = routes       # list of (url_substr, response_dict)
         self.calls = []            # (method, url)
+        self.headers = []          # headers per call
+
+    def _match(self, url):
+        for sub, resp in self.routes:
+            if sub in url:
+                status = resp.get("__status", 200) if isinstance(resp, dict) else 200
+                return FakeResp(resp, status=status)
+        return FakeResp({"code": -1, "msg": "unmatched"}, status=400)
 
     async def request(self, method, url, headers=None, timeout=None):
         self.calls.append((method, url))
-        for sub, resp in self.routes:
-            if sub in url:
-                return FakeResp(resp)
-        return FakeResp({"code": -1, "msg": "unmatched"}, status=400)
+        self.headers.append(headers or {})
+        return self._match(url)
 
-    async def get(self, url, timeout=None):
+    async def get(self, url, headers=None, timeout=None):
         self.calls.append(("GET", url))
-        for sub, resp in self.routes:
-            if sub in url:
-                return FakeResp(resp)
-        return FakeResp({}, status=404)
+        self.headers.append(headers or {})
+        return self._match(url)
 
 
 def _reset_mode():
@@ -41,6 +46,7 @@ def _reset_mode():
     server._FAPI["modeTs"] = 0.0
     server._FAPI["lots"] = {}
     server._FAPI["lotsTs"] = 0.0
+    server._FAPI["activeHost"] = None
 
 
 def test_signing_includes_apikey_and_signature(monkeypatch):
@@ -51,6 +57,39 @@ def test_signing_includes_apikey_and_signature(monkeypatch):
     asyncio.run(server.fapi_signed(http, "GET", "/fapi/v1/positionSide/dual", {}))
     method, url = http.calls[0]
     assert "signature=" in url and "timestamp=" in url and "recvWindow=" in url
+    # default host is now fapi1 and User-Agent must be sent
+    assert "fapi1.binance.com" in url
+    assert http.headers and http.headers[0].get("User-Agent")
+
+
+def test_403_falls_back_to_next_mirror(monkeypatch):
+    _reset_mode()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    # fapi1 + fapi2 are banned (403), fapi3 works
+    http = FakeHTTP([
+        ("fapi1.binance.com", {"__status": 403}),
+        ("fapi2.binance.com", {"__status": 403}),
+        ("fapi3.binance.com/fapi/v1/positionSide/dual", {"dualSidePosition": True}),
+    ])
+    res = asyncio.run(server.fapi_signed(http, "GET", "/fapi/v1/positionSide/dual", {}))
+    assert res.get("dualSidePosition") is True
+    assert server._FAPI["activeHost"] == "https://fapi3.binance.com"
+    urls = [u for _, u in http.calls]
+    assert any("fapi1.binance.com" in u for u in urls) and any("fapi3.binance.com" in u for u in urls)
+
+
+def test_all_hosts_403_raises(monkeypatch):
+    _reset_mode()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    http = FakeHTTP([("binance.com", {"__status": 403})])  # every host 403
+    raised = False
+    try:
+        asyncio.run(server.fapi_signed(http, "GET", "/fapi/v1/positionSide/dual", {}))
+    except RuntimeError as e:
+        raised = "all hosts blocked" in str(e)
+    assert raised
 
 
 def test_position_mode_detected_not_guessed(monkeypatch):

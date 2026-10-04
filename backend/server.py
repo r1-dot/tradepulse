@@ -49,8 +49,13 @@ COINGECKO_API_KEY = os.environ.get('COINGECKO_API_KEY', '')
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '')
 BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
 BINANCE_TRADE_BASE_URL = os.environ.get('BINANCE_TRADE_BASE_URL', 'https://api.binance.com')
-BINANCE_FUTURES_BASE_URL = os.environ.get('BINANCE_FUTURES_BASE_URL', 'https://fapi.binance.com')
+BINANCE_FUTURES_BASE_URL = os.environ.get('BINANCE_FUTURES_BASE_URL', 'https://fapi1.binance.com')
 BINANCE_FUTURES_TESTNET_URL = 'https://testnet.binancefuture.com'
+# fapi1-4 are regional mirrors of fapi.binance.com — used as fallbacks when a host returns 403
+# (some datacenter IPs, e.g. Vultr, are banned on specific hosts).
+BINANCE_FUTURES_HOSTS = ["https://fapi1.binance.com", "https://fapi2.binance.com",
+                         "https://fapi3.binance.com", "https://fapi4.binance.com"]
+BINANCE_FUTURES_UA = "Mozilla/5.0 (X11; Linux x86_64) TradePulse/1.0"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("scanner")
@@ -231,11 +236,29 @@ async def _live_market(http, symbol, side, quote_qty=None, base_qty=None):
 
 
 # ----------------------------- Binance USD-M Futures -----------------------------
-_FAPI = {"mode": None, "modeTs": 0.0, "lots": {}, "lotsTs": 0.0}  # cache: position mode + lot sizes
+_FAPI = {"mode": None, "modeTs": 0.0, "lots": {}, "lotsTs": 0.0, "activeHost": None}
+
+
+def _fapi_hosts():
+    """Ordered list of futures hosts to try. Testnet uses the single testnet URL; otherwise the
+    configured primary first, then fapi1-4 mirrors (deduped) for 403 fallback."""
+    if BOT["config"].get("futuresTestnet"):
+        return [BINANCE_FUTURES_TESTNET_URL]
+    hosts = []
+    for h in [BINANCE_FUTURES_BASE_URL] + BINANCE_FUTURES_HOSTS:
+        if h and h not in hosts:
+            hosts.append(h)
+    # prefer the last host that worked so we don't re-hit a banned one every call
+    if _FAPI["activeHost"] in hosts:
+        hosts.remove(_FAPI["activeHost"])
+        hosts.insert(0, _FAPI["activeHost"])
+    return hosts
 
 
 def _fapi_base():
-    return BINANCE_FUTURES_TESTNET_URL if BOT["config"].get("futuresTestnet") else BINANCE_FUTURES_BASE_URL
+    if BOT["config"].get("futuresTestnet"):
+        return BINANCE_FUTURES_TESTNET_URL
+    return _FAPI["activeHost"] or BINANCE_FUTURES_BASE_URL
 
 
 async def fapi_signed(http, method, path, params):
@@ -246,15 +269,28 @@ async def fapi_signed(http, method, path, params):
     p.setdefault("recvWindow", "5000")
     query = urlencode(p)
     sig = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
-    url = f"{_fapi_base()}{path}?{query}&signature={sig}"
-    r = await http.request(method, url, headers={"X-MBX-APIKEY": BINANCE_API_KEY}, timeout=15)
-    try:
-        data = r.json()
-    except Exception:  # noqa: BLE001
-        data = {"msg": r.text[:200]}
-    if r.status_code >= 400 or (isinstance(data, dict) and int(data.get("code", 0) or 0) < 0):
-        raise RuntimeError(f"binance-futures {r.status_code}: {str(data)[:200]}")
-    return data
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY, "User-Agent": BINANCE_FUTURES_UA}
+    hosts = _fapi_hosts()
+    last = None
+    for base in hosts:
+        url = f"{base}{path}?{query}&signature={sig}"
+        try:
+            r = await http.request(method, url, headers=headers, timeout=15)
+        except Exception as e:  # noqa: BLE001
+            last = f"{base} -> {str(e)[:80]}"
+            continue
+        if r.status_code in (403, 451):  # IP banned / geo-restricted on this host -> try next mirror
+            last = f"{base} -> HTTP {r.status_code}"
+            continue
+        try:
+            data = r.json()
+        except Exception:  # noqa: BLE001
+            data = {"msg": r.text[:200]}
+        if r.status_code >= 400 or (isinstance(data, dict) and int(data.get("code", 0) or 0) < 0):
+            raise RuntimeError(f"binance-futures {r.status_code}: {str(data)[:200]}")
+        _FAPI["activeHost"] = base  # remember the working mirror
+        return data
+    raise RuntimeError(f"binance-futures: all hosts blocked (403/451). tried {len(hosts)} mirrors. last: {last}")
 
 
 async def fapi_position_mode(http, force=False):
@@ -274,9 +310,20 @@ async def _fapi_round_qty(http, symbol, qty):
     try:
         now = time.time()
         if not _FAPI["lots"] or now - _FAPI["lotsTs"] > 3600:
-            info = (await http.get(f"{_fapi_base()}/fapi/v1/exchangeInfo", timeout=15)).json()
+            info = None
+            for base in _fapi_hosts():
+                try:
+                    r = await http.get(f"{base}/fapi/v1/exchangeInfo",
+                                       headers={"User-Agent": BINANCE_FUTURES_UA}, timeout=15)
+                    if r.status_code in (403, 451):
+                        continue
+                    info = r.json()
+                    _FAPI["activeHost"] = base
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
             lots = {}
-            for s in info.get("symbols", []):
+            for s in (info or {}).get("symbols", []):
                 step = None
                 for f in s.get("filters", []):
                     if f.get("filterType") in ("MARKET_LOT_SIZE", "LOT_SIZE"):
