@@ -378,7 +378,9 @@ async def _fapi_market_close(http, symbol, is_long, qty):
 async def _fapi_positions(http, symbol=None):
     p = {"symbol": symbol.upper()} if symbol else {}
     rows = await fapi_signed(http, "GET", "/fapi/v2/positionRisk", p)
-    return [x for x in rows if float(x.get("positionAmt", 0) or 0) != 0]
+    if not isinstance(rows, list):
+        return []
+    return [x for x in rows if isinstance(x, dict) and float(x.get("positionAmt", 0) or 0) != 0]
 
 
 

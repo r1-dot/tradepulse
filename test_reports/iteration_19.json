@@ -1,0 +1,31 @@
+{
+  "summary": "Backend-only verification of Binance USD-M Futures fapi1-4 fallback fix. Ran the 6 targeted mocked pytest files (29 tests) — all passed. Verified GET /api/futures/diagnose returns 200 with base=https://fapi1.binance.com (new default, not fapi.binance.com). Verified /api/bot/config accepts exchange=binance_futures, futuresLeverage, futuresTestnet; /api/bot/status returns futuresBase & futuresMode; setting futuresTestnet=true switches base to https://testnet.binancefuture.com and false reverts to fapi1.binance.com.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/futures/diagnose", "issue": "openPositions call raises TypeError \"'str' object has no attribute 'get'\" from _fapi_positions line 381 — rows likely came back as list of strings (or signed response wasn't the expected list of dicts). Endpoint still returns HTTP 200 (handled in try/except), but the error is surfaced in the 'error' field. Note: from this preview server fapi1 is actually reachable (HTTP 302 on /ping) — not fully geo-blocked as expected, so positionMode='one-way' was returned successfully; the error is in a downstream call, not the fallback logic."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_binance_futures.py",
+    "/app/backend/tests/test_sim_binance_leverage.py",
+    "/app/backend/tests/test_desync_reconcile.py",
+    "/app/backend/tests/test_trailing_native_sync.py",
+    "/app/backend/tests/test_bigtime_fixes.py",
+    "/app/backend/tests/test_hl_tpsl_none.py"
+  ],
+  "action_items": [
+    "Investigate _fapi_positions parsing: `[x for x in rows if float(x.get('positionAmt', 0)...` fails when `rows` isn't a list of dicts. Likely fapi_signed returned a top-level dict (error payload) or a list of strings. Add a guard: if not isinstance(rows, list) or (rows and not isinstance(rows[0], dict)): return []. This is a minor pre-existing surface error in diagnose output, unrelated to the geo-fallback fix itself."
+  ],
+  "critical_code_review_comments": [
+    "fapi_signed fallback skip condition should probably include network timeouts/connect errors too (currently only 403/451 — ok per spec).",
+    "server.py is 2137 lines — above 700-line guideline; consider modularizing (futures/, hyperliquid/, bot/ submodules)."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (29/29 mocked tests + 3/3 API checks; 1 minor diagnose downstream error unrelated to fallback)", "frontend": "n/a (skipped per request)"},
+  "seed_data_creation": "none",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Fapi1-4 fallback fix verified. Preview server CAN reach fapi1.binance.com (HTTP 302) — it is NOT fully geo-blocked as the task description assumed; only fapi.binance.com returned 451. Diagnose endpoint has a secondary bug in _fapi_positions ('str' object has no attribute 'get') — low priority. Default base, testnet toggle, config/status endpoints all behave correctly."
+}

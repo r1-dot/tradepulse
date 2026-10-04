@@ -189,6 +189,12 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - UI: venue selector now SPOT / FUTURES / PERPS; Futures shows a Leverage box (futuresLeverage, 1–125), Testnet toggle, and a status line (key configured, detected position mode, SIM/LIVE). `GET /api/futures/diagnose` reports mode + open positions; `_bot_status` exposes `futuresMode`/`futuresBase`.
 - Verified: tests/test_binance_futures.py 6/6 (signing, mode detect, one-way BOTH open, one-way reduceOnly close, hedge leg close, sim long/short no-real-orders) + full mocked regression 27/27. Live diagnose from this preview returns the expected HTTP 451 geo-block gracefully — futures execute once deployed to the Singapore VPS.
 
+## Bug fix (2026-06) — Binance Futures 403 (Vultr IP banned) → fapi1-4 fallback
+- Report: Vultr server IP gets HTTP 403 on https://fapi.binance.com.
+- Fix: default futures base changed to `https://fapi1.binance.com` (env BINANCE_FUTURES_BASE_URL); `fapi_signed()` + exchangeInfo GET now rotate through fapi1→fapi2→fapi3→fapi4 on 403/451, remember the last working host (`_FAPI['activeHost']`), and send a `User-Agent` header. Raises a clear "all hosts blocked" error only if every mirror fails.
+- Also hardened `_fapi_positions` to guard non-list / non-dict responses (fixed a downstream `'str' has no attribute get` surfaced in /api/futures/diagnose).
+- Verified by testing_agent (iteration_19): 29/29 mocked tests + API checks; default base=fapi1, testnet toggle works, config/status correct. IMPORTANT finding: **fapi1.binance.com is reachable from the Emergent preview** (only fapi.binance.com was 451), so `/api/futures/diagnose` now returns `positionMode=one-way` successfully from here — futures can be tested live from preview too, not just the VPS.
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections
