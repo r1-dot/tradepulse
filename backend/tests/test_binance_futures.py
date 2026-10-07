@@ -6,36 +6,42 @@ import server
 
 
 class FakeResp:
-    def __init__(self, data, status=200):
+    def __init__(self, data, status=200, text=None):
         self._data = data
         self.status_code = status
-        self.text = str(data)
+        self.text = text if text is not None else str(data)
+        self.headers = {}
 
     def json(self):
+        if isinstance(self._data, str):
+            raise ValueError("not json")
         return self._data
 
 
 class FakeHTTP:
     """Records signed requests and returns queued responses keyed by url substring.
-    A response dict with {"__status": N} simulates an HTTP status (e.g. 403)."""
+    A response dict may carry {"__status": N} to simulate an HTTP status; a string value
+    simulates a non-JSON body (e.g. an nginx 302 HTML page)."""
     def __init__(self, routes):
-        self.routes = routes       # list of (url_substr, response_dict)
-        self.calls = []            # (method, url)
-        self.headers = []          # headers per call
+        self.routes = routes       # list of (url_substr, response)
+        self.calls = []
+        self.headers = []
 
     def _match(self, url):
         for sub, resp in self.routes:
             if sub in url:
+                if isinstance(resp, str):
+                    return FakeResp(resp, status=302, text=resp)
                 status = resp.get("__status", 200) if isinstance(resp, dict) else 200
                 return FakeResp(resp, status=status)
         return FakeResp({"code": -1, "msg": "unmatched"}, status=400)
 
-    async def request(self, method, url, headers=None, timeout=None):
+    async def request(self, method, url, headers=None, timeout=None, follow_redirects=False):
         self.calls.append((method, url))
         self.headers.append(headers or {})
         return self._match(url)
 
-    async def get(self, url, headers=None, timeout=None):
+    async def get(self, url, headers=None, timeout=None, follow_redirects=False):
         self.calls.append(("GET", url))
         self.headers.append(headers or {})
         return self._match(url)
@@ -88,7 +94,7 @@ def test_all_hosts_403_raises(monkeypatch):
     try:
         asyncio.run(server.fapi_signed(http, "GET", "/fapi/v1/positionSide/dual", {}))
     except RuntimeError as e:
-        raised = "all hosts blocked" in str(e)
+        raised = "no host returned a valid response" in str(e)
     assert raised
 
 
@@ -182,6 +188,50 @@ def test_close_returns_order_id(monkeypatch):
     ])
     r = asyncio.run(server._fapi_market_close(http, "BTCUSDT", True, 0.5))
     assert r["orderId"] == "555"
+
+
+def test_302_redirect_html_is_not_success(monkeypatch):
+    """CRITICAL: a 302 nginx HTML page must NOT be treated as a filled order (phantom position).
+    All mirrors returning a redirect must raise, so the futures open fails loudly."""
+    _reset_mode()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    html = "<html><head><title>302 Found</title></head><body>nginx</body></html>"
+    http = FakeHTTP([("binance.com", html)])  # every host returns a 302 HTML page
+    raised = False
+    try:
+        asyncio.run(server.fapi_signed(http, "POST", "/fapi/v1/order", {"symbol": "JSTUSDT"}))
+    except RuntimeError as e:
+        raised = "no host returned a valid response" in str(e)
+    assert raised, "302/non-JSON must raise, never return as success"
+
+
+def test_open_position_futures_failure_no_phantom(monkeypatch):
+    """If the futures order can't be placed (all hosts 302), _open_position must NOT create a
+    tracked position and must NOT log a FUTURES OPEN success."""
+    _reset_mode()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    cfg = server.BOT["config"]
+    cfg["dryRun"] = False
+    cfg["exchange"] = "binance_futures"
+    cfg["maxPositionUsdt"] = 10.0
+    cfg["futuresLeverage"] = 1
+    cfg["maxOpenPositions"] = 50
+    cfg["dailyLossLimit"] = 1e9
+    server.BOT["positions"].clear()
+    server.STATE["latest"] = {"JSTUSDT": {"base": "JST", "price": 0.3191, "quote": "USDT"}}
+
+    async def _boom(http, method, path, params):
+        raise RuntimeError("binance-futures: no host returned a valid response (redirect)")
+    monkeypatch.setattr(server, "fapi_signed", _boom)
+
+    class _H:  # _open_position may call _ensure_hl_ready etc; futures path only uses fapi_signed
+        pass
+    asyncio.run(server._open_position(_H(), "JSTUSDT", 0.3191, 1000.0, side="long", source="straddle"))
+    assert "JSTUSDT" not in server.BOT["positions"], "must NOT create a phantom position on order failure"
+    cfg["dryRun"] = True  # restore safe default
+    cfg["exchange"] = "binance"
 
 
 def test_sim_futures_long_and_short_no_real_orders(monkeypatch):

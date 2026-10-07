@@ -275,22 +275,31 @@ async def fapi_signed(http, method, path, params):
     for base in hosts:
         url = f"{base}{path}?{query}&signature={sig}"
         try:
-            r = await http.request(method, url, headers=headers, timeout=15)
+            # follow_redirects so a legit edge redirect resolves to the real JSON response
+            r = await http.request(method, url, headers=headers, timeout=15, follow_redirects=True)
         except Exception as e:  # noqa: BLE001
             last = f"{base} -> {str(e)[:80]}"
             continue
-        if r.status_code in (403, 451):  # IP banned / geo-restricted on this host -> try next mirror
+        # 403/451 = banned/geo-blocked; 3xx that didn't resolve = this mirror won't serve the
+        # write (mirrors redirect order POSTs to the canonical host) -> try the next mirror
+        if r.status_code in (403, 451) or 300 <= r.status_code < 400:
             last = f"{base} -> HTTP {r.status_code}"
             continue
         try:
             data = r.json()
         except Exception:  # noqa: BLE001
-            data = {"msg": r.text[:200]}
+            # non-JSON (e.g. an nginx HTML redirect/error page) is NOT a valid order response —
+            # never treat it as success; move on to the next mirror
+            last = f"{base} -> non-JSON HTTP {r.status_code} ({r.text[:60].strip()})"
+            continue
+        if not isinstance(data, (dict, list)):
+            last = f"{base} -> unexpected body"
+            continue
         if r.status_code >= 400 or (isinstance(data, dict) and int(data.get("code", 0) or 0) < 0):
             raise RuntimeError(f"binance-futures {r.status_code}: {str(data)[:200]}")
         _FAPI["activeHost"] = base  # remember the working mirror
         return data
-    raise RuntimeError(f"binance-futures: all hosts blocked (403/451). tried {len(hosts)} mirrors. last: {last}")
+    raise RuntimeError(f"binance-futures: no host returned a valid response (403/451/redirect). tried {len(hosts)} mirrors. last: {last}")
 
 
 async def fapi_position_mode(http, force=False):
