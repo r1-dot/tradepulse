@@ -346,6 +346,19 @@ async def _fapi_set_leverage(http, symbol, lev):
     return await fapi_signed(http, "POST", "/fapi/v1/leverage", {"symbol": symbol.upper(), "leverage": lev})
 
 
+def _extract_order_id(res):
+    """Pull the order id out of a Binance Futures order response regardless of key casing,
+    and never return it as None when the order actually went through (fall back to clientOrderId)."""
+    if not isinstance(res, dict):
+        return None
+    oid = res.get("orderId")
+    if oid is None:
+        oid = res.get("orderID")
+    if oid is None:
+        oid = res.get("clientOrderId") or res.get("origClientOrderId")
+    return str(oid) if oid is not None else None
+
+
 async def _fapi_market_open(http, symbol, is_long, qty, lev):
     hedge = await fapi_position_mode(http)
     await _fapi_set_leverage(http, symbol, lev)
@@ -354,9 +367,10 @@ async def _fapi_market_open(http, symbol, is_long, qty, lev):
               "quantity": qty, "newOrderRespType": "RESULT",
               "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
     res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
+    logger.info("FUTURES open raw response (%s %s): %s", symbol, "BUY" if is_long else "SELL", res)
     executed = float(res.get("executedQty", 0) or 0) or qty
     ap = float(res.get("avgPrice", 0) or 0)
-    return {"executedQty": executed, "fillPrice": ap, "orderId": res.get("orderId"), "raw": res}
+    return {"executedQty": executed, "fillPrice": ap, "orderId": _extract_order_id(res), "raw": res}
 
 
 async def _fapi_market_close(http, symbol, is_long, qty):
@@ -371,8 +385,9 @@ async def _fapi_market_close(http, symbol, is_long, qty):
         params["positionSide"] = "BOTH"
         params["reduceOnly"] = True
     res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
+    logger.info("FUTURES close raw response (%s): %s", symbol, res)
     ap = float(res.get("avgPrice", 0) or 0)
-    return {"fillPrice": ap, "raw": res}
+    return {"fillPrice": ap, "orderId": _extract_order_id(res), "raw": res}
 
 
 async def _fapi_positions(http, symbol=None):

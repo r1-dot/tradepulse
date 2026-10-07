@@ -148,6 +148,42 @@ def test_close_hedge_no_reduce_only_leg_side(monkeypatch):
     assert "side=BUY" in order_url and "positionSide=SHORT" in order_url
 
 
+def test_order_id_returned_various_shapes(monkeypatch):
+    _reset_mode()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    # standard RESULT payload -> orderId
+    http = FakeHTTP([
+        ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
+        ("/fapi/v1/leverage", {"leverage": 3}),
+        ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/order", {"orderId": 283194212, "executedQty": "0.5", "avgPrice": "100.0"}),
+    ])
+    r = asyncio.run(server._fapi_market_open(http, "BTCUSDT", True, 0.5, 3))
+    assert r["orderId"] == "283194212", r
+
+    # fallback: no orderId but clientOrderId present
+    assert server._extract_order_id({"clientOrderId": "x7abc"}) == "x7abc"
+    # alt casing
+    assert server._extract_order_id({"orderID": 99}) == "99"
+    # genuinely empty -> None (not the string 'None')
+    assert server._extract_order_id({}) is None
+    assert server._extract_order_id({"orderId": 0}) == "0"  # 0 is a valid id, not None
+
+
+def test_close_returns_order_id(monkeypatch):
+    _reset_mode()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    http = FakeHTTP([
+        ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
+        ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/order", {"orderId": 555, "avgPrice": "99.0"}),
+    ])
+    r = asyncio.run(server._fapi_market_close(http, "BTCUSDT", True, 0.5))
+    assert r["orderId"] == "555"
+
+
 def test_sim_futures_long_and_short_no_real_orders(monkeypatch):
     cfg = server.BOT["config"]
     cfg["dryRun"] = True
