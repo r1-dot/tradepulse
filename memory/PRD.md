@@ -201,6 +201,13 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Fix: new `_extract_order_id()` tries `orderId` → `orderID` → `clientOrderId` → `origClientOrderId`, treats 0 as a valid id (`"0"`), returns None only when truly absent. `_fapi_market_open()` AND `_fapi_market_close()` now return the id via this helper and `logger.info` the RAW order response for debugging.
 - Verified by testing_agent (iteration_20): no issues; 10/10 futures tests + 31/31 full mocked regression; _extract_order_id validated for all 5 shapes; live /api/futures/diagnose healthy (fapi1, one-way).
 
+## CRITICAL fix (2026-06) — Futures "order None" was a phantom: 302 redirect treated as success
+- Report: "FUTURES OPEN LONG JSTUSDT … order None" on a LIVE straddle entry.
+- TRUE root cause (from logs): POST /fapi/v1/order to fapi1-4 returns an HTTP **302 nginx redirect** (write requests get redirected to the geo-blocked canonical host from the preview). Old `fapi_signed` treated the 302 HTML as success (status<400) → `_extract_order_id` found nothing (None) AND `_open_position` registered a PHANTOM position with a fake fill (no real order existed).
+- Fix: `fapi_signed` now `follow_redirects=True`, treats any 3xx / non-JSON / unexpected body as a mirror failure → tries next host → raises "no host returned a valid response" when all fail. The futures open/close therefore FAILS LOUDLY; `_open_position` catches it, logs "FUTURES open failed", and creates NO phantom position. Raw response is logged for debugging.
+- Verified by testing_agent (iteration_21): 0 issues — 12/12 futures tests (incl. test_302_redirect_html_is_not_success, test_open_position_futures_failure_no_phantom) + 33/33 full mocked regression; diagnose healthy.
+- OPERATIONAL NOTE: from the Emergent preview, Binance futures WRITES (order/leverage POST) are 302-redirected to the geo-blocked host, so live futures orders cannot execute here — they will work from the user's Vultr/Singapore VPS (GET/read endpoints do work from preview). "Save to GitHub" is the way to push the fix (main agent cannot push).
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections
