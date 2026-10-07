@@ -195,6 +195,12 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Also hardened `_fapi_positions` to guard non-list / non-dict responses (fixed a downstream `'str' has no attribute get` surfaced in /api/futures/diagnose).
 - Verified by testing_agent (iteration_19): 29/29 mocked tests + API checks; default base=fapi1, testnet toggle works, config/status correct. IMPORTANT finding: **fapi1.binance.com is reachable from the Emergent preview** (only fapi.binance.com was 451), so `/api/futures/diagnose` now returns `positionMode=one-way` successfully from here — futures can be tested live from preview too, not just the VPS.
 
+## Bug fix (2026-06) — FUTURES OPEN order_id=None despite filled order
+- Report: the "FUTURES OPEN … order {order_id}" log showed None even when the order filled.
+- Cause: code read only `res.get("orderId")`, which returns None for alt-cased `orderID` or clientOrderId-only responses, and 0 (falsy) for orderId=0.
+- Fix: new `_extract_order_id()` tries `orderId` → `orderID` → `clientOrderId` → `origClientOrderId`, treats 0 as a valid id (`"0"`), returns None only when truly absent. `_fapi_market_open()` AND `_fapi_market_close()` now return the id via this helper and `logger.info` the RAW order response for debugging.
+- Verified by testing_agent (iteration_20): no issues; 10/10 futures tests + 31/31 full mocked regression; _extract_order_id validated for all 5 shapes; live /api/futures/diagnose healthy (fapi1, one-way).
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

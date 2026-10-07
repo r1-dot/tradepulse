@@ -1,0 +1,22 @@
+{
+  "summary": "Verified fix for FUTURES OPEN order_id=None bug. Ran mocked test_binance_futures.py (10/10 pass), full mocked regression suite (31/31 pass across 6 files), directly validated _extract_order_id helper for all 5 shapes including orderId=0 -> '0' and empty dict -> None, and confirmed live /api/futures/diagnose returns HTTP 200 with base=fapi1.binance.com, positionMode=one-way, openPositions=[].",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_binance_futures.py",
+    "/app/test_reports/pytest/iter20_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now very large (2000+ lines); consider splitting futures/hyperliquid/binance adapters into separate modules for maintainability (not blocking).",
+    "FastAPI on_event startup/shutdown is deprecated; migrate to lifespan handlers (warning in test output, not blocking)."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "N/A (skipped per request)"},
+  "test_credentials": "N/A - no auth",
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Order-id extraction fix verified via mocked tests + direct helper call + live diagnose. Mocked suite: test_binance_futures.py (10), test_sim_binance_leverage.py, test_desync_reconcile.py, test_trailing_native_sync.py, test_bigtime_fixes.py, test_hl_tpsl_none.py — total 31 pass. Do NOT run full /app/backend/tests/ dir (older integration tests hit live markets).",
+  "rca of the issue": "Previous code likely did `order.get('orderId')` only, which returns None for alt-cased 'orderID' or clientOrderId-only responses, and returns 0 (falsy, could be mishandled downstream) when orderId=0. Fix: new _extract_order_id() tries orderId, orderID, clientOrderId in order, treats 0 as valid (returns str('0')), returns None only when truly absent. _fapi_market_open/_close now use this helper and also logger.info the raw response for debugging. All 5 shape cases verified."
+}
