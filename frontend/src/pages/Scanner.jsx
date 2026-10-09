@@ -932,8 +932,8 @@ export default function Scanner() {
                       <Star size={11} className={starred.has(t.symbol) ? "fill-[#F5A623] text-[#F5A623]" : ""} />
                     </button>
                     {isAlert && <BellRing size={11} className="text-[#002FA7]" data-testid={`alert-flag-${t.symbol}`} />}
-                    <span className="mono font-semibold text-zinc-900">{t.base}</span>
-                    <span className="mono text-[10px] text-zinc-300">/{t.quote}</span>
+                    <span className="mono font-semibold text-zinc-900">{t.base}{t.quote}</span>
+                    <span className="mono text-[10px] text-zinc-300"> Perp</span>
                     {isAlgo && (
                       <span
                         data-testid={`algo-flag-${t.symbol}`}
@@ -1128,7 +1128,7 @@ export default function Scanner() {
                   >
                     <div className="flex items-center justify-between">
                       <span className="font-heading text-[13px] font-bold text-zinc-900">
-                        {e.base}<span className="mono text-[10px] font-normal text-zinc-400">/USDT</span>
+                        {e.base}USDT<span className="mono text-[10px] font-normal text-zinc-400"> Perp</span>
                       </span>
                       <span className={`mono text-[10px] font-semibold ${e.sellLead ? "text-[#FF3B30]" : "text-[#00A004]"}`}>
                         {e.sellLead ? "SELLING" : "BUYING"}
@@ -1165,7 +1165,7 @@ export default function Scanner() {
                         {botPositions.has(h.symbol) && (
                           <Bot size={11} className="text-[#00C805]" data-testid={`history-bot-flag-${h.symbol}`} />
                         )}
-                        {h.base}<span className="text-[10px] text-zinc-300">/USDT</span>
+                        {h.base}USDT<span className="text-[10px] text-zinc-300"> Perp</span>
                         {h.kind === "algo" && (
                           <span className="inline-flex items-center gap-0.5 rounded-sm bg-[#F5A623]/15 px-1 text-[8px] font-semibold uppercase text-[#B26A00]"><Cpu size={8} /> algo</span>
                         )}

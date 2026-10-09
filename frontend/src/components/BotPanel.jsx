@@ -477,7 +477,7 @@ export default function BotPanel({ open, onClose }) {
                       <div key={p.symbol} data-testid={`bot-pos-${p.symbol}`} className="flex items-center justify-between border border-zinc-100 px-2 py-1.5">
                         <div className="mono text-[12px] font-semibold text-zinc-900 flex items-center gap-1">
                           <span className={`rounded-sm px-1 text-[8px] font-bold uppercase ${p.side === "short" ? "bg-[#FF3B30] text-white" : "bg-[#00A004] text-white"}`}>{p.side === "short" ? "S" : "L"}</span>
-                          {p.base}<span className="text-[9px] text-zinc-300">/USDT</span>
+                          {p.base}USDT<span className="text-[9px] text-zinc-300"> Perp</span>
                         </div>
                         <div className="mono text-[10px] text-zinc-400">e {p.entryPrice.toPrecision(5)} · tp {p.tpPrice ? p.tpPrice.toPrecision(5) : "trail"} · sl {p.slPrice ? p.slPrice.toPrecision(5) : "—"}{p.source === "adopted" ? " · adopted" : ""}</div>
                         <div className="flex flex-col items-end leading-tight">
@@ -503,7 +503,7 @@ export default function BotPanel({ open, onClose }) {
                   <div className="mt-2 space-y-1">
                     {st.pendingStraddles.map((s) => (
                       <div key={s.symbol} data-testid={`bot-straddle-${s.symbol}`} className="flex items-center justify-between border border-[#7C3AED]/30 bg-[#7C3AED]/[0.04] px-2 py-1.5">
-                        <div className="mono text-[12px] font-semibold text-zinc-900">{s.base}<span className="text-[9px] text-zinc-300">/USDT</span></div>
+                        <div className="mono text-[12px] font-semibold text-zinc-900">{s.base}USDT<span className="text-[9px] text-zinc-300"> Perp</span></div>
                         <div className="mono text-[10px]">
                           <span className="text-[#00A004]">↑{s.longEntry.toPrecision(5)}</span>
                           <span className="text-zinc-300"> / </span>
