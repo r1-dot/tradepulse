@@ -498,7 +498,7 @@ export default function Scanner() {
     doc.text("TradePulse — Alert History", 40, 40);
     doc.setFontSize(9);
     doc.setTextColor("#52525B");
-    doc.text(`Generated ${new Date().toLocaleString()} · ${alertHistory.length} events · source data-api.binance.vision`, 40, 56);
+    doc.text(`Generated ${new Date().toLocaleString()} · ${alertHistory.length} events · source binance fapi (USD-M Perp)`, 40, 56);
 
     const body = alertHistory.map((h) => [
       fmtClock(h.ts),
@@ -1014,7 +1014,7 @@ export default function Scanner() {
           </span>
         )}
         <span className="ml-auto">
-          history depth {meta.historyDepthSec ? Math.round(meta.historyDepthSec) + "s" : "0s"} · refresh 1s · src data-api.binance.vision
+          history depth {meta.historyDepthSec ? Math.round(meta.historyDepthSec) + "s" : "0s"} · refresh 1s · src {meta.source || "binance fapi (USD-M Perp)"}
         </span>
       </footer>
       <Toaster position="bottom-right" toastOptions={{ className: "mono" }} />

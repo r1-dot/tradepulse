@@ -40,6 +40,9 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 BINANCE_BASE = os.environ.get('BINANCE_BASE', 'https://data-api.binance.vision')
+# USD-M Perpetual-futures market data (volume, trades, 24h change, depth). www.binance.com
+# serves the /fapi read endpoints and is NOT geo-blocked on this server, unlike fapi*.binance.com.
+BINANCE_FAPI_DATA_BASE = os.environ.get('BINANCE_FAPI_DATA_BASE', 'https://www.binance.com')
 QUOTES = [q.strip().upper() for q in os.environ.get('BINANCE_QUOTE', 'USDT,USDC').split(',') if q.strip()]
 QUOTE = QUOTES[0]
 ETHERSCAN_API_KEY = os.environ.get('ETHERSCAN_API_KEY', '')
@@ -1049,7 +1052,7 @@ async def _orderbook_delta(http, sym):
     if c and now - c[0] < 2:
         return c[1], c[2]
     try:
-        r = await http.get(f"{BINANCE_BASE}/api/v3/depth", params={"symbol": sym, "limit": 10}, timeout=5)
+        r = await http.get(f"{BINANCE_FAPI_DATA_BASE}/fapi/v1/depth", params={"symbol": sym, "limit": 10}, timeout=5)
         d = r.json()
         bw = sum(float(p) * float(q) for p, q in d.get("bids", [])[:10])
         sw = sum(float(p) * float(q) for p, q in d.get("asks", [])[:10])
@@ -1357,7 +1360,7 @@ async def load_bot_config():
 
 async def poll_binance(http: httpx.AsyncClient):
     backoff = 1.0
-    url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
+    url = f"{BINANCE_FAPI_DATA_BASE}/fapi/v1/ticker/24hr"
     while True:
         t0 = time.time()
         try:
@@ -1484,7 +1487,7 @@ async def engine_status():
         "connected": STATE["connected"],
         "pairsTracked": len(STATE["latest"]),
         "quote": QUOTE,
-        "source": BINANCE_BASE,
+        "source": BINANCE_FAPI_DATA_BASE + "/fapi (USD-M Perp)",
         "pollCount": STATE["poll_count"],
         "lastUpdate": STATE["last_update"],
         "uptimeSec": round(time.time() - STATE["start_ts"]),
