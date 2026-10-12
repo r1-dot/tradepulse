@@ -76,6 +76,8 @@ export default function BotPanel({ open, onClose }) {
     cooldownSec: parseInt(form.cooldownSec, 10),
     maxLossPerTradeUsdt: parseFloat(form.maxLossPerTradeUsdt),
     straddleEntryPct: parseFloat(form.straddleEntryPct),
+    tradeAmtMin: parseFloat(form.tradeAmtMin),
+    tradeAmtMax: parseFloat(form.tradeAmtMax),
     webhookUrl: form.webhookUrl || "",
     webhookBuyMsg: form.webhookBuyMsg || "",
     webhookSellMsg: form.webhookSellMsg || "",
@@ -338,6 +340,28 @@ export default function BotPanel({ open, onClose }) {
                     </div>
                     <span className="mono text-[9px] text-zinc-400">Only trades signals whose token volume falls inside this band (∞ = no upper limit).</span>
                   </label>
+
+                  {/* TRADE AMOUNT BAND (from the log alert system) */}
+                  <div className="space-y-2 border border-[#002FA7]/25 bg-[#002FA7]/[0.03] p-2.5" data-testid="bot-tradeamt-section">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] font-semibold uppercase tracking-wider text-[#002FA7]">Trade amount band (log alert)</span>
+                      <button
+                        data-testid="bot-tradeamt-toggle"
+                        onClick={() => patch({ tradeAmtEnabled: !st.config.tradeAmtEnabled })}
+                        className={`mono border px-2 py-0.5 text-[11px] font-semibold transition-colors ${
+                          st.config.tradeAmtEnabled ? "border-[#002FA7] text-[#002FA7]" : "border-zinc-200 text-zinc-400"
+                        }`}
+                      >
+                        {st.config.tradeAmtEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <NumField testid="bot-tradeamt-min" label="Min amount" step="1000" value={form.tradeAmtMin} onChange={(v) => setForm({ ...form, tradeAmtMin: v })} suffix="USDT" />
+                      <NumField testid="bot-tradeamt-max" label="Max amount" step="1000" value={form.tradeAmtMax} onChange={(v) => setForm({ ...form, tradeAmtMax: v })} suffix="USDT" />
+                    </div>
+                    <span className="mono block text-[9px] text-zinc-400">The bot only accepts a signal if its calculated trade amount (from the Alert History log) is inside $1,000 – $100,000,000. Any signal outside the band set here is rejected. Hit “Save settings” to apply.</span>
+                  </div>
+
                   <div className="grid grid-cols-2 gap-2">
                     <NumField testid="bot-streak" label="Repeat count (1 = off)" step="1" value={form.streak} onChange={(v) => setForm({ ...form, streak: v })} suffix="alerts" />
                     <NumField testid="bot-cooldown" label="Cooldown" step="1" value={form.cooldownSec} onChange={(v) => setForm({ ...form, cooldownSec: v })} suffix="sec" />

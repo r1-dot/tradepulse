@@ -16,6 +16,8 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - **External APIs**: Coinbase (BTC/ETH/SOL spot), Blockchain.com (BTC tx/hashrate), CoinGecko (global mcap/dominance — needs key to avoid 429), CoinMarketCap (optional key, mcap fallback), Etherscan (optional key, ETH gas).
 
 ## Implemented (2026-06)
+- **Perp market data switch (2026-06)**: scanner now pulls volume, 24h trades, 24h change & depth from Binance **USD-M futures** via `https://www.binance.com/fapi/v1/...` (the `fapi*.binance.com` hosts are geo-blocked 451/302, but `www.binance.com/fapi` read endpoints are NOT). Symbols display as `ETHUSDT Perp`. Config: `BINANCE_FAPI_DATA_BASE` (default `https://www.binance.com`).
+- **Trade Amount Band filter (2026-06)**: new bot gate — a signal only trades if its calculated trade amount (`tradeVol` = trades-in-window × avg $/trade, from the Alert History log) falls inside `[tradeAmtMin, tradeAmtMax]`, settable $1,000–$100,000,000. Config keys `tradeAmtEnabled`/`tradeAmtMin`/`tradeAmtMax`; UI in BotPanel under Trigger; tests in `tests/test_trade_amount_band.py` (7 pass).
 - Real-time trade-count engine across all 15 timeframes for ~671 USDT pairs (exact via lastId diff)
 - `/api/tokens` (timeframe, search, sort, limit), `/api/token/{symbol}`, `/api/engine/status`, `/api/timeframes`, `/api/market-overview`
 - Virtualized dashboard: market-overview strip, 15 timeframe pills, sortable/searchable table, live status, 1s auto-refresh, footer aggregates

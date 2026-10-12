@@ -117,6 +117,11 @@ BOT_DEFAULTS = {
     "cooldownSec": 30,
     "minVolumeUsd": 5_000_000.0,
     "maxVolumeUsd": 0.0,   # 0 = no upper limit
+    # --- TRADE AMOUNT BAND: gate signals by the USD trade amount the alert/log system calculates
+    # (trades-in-window × avg $/trade). A signal only trades if its amount is inside [min, max].
+    "tradeAmtEnabled": True,
+    "tradeAmtMin": 1_000.0,           # settable 1K – 100M
+    "tradeAmtMax": 100_000_000.0,     # settable 1K – 100M
     "autoExit": True,      # auto-close on TP/SL; if False, positions close only on a SELL signal
     "webhookEnabled": False,
     "webhookUrl": "https://wtalerts.com/bot/runbot",
@@ -1282,10 +1287,10 @@ async def process_bot(http: httpx.AsyncClient, now: float):
         logger.error("hybrid error: %s", he)
 
 
-async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: float, now: float, volume: float = 0.0):
+async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: float, now: float, volume: float = 0.0, trade_amt: float = 0.0):
     """Consume one alert-history event; fire a trade on `streak` consecutive
     same-direction alerts for the same symbol within ~1s. BUY only on buy signals,
-    SELL only on sell signals; both gated by the token volume filter."""
+    SELL only on sell signals; gated by the token-volume band AND the trade-amount band."""
     cfg = BOT["config"]
     if not cfg["enabled"] or BOT["stopped"]:
         return
@@ -1304,6 +1309,18 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
             jlog("skip", symbol=sym, base=sym[: -len(QUOTE)],
                  message=f"{sym} vol ${volume:,.0f} outside band [${_minv:,.0f} – {('$'+format(_maxv, ',.0f')) if _maxv else '∞'}] — no trade")
         return
+
+    # TRADE AMOUNT BAND: only accept signals whose calculated trade amount (from the alert log)
+    # falls inside [tradeAmtMin, tradeAmtMax]. Everything else is rejected.
+    if cfg.get("tradeAmtEnabled", True):
+        tmin = cfg.get("tradeAmtMin", 1_000.0) or 0.0
+        tmax = cfg.get("tradeAmtMax", 100_000_000.0) or 0.0
+        if trade_amt < tmin or (tmax > 0 and trade_amt > tmax):
+            if cfg.get("enabled") and not cfg.get("dryRun") and (now - BOT.get("_amtSkipTs", 0)) > 15:
+                BOT["_amtSkipTs"] = now
+                jlog("skip", symbol=sym, base=sym[: -len(QUOTE)],
+                     message=f"{sym} trade amt ${trade_amt:,.0f} outside band [${tmin:,.0f} – ${tmax:,.0f}] — no trade")
+            return
 
     # STRADDLE MODE: a qualifying volume-spike alert arms a long/short breakout straddle
     # (instead of the streak-based directional entry).
@@ -1654,6 +1671,9 @@ class BotConfigUpdate(BaseModel):
     cooldownSec: Optional[int] = None
     minVolumeUsd: Optional[float] = None
     maxVolumeUsd: Optional[float] = None
+    tradeAmtEnabled: Optional[bool] = None
+    tradeAmtMin: Optional[float] = None
+    tradeAmtMax: Optional[float] = None
     autoExit: Optional[bool] = None
     webhookEnabled: Optional[bool] = None
     webhookUrl: Optional[str] = None
@@ -1779,6 +1799,10 @@ async def bot_config(update: BotConfigUpdate):
         data.pop("exchange")
     if "maxVolumeUsd" in data:
         data["maxVolumeUsd"] = max(0.0, float(data["maxVolumeUsd"]))
+    if "tradeAmtMin" in data:
+        data["tradeAmtMin"] = max(1_000.0, min(100_000_000.0, float(data["tradeAmtMin"])))
+    if "tradeAmtMax" in data:
+        data["tradeAmtMax"] = max(1_000.0, min(100_000_000.0, float(data["tradeAmtMax"])))
     if "maxLossPerTradeUsdt" in data:
         data["maxLossPerTradeUsdt"] = max(0.0, float(data["maxLossPerTradeUsdt"]))
     if "straddleEntryPct" in data:
@@ -1824,6 +1848,7 @@ class SignalIn(BaseModel):
     side: str
     price: float
     volume: Optional[float] = 0.0
+    tradeVol: Optional[float] = 0.0
 
 
 class SignalBatch(BaseModel):
@@ -1837,7 +1862,7 @@ async def bot_signal(batch: SignalBatch):
     fired = 0
     for e in batch.events[:200]:
         if e.side in ("buy", "sell") and e.price > 0:
-            await handle_signal(app.state.http, e.symbol.upper(), e.side, e.price, now, e.volume or 0.0)
+            await handle_signal(app.state.http, e.symbol.upper(), e.side, e.price, now, e.volume or 0.0, e.tradeVol or 0.0)
             fired += 1
     return {"ok": True, "received": fired, "openPositions": len(BOT["positions"]), "active": bool(BOT["config"]["enabled"] and not BOT["stopped"])}
 
