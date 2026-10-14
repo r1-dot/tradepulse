@@ -406,6 +406,25 @@ export default function BotPanel({ open, onClose }) {
                     <div className="grid grid-cols-1 gap-2">
                       <NumField testid="bot-straddle-entry" label="Entry ±" step="0.000001" value={form.straddleEntryPct} onChange={(v) => setForm({ ...form, straddleEntryPct: v })} suffix="%" />
                     </div>
+                    {/* DUAL-SIDE (both legs) — Binance + SIM */}
+                    <div className="border border-[#7C3AED]/20 bg-white/50 p-2" data-testid="bot-straddle-dualside">
+                      <div className="flex items-center justify-between">
+                        <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#7C3AED]">Dual-side (both legs)</span>
+                        <button
+                          data-testid="bot-straddle-dualside-toggle"
+                          onClick={() => patch({ straddleDualSide: !st.config.straddleDualSide })}
+                          className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.straddleDualSide ? "border-[#7C3AED] bg-[#7C3AED] text-white" : "border-zinc-300 text-zinc-500"}`}
+                        >
+                          {st.config.straddleDualSide ? "ON" : "OFF"}
+                        </button>
+                      </div>
+                      <p className="mono text-[9px] leading-relaxed text-zinc-500 mt-1">
+                        When <b>ON</b>, both stops stay live — the <b className="text-[#00A004]">LONG</b> and <b className="text-[#FF3B30]">SHORT</b> legs each open independently as price touches them (no OCO cancel), and each runs under Smart Trailing TP. When OFF it&apos;s the classic OCO breakout above.
+                      </p>
+                      <p className="mono text-[8px] leading-relaxed text-amber-600 mt-1">
+                        ⚠ Designed for <b>Binance</b> + <b>SIM</b>. Ignored on Hyperliquid (one-way nets long+short to zero).
+                      </p>
+                    </div>
                     <div className="border border-[#7C3AED]/20 bg-white/50 p-2" data-testid="bot-straddle-trailing-summary">
                       <div className="mono text-[9px] font-semibold uppercase tracking-wider text-[#7C3AED]">Exits · Smart Trailing TP</div>
                       <p className="mono text-[9px] leading-relaxed text-zinc-500 mt-1">
@@ -498,7 +517,7 @@ export default function BotPanel({ open, onClose }) {
                 ) : (
                   <div className="space-y-1">
                     {st.openPositions.map((p) => (
-                      <div key={p.symbol} data-testid={`bot-pos-${p.symbol}`} className="flex items-center justify-between border border-zinc-100 px-2 py-1.5">
+                      <div key={p.posKey || p.symbol} data-testid={`bot-pos-${p.posKey || p.symbol}`} className="flex items-center justify-between border border-zinc-100 px-2 py-1.5">
                         <div className="mono text-[12px] font-semibold text-zinc-900 flex items-center gap-1">
                           <span className={`rounded-sm px-1 text-[8px] font-bold uppercase ${p.side === "short" ? "bg-[#FF3B30] text-white" : "bg-[#00A004] text-white"}`}>{p.side === "short" ? "S" : "L"}</span>
                           {p.base}USDT<span className="text-[9px] text-zinc-300"> Perp</span>
@@ -507,7 +526,7 @@ export default function BotPanel({ open, onClose }) {
                         <div className="flex flex-col items-end leading-tight">
                           {p.exUPnl != null ? (
                             <>
-                              <div data-testid={`bot-pos-expnl-${p.symbol}`} className={`mono text-[11px] font-semibold ${p.exUPnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}`}>{p.exUPnl >= 0 ? "+" : ""}{p.exUPnl.toFixed(4)}<span className="ml-1 text-[7px] font-bold uppercase text-zinc-400">exch</span></div>
+                              <div data-testid={`bot-pos-expnl-${p.posKey || p.symbol}`} className={`mono text-[11px] font-semibold ${p.exUPnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}`}>{p.exUPnl >= 0 ? "+" : ""}{p.exUPnl.toFixed(4)}<span className="ml-1 text-[7px] font-bold uppercase text-zinc-400">exch</span></div>
                               <div className="mono text-[8px] text-zinc-300">paper {p.uPnl >= 0 ? "+" : ""}{p.uPnl.toFixed(4)}</div>
                             </>
                           ) : (
@@ -572,7 +591,7 @@ const JournalLine = ({ j }) => {
   if (j.kind === "entry") return <span className={j.side === "short" ? "text-[#FF3B30]" : "text-[#00A004]"}>{j.side === "short" ? "SHORT" : "BUY"} {j.base} @ {Number(j.price).toPrecision(5)}{j.source === "straddle" ? " · straddle" : ""} · {j.mode}</span>;
   if (j.kind === "exit") return <span className={j.pnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}>{j.side === "cover" ? "COVER" : "SELL"} {j.base} @ {Number(j.price).toPrecision(5)} · {j.reason} · pnl {j.pnl >= 0 ? "+" : ""}{Number(j.pnl).toFixed(4)}</span>;
   if (j.kind === "straddle") return <span className="text-[#7C3AED]">STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
-  if (j.kind === "straddle_fill") return <span className="text-[#7C3AED] font-semibold">{j.side === "short" ? "SHORT" : "LONG"} leg filled {j.base} — opposite cancelled</span>;
+  if (j.kind === "straddle_fill") return <span className="text-[#7C3AED] font-semibold">{j.message || `${j.side === "short" ? "SHORT" : "LONG"} leg filled ${j.base} — opposite cancelled`}</span>;
   if (j.kind === "straddle_cancel") return <span className="text-zinc-400">straddle {j.base} cancelled ({j.reason})</span>;
   if (j.kind === "halt") return <span className="text-[#FF3B30] font-semibold">⛔ {j.message}</span>;
   if (j.kind === "power") return <span className="text-zinc-700">{j.message} ({j.mode})</span>;
