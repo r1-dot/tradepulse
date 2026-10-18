@@ -181,6 +181,8 @@ BOT = {
     "journal": deque(maxlen=300),
     "dailyPnl": 0.0,
     "dailyDate": "",
+    "wins": 0,               # today's closed trades that ended in profit
+    "losses": 0,             # today's closed trades that ended in loss
     "stopped": False,       # halted by daily loss limit
     "signalStreaks": {},    # symbol -> {"side","count","startTs"}
     "lastSignalTs": 0.0,    # last alert event received from dashboard
@@ -864,6 +866,10 @@ async def _close_position(http, pkey, price, reason):
     BOT["positions"].pop(pkey, None)
     pnl = (fill - pos["entryPrice"]) * pos["qty"] * (1 if pos.get("side", "long") == "long" else -1)
     BOT["dailyPnl"] += pnl
+    if pnl > 0:
+        BOT["wins"] += 1
+    elif pnl < 0:
+        BOT["losses"] += 1
     BOT["lastTradeTs"][sym] = time.time()
     jlog("exit", symbol=sym, base=pos["base"], side="sell" if pos.get("side", "long") == "long" else "cover", price=fill,
          entry=pos["entryPrice"], qty=pos["qty"], pnl=pnl, reason=reason,
@@ -897,6 +903,10 @@ async def _reconcile_flat(ex_map, now, fast=False):
         pnl = (fill - pos["entryPrice"]) * pos["qty"] * (1 if pos.get("side", "long") == "long" else -1)
         BOT["positions"].pop(sym, None)
         BOT["dailyPnl"] += pnl
+        if pnl > 0:
+            BOT["wins"] += 1
+        elif pnl < 0:
+            BOT["losses"] += 1
         BOT["lastTradeTs"][sym] = now
         BOT["closeIntents"].pop(hc, None)
         await _hl_cancel_coin(hc)  # clear any orphan triggers left behind
@@ -1198,6 +1208,8 @@ async def process_bot(http: httpx.AsyncClient, now: float):
     if BOT["dailyDate"] != today:
         BOT["dailyDate"] = today
         BOT["dailyPnl"] = 0.0
+        BOT["wins"] = 0
+        BOT["losses"] = 0
         BOT["stopped"] = False
         jlog("daily_reset", date=today)
 
@@ -1779,6 +1791,8 @@ def _bot_status():
         "stopped": BOT["stopped"],
         "dailyPnl": BOT["dailyPnl"],
         "dailyDate": BOT["dailyDate"],
+        "wins": BOT["wins"],
+        "losses": BOT["losses"],
         "unrealizedPnl": unrealized,
         "exchangeUnrealizedPnl": ex_upnl_total if ex_map else None,
         "openPositions": positions,
@@ -1962,6 +1976,8 @@ async def bot_sync_stops():
 @api_router.post("/bot/reset-daily")
 async def bot_reset_daily():
     BOT["dailyPnl"] = 0.0
+    BOT["wins"] = 0
+    BOT["losses"] = 0
     BOT["stopped"] = False
     jlog("daily_reset", message="Manual daily reset")
     return _bot_status()

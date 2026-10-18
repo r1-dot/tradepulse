@@ -285,7 +285,24 @@ export default function BotPanel({ open, onClose }) {
                 )}
                 <Stat label="API keys" value={st.keysConfigured ? "configured" : "missing"}
                   color={st.keysConfigured ? "#00A004" : "#B26A00"} />
+                <Stat label="Profit trades" testid="bot-wins"
+                  value={`${st.wins ?? 0}`} color="#00A004" />
+                <Stat label="Loss trades" testid="bot-losses"
+                  value={`${st.losses ?? 0}`} color="#FF3B30" />
               </div>
+
+              {/* win / loss summary bar */}
+              {((st.wins ?? 0) + (st.losses ?? 0)) > 0 && (
+                <div className="flex items-center justify-between border border-zinc-100 px-2.5 py-1.5" data-testid="bot-winrate">
+                  <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Win rate (today)</span>
+                  <span className="mono text-[12px] font-semibold text-zinc-900">
+                    {Math.round(((st.wins ?? 0) / ((st.wins ?? 0) + (st.losses ?? 0))) * 100)}%
+                    <span className="ml-2 text-[10px] font-normal text-zinc-400">
+                      <span className="text-[#00A004]">{st.wins ?? 0}W</span> · <span className="text-[#FF3B30]">{st.losses ?? 0}L</span>
+                    </span>
+                  </span>
+                </div>
+              )}
 
               {/* alert dependency notice */}
               <div className="flex items-start gap-2 border border-zinc-200 bg-zinc-50 p-2.5" data-testid="bot-feed-note">
