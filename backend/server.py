@@ -132,6 +132,11 @@ BOT_DEFAULTS = {
     # --- BINANCE USD-M FUTURES (USDT-margined perps): reuses BINANCE_API_KEY/SECRET (Futures
     # permission required). Long+short, per-trade leverage, reduce-only close, mode auto-detect.
     "futuresLeverage": 3,          # default leverage for futures trades (1-125, per-symbol)
+    # FUTURES entry buffers (Binance USD-M only): limit-entry offset from the signal price.
+    # LONG enters through the NEGATIVE buffer (below mark); SHORT through the POSITIVE buffer
+    # (above mark). Each 0.001%–5%; 0 = buffer OFF (plain market order at mark).
+    "futLongBufferPct": 0.0,       # negative buffer for LONG entries
+    "futShortBufferPct": 0.0,      # positive buffer for SHORT entries
     "futuresTestnet": False,       # use testnet.binancefuture.com instead of fapi.binance.com
     "maxLossPerTradeUsdt": 0.0002,  # hard cap: auto-close any position at this $ loss
     # --- STRADDLE SYSTEM: on a volume spike, arm a LONG stop above + SHORT stop below.
@@ -247,7 +252,7 @@ async def _live_market(http, symbol, side, quote_qty=None, base_qty=None):
 
 
 # ----------------------------- Binance USD-M Futures -----------------------------
-_FAPI = {"mode": None, "modeTs": 0.0, "lots": {}, "lotsTs": 0.0, "activeHost": None}
+_FAPI = {"mode": None, "modeTs": 0.0, "lots": {}, "ticks": {}, "lotsTs": 0.0, "activeHost": None}
 
 
 def _fapi_hosts():
@@ -343,15 +348,22 @@ async def _fapi_round_qty(http, symbol, qty):
                 except Exception:  # noqa: BLE001
                     continue
             lots = {}
+            ticks = {}
             for s in (info or {}).get("symbols", []):
                 step = None
+                tick = None
                 for f in s.get("filters", []):
                     if f.get("filterType") in ("MARKET_LOT_SIZE", "LOT_SIZE"):
                         step = f.get("stepSize")
+                    if f.get("filterType") == "PRICE_FILTER":
+                        tick = f.get("tickSize")
                 if step:
                     lots[s["symbol"]] = float(step)
+                if tick:
+                    ticks[s["symbol"]] = float(tick)
             if lots:
                 _FAPI["lots"] = lots
+                _FAPI["ticks"] = ticks
                 _FAPI["lotsTs"] = now
         step = _FAPI["lots"].get(symbol.upper())
         if step and step > 0:
@@ -359,6 +371,21 @@ async def _fapi_round_qty(http, symbol, qty):
     except Exception:  # noqa: BLE001
         pass
     return qty
+
+
+async def _fapi_round_price(http, symbol, price):
+    """Round a price to the symbol's PRICE_FILTER tickSize (populated alongside lots)."""
+    try:
+        if not _FAPI["lots"]:
+            await _fapi_round_qty(http, symbol, 1.0)  # warms both lots + ticks caches
+        tick = _FAPI.get("ticks", {}).get(symbol.upper())
+        if tick and tick > 0:
+            rounded = math.floor(price / tick) * tick
+            decimals = max(0, len(f"{tick:.10f}".rstrip("0").split(".")[-1])) if tick < 1 else 0
+            return round(rounded, decimals)
+    except Exception:  # noqa: BLE001
+        pass
+    return price
 
 
 async def _fapi_set_leverage(http, symbol, lev):
@@ -379,15 +406,22 @@ def _extract_order_id(res):
     return str(oid) if oid is not None else None
 
 
-async def _fapi_market_open(http, symbol, is_long, qty, lev):
+async def _fapi_market_open(http, symbol, is_long, qty, lev, limit_price=None):
     hedge = await fapi_position_mode(http)
     await _fapi_set_leverage(http, symbol, lev)
     qty = await _fapi_round_qty(http, symbol, qty)
-    params = {"symbol": symbol.upper(), "side": "BUY" if is_long else "SELL", "type": "MARKET",
+    params = {"symbol": symbol.upper(), "side": "BUY" if is_long else "SELL",
               "quantity": qty, "newOrderRespType": "RESULT",
               "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
+    if limit_price and limit_price > 0:
+        # buffered entry -> resting LIMIT order at the offset price (maker)
+        params["type"] = "LIMIT"
+        params["timeInForce"] = "GTC"
+        params["price"] = await _fapi_round_price(http, symbol, limit_price)
+    else:
+        params["type"] = "MARKET"
     res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
-    logger.info("FUTURES open raw response (%s %s): %s", symbol, "BUY" if is_long else "SELL", res)
+    logger.info("FUTURES open raw response (%s %s %s): %s", symbol, "BUY" if is_long else "SELL", params["type"], res)
     executed = float(res.get("executedQty", 0) or 0) or qty
     ap = float(res.get("avgPrice", 0) or 0)
     return {"executedQty": executed, "fillPrice": ap, "orderId": _extract_order_id(res), "raw": res}
@@ -704,13 +738,21 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     else:
         lev = cfg.get("hlLeverage", 1)
     cross = is_cross if is_cross is not None else cfg.get("hlCrossMargin", True)
+    # FUTURES entry buffer: LONG via the negative buffer (below mark), SHORT via the positive
+    # buffer (above mark). Only for Binance USD-M; 0 = off (plain market/mark fill).
+    fut_buf = 0.0
+    if cfg.get("exchange") == "binance_futures":
+        fut_buf = max(0.0, (cfg.get("futLongBufferPct", 0.0) if is_long else cfg.get("futShortBufferPct", 0.0)) or 0.0)
+    buffered_price = price
+    if fut_buf > 0:
+        buffered_price = price * (1 - fut_buf / 100) if is_long else price * (1 + fut_buf / 100)
     # base coin, stripped of USDT/USDC (safe even if sym dropped out of the latest snapshot)
     base = (STATE["latest"].get(sym) or {}).get("base") or hlconv.strip_quote(sym)
     if cfg["dryRun"]:
         # simulated fill at the live price; leverage scales the simulated exposure (long AND
         # short) so PnL reflects the chosen leverage — works for Binance sim + Hyperliquid sim.
         qty = qty * max(1, int(lev or 1))
-        fill = price
+        fill = buffered_price
         executed = qty
     elif cfg.get("exchange") == "hyperliquid":
         try:
@@ -738,13 +780,15 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
             return
     elif cfg.get("exchange") == "binance_futures":
         try:
-            r = await _fapi_market_open(http, sym, is_long, qty, lev)
-            fill = r["fillPrice"] or price
+            r = await _fapi_market_open(http, sym, is_long, qty, lev,
+                                        limit_price=buffered_price if fut_buf > 0 else None)
+            fill = r["fillPrice"] or buffered_price
             executed = r["executedQty"] or qty
             order_id = r.get("orderId")
+            _bufmsg = f" · buf {fut_buf}%" if fut_buf > 0 else ""
             jlog("futures", symbol=sym, base=base, action="LONG" if is_long else "SHORT", live=True,
                  venue="binance_futures", leverage=lev, size=executed, price=fill,
-                 message=f"FUTURES OPEN {'LONG' if is_long else 'SHORT'} {sym} {executed} @ {fill:.6g} · {lev}x · order {order_id}")
+                 message=f"FUTURES OPEN {'LONG' if is_long else 'SHORT'} {sym} {executed} @ {fill:.6g} · {lev}x{_bufmsg} · order {order_id}")
         except Exception as e:  # noqa: BLE001
             jlog("error", symbol=sym, action="LONG" if is_long else "SHORT", live=True, venue="binance_futures",
                  message=f"FUTURES open failed: {str(e)[:180]}")
@@ -1719,6 +1763,8 @@ class BotConfigUpdate(BaseModel):
     exchange: Optional[str] = None
     hlTestnet: Optional[bool] = None
     futuresLeverage: Optional[int] = None
+    futLongBufferPct: Optional[float] = None
+    futShortBufferPct: Optional[float] = None
     futuresTestnet: Optional[bool] = None
     maxLossPerTradeUsdt: Optional[float] = None
     straddleEnabled: Optional[bool] = None
@@ -1846,6 +1892,10 @@ async def bot_config(update: BotConfigUpdate):
         data["tradeAmtMax"] = max(1_000.0, min(100_000_000.0, float(data["tradeAmtMax"])))
     if "maxLossPerTradeUsdt" in data:
         data["maxLossPerTradeUsdt"] = max(0.0, float(data["maxLossPerTradeUsdt"]))
+    for _bk in ("futLongBufferPct", "futShortBufferPct"):
+        if _bk in data:
+            _v = float(data[_bk])
+            data[_bk] = 0.0 if _v <= 0 else max(0.001, min(5.0, _v))
     if "straddleEntryPct" in data:
         data["straddleEntryPct"] = max(0.000001, min(5.0, float(data["straddleEntryPct"])))
     if "straddleTpPct" in data:
