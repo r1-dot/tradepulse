@@ -266,8 +266,8 @@ export default function BotPanel({ open, onClose }) {
                 {st.config.exchange === "binance_futures" && (
                   <div className="space-y-1.5" data-testid="bot-fut-buffer-row">
                     <div className="flex flex-wrap items-center gap-2">
-                      <div className="flex items-center gap-1 border border-[#00A004]/40 px-2 py-1" title="SHORT entries: limit sell this % ABOVE the signal price">
-                        <span className="mono text-[10px] text-zinc-500">+ buffer <span className="text-[#00A004] font-semibold">(short)</span></span>
+                      <div className="flex items-center gap-1 border border-[#00A004]/40 px-2 py-1" title="SHORT max slippage: fills instantly, never more than this % below mark">
+                        <span className="mono text-[10px] text-zinc-500">slip <span className="text-[#00A004] font-semibold">(short)</span></span>
                         <input
                           data-testid="bot-fut-pos-buffer"
                           type="number" min="0" max="5" step="0.001"
@@ -278,8 +278,8 @@ export default function BotPanel({ open, onClose }) {
                         />
                         <span className="mono text-[11px] font-bold text-[#7C3AED]">%</span>
                       </div>
-                      <div className="flex items-center gap-1 border border-[#FF3B30]/40 px-2 py-1" title="LONG entries: limit buy this % BELOW the signal price">
-                        <span className="mono text-[10px] text-zinc-500">− buffer <span className="text-[#FF3B30] font-semibold">(long)</span></span>
+                      <div className="flex items-center gap-1 border border-[#FF3B30]/40 px-2 py-1" title="LONG max slippage: fills instantly, never more than this % above mark">
+                        <span className="mono text-[10px] text-zinc-500">slip <span className="text-[#FF3B30] font-semibold">(long)</span></span>
                         <input
                           data-testid="bot-fut-neg-buffer"
                           type="number" min="0" max="5" step="0.001"
@@ -292,7 +292,7 @@ export default function BotPanel({ open, onClose }) {
                       </div>
                     </div>
                     <span className="mono block text-[9px] leading-tight text-zinc-400">
-                      LONG enters via the <b className="text-[#FF3B30]">− buffer</b> (limit buy below mark), SHORT via the <b className="text-[#00A004]">+ buffer</b> (limit sell above mark). Each 0.001%–5%; set <b>0.000</b> to turn a buffer off (market fill at mark).
+                      Max <b>slippage</b> on instant market entry: <b className="text-[#FF3B30]">LONG</b> fills up to this % above mark, <b className="text-[#00A004]">SHORT</b> down to this % below mark — fills immediately (IOC) but never worse than the cap. Each 0.001%–5%; set <b>0.000</b> to turn off (plain market at mark).
                     </span>
                   </div>
                 )}

@@ -132,11 +132,11 @@ BOT_DEFAULTS = {
     # --- BINANCE USD-M FUTURES (USDT-margined perps): reuses BINANCE_API_KEY/SECRET (Futures
     # permission required). Long+short, per-trade leverage, reduce-only close, mode auto-detect.
     "futuresLeverage": 3,          # default leverage for futures trades (1-125, per-symbol)
-    # FUTURES entry buffers (Binance USD-M only): limit-entry offset from the signal price.
-    # LONG enters through the NEGATIVE buffer (below mark); SHORT through the POSITIVE buffer
-    # (above mark). Each 0.001%–5%; 0 = buffer OFF (plain market order at mark).
-    "futLongBufferPct": 0.0,       # negative buffer for LONG entries
-    "futShortBufferPct": 0.0,      # positive buffer for SHORT entries
+    # FUTURES slippage caps (Binance USD-M only): marketable IOC entry that fills instantly
+    # but never worse than buf% from mark. LONG caps at +buf% above, SHORT at -buf% below.
+    # Each 0.001%–5%; 0 = off (plain MARKET order at mark).
+    "futLongBufferPct": 0.0,       # max slippage for LONG entries
+    "futShortBufferPct": 0.0,      # max slippage for SHORT entries
     "futuresTestnet": False,       # use testnet.binancefuture.com instead of fapi.binance.com
     "maxLossPerTradeUsdt": 0.0002,  # hard cap: auto-close any position at this $ loss
     # --- STRADDLE SYSTEM: on a volume spike, arm a LONG stop above + SHORT stop below.
@@ -414,9 +414,10 @@ async def _fapi_market_open(http, symbol, is_long, qty, lev, limit_price=None):
               "quantity": qty, "newOrderRespType": "RESULT",
               "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
     if limit_price and limit_price > 0:
-        # buffered entry -> resting LIMIT order at the offset price (maker)
+        # slippage-capped entry -> marketable LIMIT IOC: fills instantly against the book
+        # up to this price, then cancels any remainder (never fills worse than the cap).
         params["type"] = "LIMIT"
-        params["timeInForce"] = "GTC"
+        params["timeInForce"] = "IOC"
         params["price"] = await _fapi_round_price(http, symbol, limit_price)
     else:
         params["type"] = "MARKET"
@@ -738,21 +739,22 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     else:
         lev = cfg.get("hlLeverage", 1)
     cross = is_cross if is_cross is not None else cfg.get("hlCrossMargin", True)
-    # FUTURES entry buffer: LONG via the negative buffer (below mark), SHORT via the positive
-    # buffer (above mark). Only for Binance USD-M; 0 = off (plain market/mark fill).
+    # FUTURES slippage cap (Binance USD-M only): a marketable IOC order that fills instantly
+    # but never worse than buf% from mark. LONG caps at +buf% above, SHORT at -buf% below.
+    # 0 = off (plain MARKET at mark).
     fut_buf = 0.0
     if cfg.get("exchange") == "binance_futures":
         fut_buf = max(0.0, (cfg.get("futLongBufferPct", 0.0) if is_long else cfg.get("futShortBufferPct", 0.0)) or 0.0)
-    buffered_price = price
+    cap_price = None
     if fut_buf > 0:
-        buffered_price = price * (1 - fut_buf / 100) if is_long else price * (1 + fut_buf / 100)
+        cap_price = price * (1 + fut_buf / 100) if is_long else price * (1 - fut_buf / 100)
     # base coin, stripped of USDT/USDC (safe even if sym dropped out of the latest snapshot)
     base = (STATE["latest"].get(sym) or {}).get("base") or hlconv.strip_quote(sym)
     if cfg["dryRun"]:
         # simulated fill at the live price; leverage scales the simulated exposure (long AND
         # short) so PnL reflects the chosen leverage — works for Binance sim + Hyperliquid sim.
         qty = qty * max(1, int(lev or 1))
-        fill = buffered_price
+        fill = price
         executed = qty
     elif cfg.get("exchange") == "hyperliquid":
         try:
@@ -781,11 +783,11 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     elif cfg.get("exchange") == "binance_futures":
         try:
             r = await _fapi_market_open(http, sym, is_long, qty, lev,
-                                        limit_price=buffered_price if fut_buf > 0 else None)
-            fill = r["fillPrice"] or buffered_price
+                                        limit_price=cap_price if fut_buf > 0 else None)
+            fill = r["fillPrice"] or price
             executed = r["executedQty"] or qty
             order_id = r.get("orderId")
-            _bufmsg = f" · buf {fut_buf}%" if fut_buf > 0 else ""
+            _bufmsg = f" · slip≤{fut_buf}%" if fut_buf > 0 else ""
             jlog("futures", symbol=sym, base=base, action="LONG" if is_long else "SHORT", live=True,
                  venue="binance_futures", leverage=lev, size=executed, price=fill,
                  message=f"FUTURES OPEN {'LONG' if is_long else 'SHORT'} {sym} {executed} @ {fill:.6g} · {lev}x{_bufmsg} · order {order_id}")
