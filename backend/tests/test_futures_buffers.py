@@ -96,8 +96,8 @@ def test_open_position_cap_direction(monkeypatch):
         await server._open_position(FakeHTTP(), "BTCUSDT", 100.0, time.time(), side="short",
                                     tp_price=None, sl_price=None, source="signal", pos_key="B#S")
     asyncio.run(run())
-    assert abs(captured["long"] - 101.0) < 1e-9, "long cap = +1% above mark"
-    assert abs(captured["short"] - 98.0) < 1e-9, "short cap = -2% below mark"
+    assert abs(captured["long"] - 99.0) < 1e-9, "long cap = -1% below mark"
+    assert abs(captured["short"] - 102.0) < 1e-9, "short cap = +2% above mark"
     cfg.update({"enabled": False, "dryRun": True, "exchange": "hyperliquid",
                 "futLongBufferPct": 0.0, "futShortBufferPct": 0.0})
     server.BOT["positions"].clear()

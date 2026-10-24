@@ -133,7 +133,7 @@ BOT_DEFAULTS = {
     # permission required). Long+short, per-trade leverage, reduce-only close, mode auto-detect.
     "futuresLeverage": 3,          # default leverage for futures trades (1-125, per-symbol)
     # FUTURES slippage caps (Binance USD-M only): marketable IOC entry that fills instantly
-    # but never worse than buf% from mark. LONG caps at +buf% above, SHORT at -buf% below.
+    # but never worse than buf% from mark. LONG caps at -buf% below mark, SHORT at +buf% above.
     # Each 0.001%–5%; 0 = off (plain MARKET order at mark).
     "futLongBufferPct": 0.0,       # max slippage for LONG entries
     "futShortBufferPct": 0.0,      # max slippage for SHORT entries
@@ -740,14 +740,14 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
         lev = cfg.get("hlLeverage", 1)
     cross = is_cross if is_cross is not None else cfg.get("hlCrossMargin", True)
     # FUTURES slippage cap (Binance USD-M only): a marketable IOC order that fills instantly
-    # but never worse than buf% from mark. LONG caps at +buf% above, SHORT at -buf% below.
+    # but never worse than buf% from mark. LONG caps at -buf% below mark, SHORT at +buf% above.
     # 0 = off (plain MARKET at mark).
     fut_buf = 0.0
     if cfg.get("exchange") == "binance_futures":
         fut_buf = max(0.0, (cfg.get("futLongBufferPct", 0.0) if is_long else cfg.get("futShortBufferPct", 0.0)) or 0.0)
     cap_price = None
     if fut_buf > 0:
-        cap_price = price * (1 + fut_buf / 100) if is_long else price * (1 - fut_buf / 100)
+        cap_price = price * (1 - fut_buf / 100) if is_long else price * (1 + fut_buf / 100)
     # base coin, stripped of USDT/USDC (safe even if sym dropped out of the latest snapshot)
     base = (STATE["latest"].get(sym) or {}).get("base") or hlconv.strip_quote(sym)
     if cfg["dryRun"]:
