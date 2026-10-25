@@ -292,7 +292,7 @@ export default function BotPanel({ open, onClose }) {
                       </div>
                     </div>
                     <span className="mono block text-[9px] leading-tight text-zinc-400">
-                      Max <b>slippage</b> on instant market entry: <b className="text-[#FF3B30]">LONG</b> fills up to this % below mark, <b className="text-[#00A004]">SHORT</b> up to this % above mark — fills immediately (IOC) but never worse than the cap. Each 0.001%–5%; set <b>0.000</b> to turn off (plain market at mark).
+                      Entry <b>buffer</b> (limit price): <b className="text-[#FF3B30]">LONG</b> rests this % below mark, <b className="text-[#00A004]">SHORT</b> this % above mark — a resting limit order (no IOC). Each 0.001%–5%; set <b>0.000</b> to turn off (plain market at mark).
                     </span>
                   </div>
                 )}

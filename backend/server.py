@@ -132,8 +132,8 @@ BOT_DEFAULTS = {
     # --- BINANCE USD-M FUTURES (USDT-margined perps): reuses BINANCE_API_KEY/SECRET (Futures
     # permission required). Long+short, per-trade leverage, reduce-only close, mode auto-detect.
     "futuresLeverage": 3,          # default leverage for futures trades (1-125, per-symbol)
-    # FUTURES slippage caps (Binance USD-M only): marketable IOC entry that fills instantly
-    # but never worse than buf% from mark. LONG caps at -buf% below mark, SHORT at +buf% above.
+    # FUTURES slippage caps (Binance USD-M only): resting LIMIT GTC entry (IOC disabled)
+    # LONG rests at -buf% below mark, SHORT at +buf% above. 0 = off (plain MARKET at mark).
     # Each 0.001%–5%; 0 = off (plain MARKET order at mark).
     "futLongBufferPct": 0.0,       # max slippage for LONG entries
     "futShortBufferPct": 0.0,      # max slippage for SHORT entries
@@ -414,10 +414,9 @@ async def _fapi_market_open(http, symbol, is_long, qty, lev, limit_price=None):
               "quantity": qty, "newOrderRespType": "RESULT",
               "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
     if limit_price and limit_price > 0:
-        # slippage-capped entry -> marketable LIMIT IOC: fills instantly against the book
-        # up to this price, then cancels any remainder (never fills worse than the cap).
+        # buffered entry -> resting LIMIT GTC at the offset price (IOC disabled).
         params["type"] = "LIMIT"
-        params["timeInForce"] = "IOC"
+        params["timeInForce"] = "GTC"
         params["price"] = await _fapi_round_price(http, symbol, limit_price)
     else:
         params["type"] = "MARKET"
@@ -739,8 +738,8 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     else:
         lev = cfg.get("hlLeverage", 1)
     cross = is_cross if is_cross is not None else cfg.get("hlCrossMargin", True)
-    # FUTURES slippage cap (Binance USD-M only): a marketable IOC order that fills instantly
-    # but never worse than buf% from mark. LONG caps at -buf% below mark, SHORT at +buf% above.
+    # FUTURES slippage cap (Binance USD-M only): a resting LIMIT GTC order (IOC disabled)
+    # LONG rests at -buf% below mark, SHORT at +buf% above. 0 = off (plain MARKET at mark).
     # 0 = off (plain MARKET at mark).
     fut_buf = 0.0
     if cfg.get("exchange") == "binance_futures":

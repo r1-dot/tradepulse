@@ -51,11 +51,11 @@ def _patch(monkeypatch):
 
 def test_long_cap_is_marketable_ioc(monkeypatch):
     fs = _patch(monkeypatch)
-    # long slippage cap -> price above mark, instant IOC
+    # buffered long -> resting LIMIT GTC (IOC disabled)
     r = asyncio.run(server._fapi_market_open(FakeHTTP(), "BTCUSDT", True, 0.01, 3, limit_price=100.1))
     p = fs.calls[-1]
     assert p["type"] == "LIMIT" and p["side"] == "BUY"
-    assert p["timeInForce"] == "IOC" and p["price"] == 100.1
+    assert p["timeInForce"] == "GTC" and p["price"] == 100.1
     assert r["orderId"] == "123"
 
 
@@ -64,7 +64,7 @@ def test_short_cap_is_marketable_ioc(monkeypatch):
     asyncio.run(server._fapi_market_open(FakeHTTP(), "BTCUSDT", False, 0.01, 3, limit_price=99.9))
     p = fs.calls[-1]
     assert p["type"] == "LIMIT" and p["side"] == "SELL"
-    assert p["timeInForce"] == "IOC" and p["price"] == 99.9
+    assert p["timeInForce"] == "GTC" and p["price"] == 99.9
 
 
 def test_zero_buffer_is_plain_market(monkeypatch):
