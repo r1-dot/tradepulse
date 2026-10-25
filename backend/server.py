@@ -132,8 +132,8 @@ BOT_DEFAULTS = {
     # --- BINANCE USD-M FUTURES (USDT-margined perps): reuses BINANCE_API_KEY/SECRET (Futures
     # permission required). Long+short, per-trade leverage, reduce-only close, mode auto-detect.
     "futuresLeverage": 3,          # default leverage for futures trades (1-125, per-symbol)
-    # FUTURES slippage caps (Binance USD-M only): resting LIMIT GTC entry (IOC disabled)
-    # LONG rests at -buf% below mark, SHORT at +buf% above. 0 = off (plain MARKET at mark).
+    # FUTURES entry buffer (Binance USD-M only): shapes the SIM preview fill only; live is a
+    # plain MARKET order. SIM preview: LONG -buf% below mark, SHORT +buf% above. 0.001%-5%; 0 = off.
     # Each 0.001%–5%; 0 = off (plain MARKET order at mark).
     "futLongBufferPct": 0.0,       # max slippage for LONG entries
     "futShortBufferPct": 0.0,      # max slippage for SHORT entries
@@ -407,21 +407,16 @@ def _extract_order_id(res):
 
 
 async def _fapi_market_open(http, symbol, is_long, qty, lev, limit_price=None):
+    # Entry is always a plain MARKET order (instant fill at mark). The buffer only shapes the
+    # SIM preview fill; a live market order has no price, so limit_price is accepted but unused.
     hedge = await fapi_position_mode(http)
     await _fapi_set_leverage(http, symbol, lev)
     qty = await _fapi_round_qty(http, symbol, qty)
-    params = {"symbol": symbol.upper(), "side": "BUY" if is_long else "SELL",
+    params = {"symbol": symbol.upper(), "side": "BUY" if is_long else "SELL", "type": "MARKET",
               "quantity": qty, "newOrderRespType": "RESULT",
               "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
-    if limit_price and limit_price > 0:
-        # buffered entry -> resting LIMIT GTC at the offset price (IOC disabled).
-        params["type"] = "LIMIT"
-        params["timeInForce"] = "GTC"
-        params["price"] = await _fapi_round_price(http, symbol, limit_price)
-    else:
-        params["type"] = "MARKET"
     res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
-    logger.info("FUTURES open raw response (%s %s %s): %s", symbol, "BUY" if is_long else "SELL", params["type"], res)
+    logger.info("FUTURES open raw response (%s %s MARKET): %s", symbol, "BUY" if is_long else "SELL", res)
     executed = float(res.get("executedQty", 0) or 0) or qty
     ap = float(res.get("avgPrice", 0) or 0)
     return {"executedQty": executed, "fillPrice": ap, "orderId": _extract_order_id(res), "raw": res}
@@ -738,9 +733,9 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     else:
         lev = cfg.get("hlLeverage", 1)
     cross = is_cross if is_cross is not None else cfg.get("hlCrossMargin", True)
-    # FUTURES slippage cap (Binance USD-M only): a resting LIMIT GTC order (IOC disabled)
-    # LONG rests at -buf% below mark, SHORT at +buf% above. 0 = off (plain MARKET at mark).
-    # 0 = off (plain MARKET at mark).
+    # FUTURES entry buffer (Binance USD-M only): shapes the SIM preview fill. LONG previews at
+    # -buf% below mark, SHORT at +buf% above. Live entry is always a plain MARKET order at mark.
+    # 0 = off (fill at mark).
     fut_buf = 0.0
     if cfg.get("exchange") == "binance_futures":
         fut_buf = max(0.0, (cfg.get("futLongBufferPct", 0.0) if is_long else cfg.get("futShortBufferPct", 0.0)) or 0.0)
@@ -750,10 +745,10 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
     # base coin, stripped of USDT/USDC (safe even if sym dropped out of the latest snapshot)
     base = (STATE["latest"].get(sym) or {}).get("base") or hlconv.strip_quote(sym)
     if cfg["dryRun"]:
-        # simulated fill at the live price; leverage scales the simulated exposure (long AND
-        # short) so PnL reflects the chosen leverage — works for Binance sim + Hyperliquid sim.
+        # simulated fill; leverage scales the simulated exposure. For Binance futures a buffer
+        # previews the shifted entry (cap_price); otherwise fill at mark.
         qty = qty * max(1, int(lev or 1))
-        fill = price
+        fill = cap_price if (cap_price and cfg.get("exchange") == "binance_futures") else price
         executed = qty
     elif cfg.get("exchange") == "hyperliquid":
         try:
@@ -781,12 +776,11 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
             return
     elif cfg.get("exchange") == "binance_futures":
         try:
-            r = await _fapi_market_open(http, sym, is_long, qty, lev,
-                                        limit_price=cap_price if fut_buf > 0 else None)
+            r = await _fapi_market_open(http, sym, is_long, qty, lev)
             fill = r["fillPrice"] or price
             executed = r["executedQty"] or qty
             order_id = r.get("orderId")
-            _bufmsg = f" · slip≤{fut_buf}%" if fut_buf > 0 else ""
+            _bufmsg = f" · buf {fut_buf}%(sim)" if fut_buf > 0 else ""
             jlog("futures", symbol=sym, base=base, action="LONG" if is_long else "SHORT", live=True,
                  venue="binance_futures", leverage=lev, size=executed, price=fill,
                  message=f"FUTURES OPEN {'LONG' if is_long else 'SHORT'} {sym} {executed} @ {fill:.6g} · {lev}x{_bufmsg} · order {order_id}")

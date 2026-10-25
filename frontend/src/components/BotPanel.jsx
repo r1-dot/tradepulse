@@ -292,7 +292,7 @@ export default function BotPanel({ open, onClose }) {
                       </div>
                     </div>
                     <span className="mono block text-[9px] leading-tight text-zinc-400">
-                      Entry <b>buffer</b> (limit price): <b className="text-[#FF3B30]">LONG</b> rests this % below mark, <b className="text-[#00A004]">SHORT</b> this % above mark — a resting limit order (no IOC). Each 0.001%–5%; set <b>0.000</b> to turn off (plain market at mark).
+                      Entry <b>buffer</b>: live entry is always a plain <b>market</b> order (instant fill at mark). In <b>SIM</b> it previews the shifted entry — <b className="text-[#FF3B30]">LONG</b> this % below mark, <b className="text-[#00A004]">SHORT</b> this % above. Each 0.001%–5%; set <b>0.000</b> to turn off.
                     </span>
                   </div>
                 )}
