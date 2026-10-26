@@ -38,6 +38,7 @@ def _reset(client, **extra):
         "enabled": True, "dryRun": True, "streak": 2, "cooldownSec": 0,
         "minVolumeUsd": 0.0, "maxVolumeUsd": 0.0, "maxOpenPositions": 5,
         "straddleEnabled": False,
+        "futLongBufferPct": 0.0, "futShortBufferPct": 0.0,
         "tradeAmtEnabled": True, "tradeAmtMin": 1000.0, "tradeAmtMax": 100_000_000.0,
     }
     body.update(extra)

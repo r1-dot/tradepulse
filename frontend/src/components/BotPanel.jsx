@@ -292,7 +292,7 @@ export default function BotPanel({ open, onClose }) {
                       </div>
                     </div>
                     <span className="mono block text-[9px] leading-tight text-zinc-400">
-                      Entry <b>buffer</b>: live entry is always a plain <b>market</b> order (instant fill at mark). In <b>SIM</b> it previews the shifted entry — <b className="text-[#FF3B30]">LONG</b> this % below mark, <b className="text-[#00A004]">SHORT</b> this % above. Each 0.001%–5%; set <b>0.000</b> to turn off.
+                      <b>IOC / slippage</b> entry: a slippage-priced order that waits up to <b>5 min</b> to fill, else auto-cancels. <b className="text-[#FF3B30]">LONG</b> fills up to this % below mark, <b className="text-[#00A004]">SHORT</b> up to this % above mark. Each 0.001%–5%; set <b>0.000</b> to turn off (plain market at mark).
                     </span>
                   </div>
                 )}
@@ -608,7 +608,26 @@ export default function BotPanel({ open, onClose }) {
                 </div>
               )}
 
-              {/* journal */}
+              {/* pending futures (IOC / slippage, 5-min timeout) */}
+              {st.pendingFutures && st.pendingFutures.length > 0 && (
+                <div className="border-t border-zinc-100 pt-3" data-testid="bot-pending-futures">
+                  <span className="mono text-[10px] uppercase tracking-wider text-[#B26A00]">Pending entries ({st.pendingFutures.length})</span>
+                  <div className="mt-2 space-y-1">
+                    {st.pendingFutures.map((p) => (
+                      <div key={p.posKey} data-testid={`bot-pending-${p.posKey}`} className="flex items-center justify-between border border-[#B26A00]/30 bg-[#B26A00]/[0.04] px-2 py-1.5">
+                        <div className="mono text-[12px] font-semibold text-zinc-900">
+                          {p.base}USDT<span className="text-[9px] text-zinc-300"> Perp</span>
+                          <span className={`ml-1.5 text-[9px] font-bold ${p.side === "long" ? "text-[#00A004]" : "text-[#FF3B30]"}`}>{p.side.toUpperCase()}</span>
+                        </div>
+                        <div className="mono text-[10px] text-zinc-500">
+                          @ {Number(p.limitPrice).toPrecision(5)}
+                          <span className="ml-2 text-[9px] text-[#B26A00]">{Math.max(0, 300 - p.ageSec)}s left</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="border-t border-zinc-100 pt-3">
                 <span className="mono text-[10px] uppercase tracking-wider text-zinc-400">Activity log</span>
                 <div className="mt-2 space-y-1" data-testid="bot-journal">
