@@ -292,7 +292,7 @@ export default function BotPanel({ open, onClose }) {
                       </div>
                     </div>
                     <span className="mono block text-[9px] leading-tight text-zinc-400">
-                      <b>IOC / slippage</b> entry: a slippage-priced order that waits up to <b>5 min</b> to fill, else auto-cancels. <b className="text-[#FF3B30]">LONG</b> fills up to this % below mark, <b className="text-[#00A004]">SHORT</b> up to this % above mark. Each 0.001%–5%; set <b>0.000</b> to turn off (plain market at mark).
+                      <b>Slippage trigger</b> → <b>market</b> entry: waits up to <b>5 min</b> for the mark to reach your level, then fills instantly at market (else auto-cancels). <b className="text-[#FF3B30]">LONG</b> triggers this % below mark, <b className="text-[#00A004]">SHORT</b> this % above mark. Each 0.001%–5%; set <b>0.000</b> to turn off (plain market now).
                     </span>
                   </div>
                 )}

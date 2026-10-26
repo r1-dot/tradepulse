@@ -734,43 +734,25 @@ async def _hl_cancel_coin(coin):
 
 async def _register_pending_futures(http, sym, base, is_long, qty, lev, limit_price, now,
                                     source, pos_key, tp_price, sl_price, slip_pct):
-    """IOC/slippage system: register a pending Binance USD-M entry at the slippage-limit price.
-    SIM fills when the mark reaches the limit; LIVE places a resting LIMIT GTC order. Either way
-    the entry is auto-cancelled if it is not filled within FUT_PENDING_EXPIRY (5 min)."""
+    """Slippage-triggered entry: register a pending Binance USD-M entry at the slippage level.
+    When the mark reaches that level (LONG -buf% below / SHORT +buf% above) a plain MARKET order
+    is fired for instant fill. Auto-cancels if it is not triggered within FUT_PENDING_EXPIRY (5 min).
+    No resting order sits on the book — we monitor the mark and market-fill on trigger."""
     cfg = BOT["config"]
     pkey = pos_key or sym
     if pkey in BOT["pendingFutures"] or pkey in BOT["positions"]:
         return  # already pending or already open — don't stack duplicate entries
     sim = cfg["dryRun"]
-    order_id = None
-    store_qty = qty
-    if sim:
-        store_qty = qty * max(1, int(lev or 1))
-    else:
-        try:
-            hedge = await fapi_position_mode(http)
-            await _fapi_set_leverage(http, sym, lev)
-            q = await _fapi_round_qty(http, sym, qty)
-            store_qty = q
-            params = {"symbol": sym.upper(), "side": "BUY" if is_long else "SELL", "type": "LIMIT",
-                      "timeInForce": "GTC", "price": await _fapi_round_price(http, sym, limit_price),
-                      "quantity": q, "newOrderRespType": "RESULT",
-                      "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
-            res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
-            order_id = _extract_order_id(res)
-        except Exception as e:  # noqa: BLE001
-            jlog("error", symbol=sym, action="LONG" if is_long else "SHORT", live=True,
-                 venue="binance_futures", message=f"FUTURES pending open failed: {str(e)[:180]}")
-            return
+    store_qty = qty * max(1, int(lev or 1)) if sim else qty
     BOT["pendingFutures"][pkey] = {
         "symbol": sym, "base": base, "side": "long" if is_long else "short",
         "limitPrice": limit_price, "qty": store_qty, "lev": lev, "createdTs": now,
-        "source": source, "posKey": pkey, "orderId": order_id, "dryRun": sim,
+        "source": source, "posKey": pkey, "orderId": None, "dryRun": sim,
         "tpPrice": tp_price, "slPrice": sl_price,
     }
     jlog("futures_pending", symbol=sym, base=base, side="long" if is_long else "short",
          price=limit_price, live=not sim, venue="binance_futures",
-         message=f"FUTURES PENDING {'LONG' if is_long else 'SHORT'} {sym} @ {limit_price:.6g} · slip {slip_pct}% · waits up to 5m")
+         message=f"FUTURES PENDING {'LONG' if is_long else 'SHORT'} {sym} · market-fill when mark hits {limit_price:.6g} (slip {slip_pct}%) · waits up to 5m")
 
 
 def _fill_pending_futures(pend, fill_price, now):
@@ -1358,40 +1340,37 @@ async def process_bot(http: httpx.AsyncClient, now: float):
             if upnl <= -hard_cap:
                 await _close_position(http, pkey, v["price"], "max-loss-cap")
 
-    # PENDING FUTURES (IOC / slippage system): fill when the mark reaches the slippage price,
-    # or auto-cancel the entry if it is still unfilled after FUT_PENDING_EXPIRY (5 min).
+    # PENDING FUTURES (slippage-triggered MARKET entry): when the mark reaches the slippage level
+    # fire a plain MARKET order (instant fill); auto-cancel the entry after FUT_PENDING_EXPIRY (5 min).
     if BOT["pendingFutures"]:
         for pkey in list(BOT["pendingFutures"].keys()):
             pend = BOT["pendingFutures"][pkey]
             if now - pend["createdTs"] > FUT_PENDING_EXPIRY:
-                if not pend["dryRun"] and pend.get("orderId"):
-                    try:
-                        await _fapi_cancel_order(http, pend["symbol"], pend["orderId"])
-                    except Exception:  # noqa: BLE001
-                        pass
                 BOT["pendingFutures"].pop(pkey, None)
                 jlog("futures_cancel", symbol=pend["symbol"], base=pend["base"],
-                     message=f"{pend['symbol']} entry not filled in 5m — cancelled")
+                     message=f"{pend['symbol']} entry not triggered in 5m — cancelled")
                 continue
-            if pend["dryRun"]:
-                v = latest.get(pend["symbol"])
-                if not v:
-                    continue
-                price = v["price"]
-                hit = (pend["side"] == "long" and price <= pend["limitPrice"]) or \
-                      (pend["side"] == "short" and price >= pend["limitPrice"])
-                if hit:
-                    BOT["pendingFutures"].pop(pkey, None)
-                    _fill_pending_futures(pend, pend["limitPrice"], now)
-            else:
+            v = latest.get(pend["symbol"])
+            if not v:
+                continue
+            price = v["price"]
+            hit = (pend["side"] == "long" and price <= pend["limitPrice"]) or \
+                  (pend["side"] == "short" and price >= pend["limitPrice"])
+            if not hit:
+                continue
+            BOT["pendingFutures"].pop(pkey, None)
+            fill_price = price
+            if not pend["dryRun"]:
+                # trigger reached -> fire a MARKET order for instant fill
                 try:
-                    st = await _fapi_order_status(http, pend["symbol"], pend["orderId"])
-                except Exception:  # noqa: BLE001
-                    st = None
-                if st and str(st.get("status")) == "FILLED":
-                    BOT["pendingFutures"].pop(pkey, None)
-                    ap = float(st.get("avgPrice") or 0) or pend["limitPrice"]
-                    _fill_pending_futures(pend, ap, now)
+                    r = await _fapi_market_open(http, pend["symbol"], pend["side"] == "long",
+                                                pend["qty"], pend["lev"])
+                    fill_price = r["fillPrice"] or price
+                except Exception as e:  # noqa: BLE001
+                    jlog("error", symbol=pend["symbol"], base=pend["base"], live=True,
+                         venue="binance_futures", message=f"FUTURES trigger market open failed: {str(e)[:160]}")
+                    continue
+            _fill_pending_futures(pend, fill_price, now)
 
     # STRADDLE fills. Default (OCO): whichever stop hits first fills, the other is cancelled.
     # DUAL-SIDE (straddleDualSide, Binance/SIM only): both stops stay live — each leg opens

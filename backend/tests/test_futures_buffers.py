@@ -63,12 +63,12 @@ def test_buffer_registers_pending_short_above_mark():
 
 def test_pending_fills_when_price_reaches_limit():
     _sim(futLongBufferPct=1.0)
-    _open("long", "BTCUSDT")               # pending long @ 99
+    _open("long", "BTCUSDT")               # pending long, triggers at 99
     _tick(99.5)                            # not yet reached
     assert "BTCUSDT" not in server.BOT["positions"]
     assert "BTCUSDT" in server.BOT["pendingFutures"]
-    _tick(98.9)                            # crosses the limit -> fills @ 99
-    assert "BTCUSDT" in server.BOT["positions"], "fills once mark <= limit"
+    _tick(99.0)                            # trigger hit -> MARKET fill at mark (99.0)
+    assert "BTCUSDT" in server.BOT["positions"], "fills once mark <= trigger"
     assert "BTCUSDT" not in server.BOT["pendingFutures"]
     assert abs(server.BOT["positions"]["BTCUSDT"]["entryPrice"] - 99.0) < 1e-9
 
