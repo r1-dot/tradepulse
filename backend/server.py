@@ -136,6 +136,7 @@ BOT_DEFAULTS = {
     # to 5 min then auto-cancels. LONG caps -buf% below mark, SHORT +buf% above. 0.001%-5%; 0 = off (market).
     "futLongBufferPct": 0.0,       # max slippage for LONG entries
     "futShortBufferPct": 0.0,      # max slippage for SHORT entries
+    "futPendingTimeoutSec": 300,   # how long a pending slippage-trigger entry waits (1-300s)
     "futuresTestnet": False,       # use testnet.binancefuture.com instead of fapi.binance.com
     "maxLossPerTradeUsdt": 0.0002,  # hard cap: auto-close any position at this $ loss
     # --- STRADDLE SYSTEM: on a volume spike, arm a LONG stop above + SHORT stop below.
@@ -752,7 +753,7 @@ async def _register_pending_futures(http, sym, base, is_long, qty, lev, limit_pr
     }
     jlog("futures_pending", symbol=sym, base=base, side="long" if is_long else "short",
          price=limit_price, live=not sim, venue="binance_futures",
-         message=f"FUTURES PENDING {'LONG' if is_long else 'SHORT'} {sym} · market-fill when mark hits {limit_price:.6g} (slip {slip_pct}%) · waits up to 5m")
+         message=f"FUTURES PENDING {'LONG' if is_long else 'SHORT'} {sym} · market-fill when mark hits {limit_price:.6g} (slip {slip_pct}%) · waits up to {int(cfg.get('futPendingTimeoutSec', 300))}s")
 
 
 def _fill_pending_futures(pend, fill_price, now):
@@ -1343,12 +1344,13 @@ async def process_bot(http: httpx.AsyncClient, now: float):
     # PENDING FUTURES (slippage-triggered MARKET entry): when the mark reaches the slippage level
     # fire a plain MARKET order (instant fill); auto-cancel the entry after FUT_PENDING_EXPIRY (5 min).
     if BOT["pendingFutures"]:
+        _pend_ttl = cfg.get("futPendingTimeoutSec", FUT_PENDING_EXPIRY) or FUT_PENDING_EXPIRY
         for pkey in list(BOT["pendingFutures"].keys()):
             pend = BOT["pendingFutures"][pkey]
-            if now - pend["createdTs"] > FUT_PENDING_EXPIRY:
+            if now - pend["createdTs"] > _pend_ttl:
                 BOT["pendingFutures"].pop(pkey, None)
                 jlog("futures_cancel", symbol=pend["symbol"], base=pend["base"],
-                     message=f"{pend['symbol']} entry not triggered in 5m — cancelled")
+                     message=f"{pend['symbol']} entry not triggered in {int(_pend_ttl)}s — cancelled")
                 continue
             v = latest.get(pend["symbol"])
             if not v:
@@ -1856,6 +1858,7 @@ class BotConfigUpdate(BaseModel):
     futuresLeverage: Optional[int] = None
     futLongBufferPct: Optional[float] = None
     futShortBufferPct: Optional[float] = None
+    futPendingTimeoutSec: Optional[int] = None
     futuresTestnet: Optional[bool] = None
     maxLossPerTradeUsdt: Optional[float] = None
     straddleEnabled: Optional[bool] = None
@@ -1991,7 +1994,9 @@ async def bot_config(update: BotConfigUpdate):
     for _bk in ("futLongBufferPct", "futShortBufferPct"):
         if _bk in data:
             _v = float(data[_bk])
-            data[_bk] = 0.0 if _v <= 0 else max(0.001, min(5.0, _v))
+            data[_bk] = 0.0 if _v <= 0 else max(0.00000001, min(5.0, _v))
+    if "futPendingTimeoutSec" in data:
+        data["futPendingTimeoutSec"] = max(1, min(300, int(float(data["futPendingTimeoutSec"]))))
     if "straddleEntryPct" in data:
         data["straddleEntryPct"] = max(0.000001, min(5.0, float(data["straddleEntryPct"])))
     if "straddleTpPct" in data:

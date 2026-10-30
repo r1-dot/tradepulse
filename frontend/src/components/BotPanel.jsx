@@ -270,11 +270,11 @@ export default function BotPanel({ open, onClose }) {
                         <span className="mono text-[10px] text-zinc-500">slip <span className="text-[#00A004] font-semibold">(short)</span></span>
                         <input
                           data-testid="bot-fut-pos-buffer"
-                          type="number" min="0" max="5" step="0.001"
+                          type="number" min="0" max="5" step="0.00000001"
                           value={form.futShortBufferPct}
                           onChange={(e) => setForm({ ...form, futShortBufferPct: e.target.value })}
                           onBlur={() => patch({ futShortBufferPct: parseFloat(form.futShortBufferPct) || 0 })}
-                          className="mono w-16 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
+                          className="mono w-24 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
                         />
                         <span className="mono text-[11px] font-bold text-[#7C3AED]">%</span>
                       </div>
@@ -282,17 +282,31 @@ export default function BotPanel({ open, onClose }) {
                         <span className="mono text-[10px] text-zinc-500">slip <span className="text-[#FF3B30] font-semibold">(long)</span></span>
                         <input
                           data-testid="bot-fut-neg-buffer"
-                          type="number" min="0" max="5" step="0.001"
+                          type="number" min="0" max="5" step="0.00000001"
                           value={form.futLongBufferPct}
                           onChange={(e) => setForm({ ...form, futLongBufferPct: e.target.value })}
                           onBlur={() => patch({ futLongBufferPct: parseFloat(form.futLongBufferPct) || 0 })}
-                          className="mono w-16 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
+                          className="mono w-24 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
                         />
                         <span className="mono text-[11px] font-bold text-[#7C3AED]">%</span>
                       </div>
                     </div>
+                    <div className="flex items-center gap-2" data-testid="bot-fut-timeout-row">
+                      <div className="flex items-center gap-1 border border-[#B26A00]/40 px-2 py-1" title="How long a pending entry waits for its trigger before auto-cancelling (1–300s)">
+                        <span className="mono text-[10px] text-zinc-500">timeout</span>
+                        <input
+                          data-testid="bot-fut-timeout"
+                          type="number" min="1" max="300" step="1"
+                          value={form.futPendingTimeoutSec}
+                          onChange={(e) => setForm({ ...form, futPendingTimeoutSec: e.target.value })}
+                          onBlur={() => patch({ futPendingTimeoutSec: parseInt(form.futPendingTimeoutSec, 10) || 300 })}
+                          className="mono w-16 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
+                        />
+                        <span className="mono text-[11px] font-bold text-[#B26A00]">s</span>
+                      </div>
+                    </div>
                     <span className="mono block text-[9px] leading-tight text-zinc-400">
-                      <b>Slippage trigger</b> → <b>market</b> entry: waits up to <b>5 min</b> for the mark to reach your level, then fills instantly at market (else auto-cancels). <b className="text-[#FF3B30]">LONG</b> triggers this % below mark, <b className="text-[#00A004]">SHORT</b> this % above mark. Each 0.001%–5%; set <b>0.000</b> to turn off (plain market now).
+                      <b>Slippage trigger</b> → <b>market</b> entry: waits up to the <b>timeout</b> for the mark to reach your level, then fills instantly at market (else auto-cancels). <b className="text-[#FF3B30]">LONG</b> triggers this % below mark, <b className="text-[#00A004]">SHORT</b> this % above mark. Each 0.00000001%–5%; set <b>0.000</b> to turn off (plain market now). Timeout 1–300s.
                     </span>
                   </div>
                 )}
@@ -621,7 +635,7 @@ export default function BotPanel({ open, onClose }) {
                         </div>
                         <div className="mono text-[10px] text-zinc-500">
                           @ {Number(p.limitPrice).toPrecision(5)}
-                          <span className="ml-2 text-[9px] text-[#B26A00]">{Math.max(0, 300 - p.ageSec)}s left</span>
+                          <span className="ml-2 text-[9px] text-[#B26A00]">{Math.max(0, (st.config.futPendingTimeoutSec || 300) - p.ageSec)}s left</span>
                         </div>
                       </div>
                     ))}

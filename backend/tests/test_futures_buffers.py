@@ -82,6 +82,30 @@ def test_pending_auto_cancels_after_5min():
     assert "BTCUSDT" not in server.BOT["positions"], "nothing opened"
 
 
+def test_pending_respects_configurable_timeout():
+    _sim(futLongBufferPct=1.0, futPendingTimeoutSec=2)
+    _open("long", "BTCUSDT")
+    server.BOT["pendingFutures"]["BTCUSDT"]["createdTs"] = time.time() - 3  # older than 2s ttl
+    _tick(100.0)
+    assert "BTCUSDT" not in server.BOT["pendingFutures"], "cancels after the configured 2s"
+    # a longer ttl keeps it alive at the same age
+    _sim(futLongBufferPct=1.0, futPendingTimeoutSec=60)
+    _open("long", "BTCUSDT")
+    server.BOT["pendingFutures"]["BTCUSDT"]["createdTs"] = time.time() - 3
+    _tick(100.0)
+    assert "BTCUSDT" in server.BOT["pendingFutures"], "still pending within the 60s ttl"
+
+
+def test_tiny_buffer_floor():
+    _sim()
+    c = server.BOT["config"]
+    # emulate the clamp applied by the config endpoint
+    import asyncio as _a
+    res = _a.run(server.bot_config(server.BotConfigUpdate(futLongBufferPct=0.000000001)))
+    assert res["config"]["futLongBufferPct"] == 1e-08, "floor is 0.00000001%"
+    c.update({"futLongBufferPct": 0.0})
+
+
 def test_no_duplicate_pending():
     _sim(futLongBufferPct=1.0)
     _open("long", "BTCUSDT")
