@@ -761,7 +761,9 @@ def _fill_pending_futures(pend, fill_price, now):
     cfg = BOT["config"]
     is_long = pend["side"] == "long"
     tp_price, sl_price = pend["tpPrice"], pend["slPrice"]
-    if tp_price is None and sl_price is None:
+    # FIXED TP/SL when Smart Trailing is OFF (applies to every entry); otherwise use the
+    # fixed defaults only when no explicit levels were carried on the pending entry.
+    if (not cfg.get("trailEnabled", True)) or (tp_price is None and sl_price is None):
         if is_long:
             tp_price = fill_price * (1 + cfg["tpPct"] / 100)
             sl_price = fill_price * (1 - cfg["slPct"] / 100)
@@ -867,11 +869,18 @@ async def _open_position(http, sym, price, now, side="long", tp_price=None, sl_p
         except Exception as e:  # noqa: BLE001
             jlog("error", symbol=sym, action="BUY", message=str(e), live=True)
             return
-    # Only apply the FIXED tpPct/slPct defaults when the caller passed neither.
-    # Straddle & hybrid explicitly pass tp_price=None (trailing manages upside) with
-    # a computed sl_price — we MUST preserve tp_price=None so process_bot routes them
-    # through _update_trailing() instead of hitting the fixed take-profit.
-    if tp_price is None and sl_price is None:
+    # FIXED TP/SL system: when Smart Trailing TP is OFF, EVERY entry — including straddle &
+    # hybrid legs that would otherwise trail — uses the fixed tpPct/slPct levels set by the user.
+    # When trailing is ON, straddle/hybrid keep tp_price=None (trailing manages upside); only
+    # directional signals (which pass neither level) fall back to the fixed defaults.
+    if not cfg.get("trailEnabled", True):
+        if is_long:
+            tp_price = fill * (1 + cfg["tpPct"] / 100)
+            sl_price = fill * (1 - cfg["slPct"] / 100)
+        else:
+            tp_price = fill * (1 - cfg["tpPct"] / 100)
+            sl_price = fill * (1 + cfg["slPct"] / 100)
+    elif tp_price is None and sl_price is None:
         if is_long:
             tp_price = fill * (1 + cfg["tpPct"] / 100)
             sl_price = fill * (1 - cfg["slPct"] / 100)

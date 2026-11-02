@@ -433,8 +433,6 @@ export default function BotPanel({ open, onClose }) {
 
                   <div className="mono text-[10px] uppercase tracking-wider text-zinc-400 pt-1">Risk</div>
                   <div className="grid grid-cols-2 gap-2">
-                    <NumField testid="bot-tp" label="Take profit" value={form.tpPct} onChange={(v) => setForm({ ...form, tpPct: v })} suffix="%" />
-                    <NumField testid="bot-sl" label="Stop loss (max 1%)" step="0.00000001" value={form.slPct} onChange={(v) => setForm({ ...form, slPct: v })} suffix="%" />
                     <NumField testid="bot-max-pos" label="Max position" value={form.maxPositionUsdt} onChange={(v) => setForm({ ...form, maxPositionUsdt: v })} suffix="USDT" />
                     <NumField testid="bot-daily-loss" label="Daily loss limit" value={form.dailyLossLimit} onChange={(v) => setForm({ ...form, dailyLossLimit: v })} suffix="USDT" />
                     <NumField testid="bot-max-open" label="Max open positions" step="1" value={form.maxOpenPositions} onChange={(v) => setForm({ ...form, maxOpenPositions: v })} />
@@ -506,6 +504,27 @@ export default function BotPanel({ open, onClose }) {
                         Adjust these in the <b>Hybrid Power → Smart Trailing TP</b> panel (shared across Straddle &amp; Hybrid).
                       </p>
                     </div>
+                  </div>
+
+                  {/* FIXED TP/SL — used when Smart Trailing TP is OFF */}
+                  <div className="space-y-2 border border-[#FF3B30]/25 bg-[#FF3B30]/[0.03] p-2.5" data-testid="bot-fixed-tpsl-section">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] font-semibold uppercase tracking-wider text-[#FF3B30]">Fixed TP / SL</span>
+                      <span
+                        data-testid="bot-fixed-tpsl-status"
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold ${!st.config.trailEnabled ? "border-[#00A004] text-[#00A004]" : "border-zinc-300 text-zinc-400"}`}
+                      >
+                        {!st.config.trailEnabled ? "ACTIVE" : "INACTIVE · trailing on"}
+                      </span>
+                    </div>
+                    <p className="mono text-[9px] leading-relaxed text-zinc-500">
+                      Works when <b>Smart Trailing TP is OFF</b>. Every filled position — signal, straddle &amp; hybrid legs — exits at these fixed levels from entry: <b className="text-[#00A004]">LONG</b> at +TP% / −SL%, <b className="text-[#FF3B30]">SHORT</b> the inverse. Toggle trailing off in the Smart Trailing TP panel to use these.
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <NumField testid="bot-fixed-tp" label="Take profit" step="0.00000001" value={form.tpPct} onChange={(v) => setForm({ ...form, tpPct: v })} suffix="%" />
+                      <NumField testid="bot-fixed-sl" label="Stop loss" step="0.00000001" value={form.slPct} onChange={(v) => setForm({ ...form, slPct: v })} suffix="%" />
+                    </div>
+                    <span className="mono block text-[9px] text-zinc-400">Hit “Save settings” to apply.</span>
                   </div>
 
                   <button
