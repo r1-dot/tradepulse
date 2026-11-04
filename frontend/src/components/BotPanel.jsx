@@ -76,6 +76,7 @@ export default function BotPanel({ open, onClose }) {
     cooldownSec: parseInt(form.cooldownSec, 10),
     maxLossPerTradeUsdt: parseFloat(form.maxLossPerTradeUsdt),
     straddleEntryPct: parseFloat(form.straddleEntryPct),
+    obStraddleMaxSymbols: parseInt(form.obStraddleMaxSymbols, 10),
     tradeAmtMin: parseFloat(form.tradeAmtMin),
     tradeAmtMax: parseFloat(form.tradeAmtMax),
     webhookUrl: form.webhookUrl || "",
@@ -504,6 +505,29 @@ export default function BotPanel({ open, onClose }) {
                         Adjust these in the <b>Hybrid Power → Smart Trailing TP</b> panel (shared across Straddle &amp; Hybrid).
                       </p>
                     </div>
+                  </div>
+
+                  {/* ORDER-BOOK SMART STRADDLE */}
+                  <div className="space-y-2 border border-[#0EA5E9]/30 bg-[#0EA5E9]/[0.04] p-2.5" data-testid="bot-ob-straddle-section">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] font-semibold uppercase tracking-wider text-[#0369A1]">Order-book smart straddle</span>
+                      <button
+                        data-testid="bot-ob-straddle-toggle"
+                        onClick={() => patch({ obStraddleEnabled: !st.config.obStraddleEnabled })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.obStraddleEnabled ? "border-[#0EA5E9] bg-[#0EA5E9] text-white" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.obStraddleEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <p className="mono text-[9px] leading-relaxed text-zinc-500">
+                      Continuously watches the busiest tracked symbols and arms a straddle using the live <b>order book</b>: a <b className="text-[#00A004]">LONG</b> stop just above the biggest ask wall and a <b className="text-[#FF3B30]">SHORT</b> stop just below the biggest bid wall (never tighter than <b>±{form.straddleEntryPct}%</b>). The heavier side&apos;s trigger is pulled closer so it fills fast. Whichever hits first fills (OCO).
+                    </p>
+                    <div className="grid grid-cols-1 gap-2">
+                      <NumField testid="bot-ob-straddle-max" label="Symbols watched" step="1" value={form.obStraddleMaxSymbols} onChange={(v) => setForm({ ...form, obStraddleMaxSymbols: v })} suffix="top vol" />
+                    </div>
+                    <p className="mono text-[8px] leading-relaxed text-amber-600">
+                      ⚠ Designed for <b>Binance</b> + <b>SIM</b>. Respects the volume band and max-open-positions. Hit “Save settings” to apply the count.
+                    </p>
                   </div>
 
                   {/* FIXED TP/SL — used when Smart Trailing TP is OFF */}

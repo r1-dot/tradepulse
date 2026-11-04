@@ -143,6 +143,11 @@ BOT_DEFAULTS = {
     # Whichever side price hits first fills; the other is cancelled (OCO breakout).
     "straddleEnabled": False,
     "straddleDualSide": False,  # Binance/SIM only: open BOTH legs (no OCO cancel), each on Smart Trailing TP
+    # ORDER-BOOK SMART STRADDLE (Binance/SIM): continuously arm a straddle on the busiest tracked
+    # symbols, placing stops at the biggest nearby order-book walls (floored by straddleEntryPct)
+    # and biasing the trigger toward the heavier side so fills come fast.
+    "obStraddleEnabled": False,
+    "obStraddleMaxSymbols": 12,  # how many top-volume symbols it watches at once (1-50)
     "straddleEntryPct": 0.5,   # entry offset from mark (0.000001 - 5 %)
     "straddleTpPct": 1.0,      # take-profit for the filled leg (0.01 - 10 %)
     "straddleSlPct": 1.0,      # stop-loss for the filled leg (0.0001 - 5 %)
@@ -1194,6 +1199,79 @@ async def _orderbook_delta(http, sym):
     return bw, sw
 
 
+async def _orderbook_walls(http, sym, mark):
+    """Top-20 depth → (bid_wall_price below mark, ask_wall_price above mark, bid_usd, ask_usd).
+    Walls are the single price level carrying the most USD on each side."""
+    try:
+        r = await http.get(f"{BINANCE_FAPI_DATA_BASE}/fapi/v1/depth", params={"symbol": sym, "limit": 20}, timeout=5)
+        d = r.json()
+        bids = [(float(p), float(q)) for p, q in d.get("bids", [])]
+        asks = [(float(p), float(q)) for p, q in d.get("asks", [])]
+    except Exception:  # noqa: BLE001
+        return None, None, 0.0, 0.0
+    bid_usd = sum(p * q for p, q in bids)
+    ask_usd = sum(p * q for p, q in asks)
+    bw = max((b for b in bids if b[0] < mark), key=lambda x: x[0] * x[1], default=None)
+    aw = max((a for a in asks if a[0] > mark), key=lambda x: x[0] * x[1], default=None)
+    return (bw[0] if bw else None), (aw[0] if aw else None), bid_usd, ask_usd
+
+
+async def _arm_ob_straddles(http, now):
+    """ORDER-BOOK SMART STRADDLE: continuously arm straddles on the busiest tracked symbols using
+    live order-book walls (floored by straddleEntryPct), biased toward the heavier side. Binance/SIM."""
+    cfg = BOT["config"]
+    if not cfg.get("obStraddleEnabled") or not cfg["enabled"] or BOT["stopped"]:
+        return
+    if cfg.get("exchange") not in ("binance", "binance_futures"):
+        return
+    if now - BOT.get("obArmTs", 0.0) < 3.0:  # throttle the whole routine to ~3s
+        return
+    BOT["obArmTs"] = now
+    latest = STATE["latest"]
+    _minv = cfg.get("minVolumeUsd", 0) or 0
+    _maxv = cfg.get("maxVolumeUsd", 0) or 0
+    room = max(0, int(cfg.get("maxOpenPositions", 5) or 5) - len(BOT["positions"]))
+    if room <= 0:
+        return
+    cap = min(max(1, min(50, int(cfg.get("obStraddleMaxSymbols", 12) or 12))), room)
+    elig = []
+    for sym, v in latest.items():
+        if v["quoteVol"] < _minv or (_maxv > 0 and v["quoteVol"] > _maxv):
+            continue
+        if sym in BOT["positions"] or f"{sym}#L" in BOT["positions"] or f"{sym}#S" in BOT["positions"]:
+            continue
+        if sym in BOT["straddles"] or sym in BOT["pendingFutures"]:
+            continue
+        elig.append((v["quoteVol"], sym, v))
+    elig.sort(key=lambda x: x[0], reverse=True)
+    entry_pct = max(0.0, cfg.get("straddleEntryPct", 0.1) or 0.0)
+    armed = 0
+    for _, sym, v in elig[:cap]:
+        mark = v["price"]
+        if mark <= 0:
+            continue
+        bw, aw, bid_usd, ask_usd = await _orderbook_walls(http, sym, mark)
+        long_floor = mark * (1 + entry_pct / 100)
+        short_floor = mark * (1 - entry_pct / 100)
+        long_entry = max(aw, long_floor) if aw else long_floor
+        short_entry = min(bw, short_floor) if bw else short_floor
+        # imbalance bias: pull the pressured side's trigger toward the mark so it fills sooner
+        tot = bid_usd + ask_usd
+        if tot > 0:
+            bias = (bid_usd / tot - 0.5) * 2  # -1 (asks dominate) .. +1 (bids dominate)
+            if bias > 0:
+                long_entry = mark + (long_entry - mark) * (1 - min(0.8, bias))
+            elif bias < 0:
+                short_entry = mark - (mark - short_entry) * (1 - min(0.8, -bias))
+        BOT["straddles"][sym] = {
+            "symbol": sym, "base": v.get("base") or hlconv.strip_quote(sym), "mark": mark,
+            "longEntry": long_entry, "shortEntry": short_entry, "createdTs": now, "source": "ob",
+        }
+        armed += 1
+    if armed:
+        logger.info("OB straddle armed %d symbol(s)", armed)
+
+
 async def _process_hybrid(http, now):
     cfg = BOT["config"]
     latest = STATE["latest"]
@@ -1382,6 +1460,12 @@ async def process_bot(http: httpx.AsyncClient, now: float):
                          venue="binance_futures", message=f"FUTURES trigger market open failed: {str(e)[:160]}")
                     continue
             _fill_pending_futures(pend, fill_price, now)
+
+    # ORDER-BOOK SMART STRADDLE: continuously (re-)arm straddles from the live book (throttled).
+    try:
+        await _arm_ob_straddles(http, now)
+    except Exception as obe:  # noqa: BLE001
+        logger.error("ob-straddle arm error: %s", obe)
 
     # STRADDLE fills. Default (OCO): whichever stop hits first fills, the other is cancelled.
     # DUAL-SIDE (straddleDualSide, Binance/SIM only): both stops stay live — each leg opens
@@ -1872,6 +1956,8 @@ class BotConfigUpdate(BaseModel):
     maxLossPerTradeUsdt: Optional[float] = None
     straddleEnabled: Optional[bool] = None
     straddleDualSide: Optional[bool] = None
+    obStraddleEnabled: Optional[bool] = None
+    obStraddleMaxSymbols: Optional[int] = None
     straddleEntryPct: Optional[float] = None
     straddleTpPct: Optional[float] = None
     straddleSlPct: Optional[float] = None
@@ -2006,6 +2092,8 @@ async def bot_config(update: BotConfigUpdate):
             data[_bk] = 0.0 if _v <= 0 else max(0.00000001, min(5.0, _v))
     if "futPendingTimeoutSec" in data:
         data["futPendingTimeoutSec"] = max(1, min(300, int(float(data["futPendingTimeoutSec"]))))
+    if "obStraddleMaxSymbols" in data:
+        data["obStraddleMaxSymbols"] = max(1, min(50, int(float(data["obStraddleMaxSymbols"]))))
     if "straddleEntryPct" in data:
         data["straddleEntryPct"] = max(0.000001, min(5.0, float(data["straddleEntryPct"])))
     if "straddleTpPct" in data:
