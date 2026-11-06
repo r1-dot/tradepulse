@@ -77,6 +77,9 @@ export default function BotPanel({ open, onClose }) {
     maxLossPerTradeUsdt: parseFloat(form.maxLossPerTradeUsdt),
     straddleEntryPct: parseFloat(form.straddleEntryPct),
     obStraddleMaxSymbols: parseInt(form.obStraddleMaxSymbols, 10),
+    binStradEntryPct: parseFloat(form.binStradEntryPct),
+    binStradTpPct: parseFloat(form.binStradTpPct),
+    binStradSlPct: parseFloat(form.binStradSlPct),
     tradeAmtMin: parseFloat(form.tradeAmtMin),
     tradeAmtMax: parseFloat(form.tradeAmtMax),
     webhookUrl: form.webhookUrl || "",
@@ -530,6 +533,31 @@ export default function BotPanel({ open, onClose }) {
                     </p>
                   </div>
 
+                  {/* BINANCE NATIVE STRADDLE — real orders placed directly on Binance Futures */}
+                  <div className="space-y-2 border border-[#F0B90B]/40 bg-[#F0B90B]/[0.06] p-2.5" data-testid="bot-bin-straddle-section">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] font-semibold uppercase tracking-wider text-[#A17A00]">Binance native straddle</span>
+                      <button
+                        data-testid="bot-bin-straddle-toggle"
+                        onClick={() => patch({ binStradEnabled: !st.config.binStradEnabled })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.binStradEnabled ? "border-[#A17A00] bg-[#F0B90B] text-zinc-900" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.binStradEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <p className="mono text-[9px] leading-relaxed text-zinc-500">
+                      On a bot signal, places <b>real orders directly on Binance USD-M Futures</b>: a <b className="text-[#00A004]">LONG</b> stop-entry <b>+{form.binStradEntryPct}%</b> above and a <b className="text-[#FF3B30]">SHORT</b> stop-entry <b>−{form.binStradEntryPct}%</b> below the mark. Whichever fills first keeps running; the other is cancelled on the exchange (<b>OCO</b>). The filled leg is closed by <b>native Binance TP/SL</b> trigger orders below. Entire system toggles on/off here.
+                    </p>
+                    <div className="grid grid-cols-3 gap-2">
+                      <NumField testid="bot-bin-straddle-entry" label="Entry ±" step="0.01" value={form.binStradEntryPct} onChange={(v) => setForm({ ...form, binStradEntryPct: v })} suffix="%" />
+                      <NumField testid="bot-bin-straddle-tp" label="Take profit" step="0.01" value={form.binStradTpPct} onChange={(v) => setForm({ ...form, binStradTpPct: v })} suffix="%" />
+                      <NumField testid="bot-bin-straddle-sl" label="Stop loss" step="0.01" value={form.binStradSlPct} onChange={(v) => setForm({ ...form, binStradSlPct: v })} suffix="%" />
+                    </div>
+                    <p className="mono text-[8px] leading-relaxed text-amber-600">
+                      ⚠ Requires the <b>Binance Futures</b> venue + <b>LIVE</b> for real orders (simulates in SIM). Independent of Smart Trailing / Fixed TP-SL — uses the dedicated levels above. Hit “Save settings” to apply.
+                    </p>
+                  </div>
+
                   {/* FIXED TP/SL — used when Smart Trailing TP is OFF */}
                   <div className="space-y-2 border border-[#FF3B30]/25 bg-[#FF3B30]/[0.03] p-2.5" data-testid="bot-fixed-tpsl-section">
                     <div className="flex items-center justify-between">
@@ -665,6 +693,25 @@ export default function BotPanel({ open, onClose }) {
                 </div>
               )}
 
+              {/* armed Binance native straddles (real exchange orders) */}
+              {st.pendingBinStraddles && st.pendingBinStraddles.length > 0 && (
+                <div className="border-t border-zinc-100 pt-3" data-testid="bot-bin-straddles">
+                  <span className="mono text-[10px] uppercase tracking-wider text-[#A17A00]">Binance native straddles ({st.pendingBinStraddles.length})</span>
+                  <div className="mt-2 space-y-1">
+                    {st.pendingBinStraddles.map((s) => (
+                      <div key={s.symbol} data-testid={`bot-bin-straddle-${s.symbol}`} className="flex items-center justify-between border border-[#F0B90B]/50 bg-[#F0B90B]/[0.08] px-2 py-1.5">
+                        <div className="mono text-[12px] font-semibold text-zinc-900">{s.base}USDT<span className="text-[9px] text-zinc-300"> Perp</span> <span className={`text-[8px] ${s.mode === "LIVE" ? "text-[#FF3B30]" : "text-zinc-400"}`}>{s.mode}</span></div>
+                        <div className="mono text-[10px]">
+                          <span className="text-[#00A004]">↑{s.longEntry.toPrecision(5)}</span>
+                          <span className="text-zinc-300"> / </span>
+                          <span className="text-[#FF3B30]">↓{s.shortEntry.toPrecision(5)}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* pending futures (IOC / slippage, 5-min timeout) */}
               {st.pendingFutures && st.pendingFutures.length > 0 && (
                 <div className="border-t border-zinc-100 pt-3" data-testid="bot-pending-futures">
@@ -714,9 +761,10 @@ const Stat = ({ label, value, color, testid }) => (
 );
 
 const JournalLine = ({ j }) => {
-  if (j.kind === "entry") return <span className={j.side === "short" ? "text-[#FF3B30]" : "text-[#00A004]"}>{j.side === "short" ? "SHORT" : "BUY"} {j.base} @ {Number(j.price).toPrecision(5)}{j.source === "straddle" ? " · straddle" : ""} · {j.mode}</span>;
+  if (j.kind === "entry") return <span className={j.side === "short" ? "text-[#FF3B30]" : "text-[#00A004]"}>{j.side === "short" ? "SHORT" : "BUY"} {j.base} @ {Number(j.price).toPrecision(5)}{j.source === "straddle" ? " · straddle" : j.source === "bin_straddle" ? " · bin-straddle" : ""} · {j.mode}</span>;
   if (j.kind === "exit") return <span className={j.pnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}>{j.side === "cover" ? "COVER" : "SELL"} {j.base} @ {Number(j.price).toPrecision(5)} · {j.reason} · pnl {j.pnl >= 0 ? "+" : ""}{Number(j.pnl).toFixed(4)}</span>;
   if (j.kind === "straddle") return <span className="text-[#7C3AED]">STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
+  if (j.kind === "bin_straddle") return <span className="text-[#A17A00] font-semibold">BINANCE STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
   if (j.kind === "straddle_fill") return <span className="text-[#7C3AED] font-semibold">{j.message || `${j.side === "short" ? "SHORT" : "LONG"} leg filled ${j.base} — opposite cancelled`}</span>;
   if (j.kind === "straddle_cancel") return <span className="text-zinc-400">straddle {j.base} cancelled ({j.reason})</span>;
   if (j.kind === "halt") return <span className="text-[#FF3B30] font-semibold">⛔ {j.message}</span>;
