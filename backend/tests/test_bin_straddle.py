@@ -1,8 +1,11 @@
-"""Binance NATIVE straddle engine: on a bot signal, place real Binance USD-M Futures stop-entry
-orders (LONG stop above + SHORT stop below), cancel the opposite leg on fill (OCO), and close the
-filled leg via native Binance TP/SL trigger orders using its own dedicated TP/SL measurement.
+"""Binance NATIVE straddle engine (Dec-2025 Algo Service migration): on a bot signal, place real
+Binance USD-M Futures CONDITIONAL algo stop-entry orders (/fapi/v1/algoOrder, algoType=CONDITIONAL,
+triggerPrice, workingType=MARK_PRICE) — a LONG stop above + SHORT stop below. Whichever triggers
+first keeps running; the opposite leg is cancelled via DELETE /fapi/v1/algoOrder (OCO). The filled
+leg is closed by native reduce-only TP/SL algo orders (quantity + reduceOnly, NOT closePosition).
 Fully mocked with a fake httpx client — NO real Binance calls."""
 import asyncio
+import re
 import time
 import server
 
@@ -24,23 +27,19 @@ class FakeHTTP:
     def __init__(self, routes):
         self.routes = routes
         self.calls = []
-        self.headers = []
 
     def _match(self, url):
         for sub, resp in self.routes:
             if sub in url:
-                status = resp.get("__status", 200) if isinstance(resp, dict) else 200
-                return FakeResp(resp, status=status)
+                return FakeResp(resp)
         return FakeResp({"code": -1, "msg": "unmatched"}, status=400)
 
     async def request(self, method, url, headers=None, timeout=None, follow_redirects=False):
         self.calls.append((method, url))
-        self.headers.append(headers or {})
         return self._match(url)
 
     async def get(self, url, headers=None, timeout=None, follow_redirects=False):
         self.calls.append(("GET", url))
-        self.headers.append(headers or {})
         return self._match(url)
 
 
@@ -70,7 +69,12 @@ def _cfg(**over):
     return cfg
 
 
-def test_arm_places_two_native_stop_entry_orders(monkeypatch):
+def _sp(u):
+    m = re.search(r"triggerPrice=([0-9.]+)", u)
+    return float(m.group(1)) if m else None
+
+
+def test_arm_places_two_conditional_algo_stop_entries(monkeypatch):
     _reset()
     _cfg()
     monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
@@ -80,32 +84,54 @@ def test_arm_places_two_native_stop_entry_orders(monkeypatch):
         ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
         ("/fapi/v1/leverage", {"leverage": 3}),
         ("/fapi/v1/exchangeInfo", {"symbols": []}),
-        ("/fapi/v1/order", {"orderId": 111, "status": "NEW"}),
+        ("/fapi/v1/algoOrder", {"algoId": 111, "algoStatus": "NEW"}),
     ])
     asyncio.run(server.handle_signal(http, "BTCUSDT", "buy", 100.0, time.time(), volume=1e6))
     s = server.BOT["binStraddles"].get("BTCUSDT")
     assert s is not None and s["live"] is True
-    order_urls = [u for _, u in http.calls if "/fapi/v1/order" in u]
+    assert s["longOid"] == 111 and s["shortOid"] == 111
+    order_urls = [u for _, u in http.calls if "/fapi/v1/algoOrder" in u]
     assert len(order_urls) == 2, order_urls
     joined = " ".join(order_urls)
+    # new Algo Service contract
+    assert "algoType=CONDITIONAL" in joined
     assert "type=STOP_MARKET" in joined
-    # LONG stop-entry (BUY) above the mark, SHORT stop-entry (SELL) below
-    import re
-    def _sp(u):
-        m = re.search(r"stopPrice=([0-9.]+)", u)
-        return float(m.group(1)) if m else None
+    assert "triggerPrice=" in joined and "stopPrice=" not in joined
+    assert "workingType=MARK_PRICE" in joined and "triggerType=" not in joined
+    assert "timeInForce" not in joined
+    # placed on the algo endpoint, never the legacy order endpoint
+    assert not any(u.endswith("/fapi/v1/order") or "/fapi/v1/order?" in u for _, u in http.calls)
     buy = [u for u in order_urls if "side=BUY" in u]
     sell = [u for u in order_urls if "side=SELL" in u]
     assert buy and sell
-    assert abs(_sp(buy[0]) - 100.08) < 1e-3 and _sp(buy[0]) > 100.0
-    assert abs(_sp(sell[0]) - 99.92) < 1e-3 and _sp(sell[0]) < 100.0
-    # market-trigger orders must NOT carry timeInForce
-    assert "timeInForce" not in joined
-    assert "workingType=MARK_PRICE" in joined
+    assert abs(_sp(buy[0]) - 100.08) < 1e-3 and _sp(buy[0]) > 100.0   # LONG above
+    assert abs(_sp(sell[0]) - 99.92) < 1e-3 and _sp(sell[0]) < 100.0   # SHORT below
     _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
 
 
-def test_live_fill_cancels_opposite_and_places_native_tpsl(monkeypatch):
+def test_native_tpsl_uses_reduceonly_quantity_not_closeposition(monkeypatch):
+    _reset()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    http = FakeHTTP([
+        ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
+        ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/algoOrder", {"algoId": 7}),
+    ])
+    out = asyncio.run(server._fapi_place_native_tpsl(http, "BTCUSDT", True, 0.5, 105.0, 98.0))
+    order_urls = [u for _, u in http.calls if "/fapi/v1/algoOrder" in u]
+    assert len(order_urls) == 2
+    joined = " ".join(order_urls)
+    assert "type=TAKE_PROFIT_MARKET" in joined and "type=STOP_MARKET" in joined
+    assert "algoType=CONDITIONAL" in joined and "triggerPrice=" in joined
+    # closing a LONG -> SELL triggers, reduce-only + quantity (Dec-2025: closePosition dropped)
+    assert all("side=SELL" in u for u in order_urls)
+    assert "closePosition" not in joined
+    assert "reduceOnly=true" in joined and "quantity=0.5" in joined
+    assert out["tp"]["algoId"] == 7 and out["sl"]["algoId"] == 7
+
+
+def test_live_trigger_cancels_opposite_and_places_native_tpsl(monkeypatch):
     _reset()
     _cfg()
     monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
@@ -114,20 +140,25 @@ def test_live_fill_cancels_opposite_and_places_native_tpsl(monkeypatch):
     tpsl_calls = []
 
     async def fake_status(http, sym, oid):
-        return {"status": "FILLED", "avgPrice": "100.08"} if oid == "L1" else {"status": "NEW"}
+        return {"algoStatus": "FINISHED", "actualPrice": "100.08", "actualQty": "1.0"} if oid == "L1" \
+            else {"algoStatus": "NEW"}
 
     async def fake_cancel(http, sym, oid):
         cancels.append(oid)
 
-    async def fake_tpsl(http, sym, is_long, tp, sl):
-        tpsl_calls.append((is_long, tp, sl))
-        return {"tp": {"orderId": "t1"}, "sl": {"orderId": "s1"}}
+    async def fake_positions(http, sym=None):
+        return []  # no refinement -> keep algo fill price/qty
+
+    async def fake_tpsl(http, sym, is_long, qty, tp, sl):
+        tpsl_calls.append((is_long, qty, tp, sl))
+        return {"tp": {"algoId": "t1"}, "sl": {"algoId": "s1"}}
 
     async def noop(*a, **k):
         return None
 
-    monkeypatch.setattr(server, "_fapi_order_status", fake_status)
-    monkeypatch.setattr(server, "_fapi_cancel_order", fake_cancel)
+    monkeypatch.setattr(server, "_fapi_algo_status", fake_status)
+    monkeypatch.setattr(server, "_fapi_algo_cancel", fake_cancel)
+    monkeypatch.setattr(server, "_fapi_positions", fake_positions)
     monkeypatch.setattr(server, "_fapi_place_native_tpsl", fake_tpsl)
     monkeypatch.setattr(server, "send_webhook", noop)
 
@@ -138,37 +169,59 @@ def test_live_fill_cancels_opposite_and_places_native_tpsl(monkeypatch):
         "createdTs": now, "live": True, "lastPollTs": 0.0,
     }
     asyncio.run(server._process_bin_straddles(None, now + 3))
-    assert "S1" in cancels, "opposite (SHORT) leg must be cancelled on LONG fill (OCO)"
+    assert "S1" in cancels, "opposite (SHORT) leg must be cancelled on LONG trigger (OCO)"
     assert "BTCUSDT" not in server.BOT["binStraddles"]
     pos = server.BOT["positions"]["BTCUSDT"]
     assert pos["source"] == "bin_straddle" and pos["side"] == "long"
     assert abs(pos["entryPrice"] - 100.08) < 1e-9
-    # dedicated TP/SL: LONG tp above, sl below
-    assert tpsl_calls and tpsl_calls[0][0] is True
+    # native TP/SL placed with the real fill qty + dedicated levels (LONG: tp above, sl below)
+    assert tpsl_calls and tpsl_calls[0][0] is True and abs(tpsl_calls[0][1] - 1.0) < 1e-9
     assert abs(pos["tpPrice"] - 100.08 * 1.005) < 1e-6
     assert abs(pos["slPrice"] - 100.08 * 0.997) < 1e-6
+    assert pos["binTpOid"] == "t1" and pos["binSlOid"] == "s1"
     _reset()
     _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
 
 
-def test_native_tpsl_payload_long_close_all(monkeypatch):
+def test_live_fill_price_refined_from_position_risk(monkeypatch):
     _reset()
-    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
-    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
-    http = FakeHTTP([
-        ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
-        ("/fapi/v1/exchangeInfo", {"symbols": []}),
-        ("/fapi/v1/order", {"orderId": 7}),
-    ])
-    asyncio.run(server._fapi_place_native_tpsl(http, "BTCUSDT", True, 105.0, 98.0))
-    order_urls = [u for _, u in http.calls if "/fapi/v1/order" in u]
-    assert len(order_urls) == 2
-    joined = " ".join(order_urls)
-    assert "type=TAKE_PROFIT_MARKET" in joined and "type=STOP_MARKET" in joined
-    # closing a LONG -> SELL triggers, close-all (no quantity, no reduceOnly)
-    assert all("side=SELL" in u for u in order_urls)
-    assert "closePosition=true" in joined
-    assert "reduceOnly" not in joined and "quantity=" not in joined
+    _cfg()
+
+    async def fake_status(http, sym, oid):
+        return {"algoStatus": "TRIGGERED", "actualPrice": "0", "actualQty": "0"} if oid == "S9" \
+            else {"algoStatus": "NEW"}
+
+    async def fake_cancel(http, sym, oid):
+        return None
+
+    async def fake_positions(http, sym=None):
+        return [{"positionAmt": "-0.37", "entryPrice": "99.915"}]
+
+    async def fake_tpsl(http, sym, is_long, qty, tp, sl):
+        return {"tp": {"algoId": "t"}, "sl": {"algoId": "s"}}
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(server, "_fapi_algo_status", fake_status)
+    monkeypatch.setattr(server, "_fapi_algo_cancel", fake_cancel)
+    monkeypatch.setattr(server, "_fapi_positions", fake_positions)
+    monkeypatch.setattr(server, "_fapi_place_native_tpsl", fake_tpsl)
+    monkeypatch.setattr(server, "send_webhook", noop)
+
+    now = time.time()
+    server.BOT["binStraddles"]["SOLUSDT"] = {
+        "symbol": "SOLUSDT", "base": "SOL", "mark": 100.0, "qty": 0.4, "lev": 3,
+        "longStop": 100.08, "shortStop": 99.92, "longOid": "L9", "shortOid": "S9",
+        "createdTs": now, "live": True, "lastPollTs": 0.0,
+    }
+    asyncio.run(server._process_bin_straddles(None, now + 3))
+    pos = server.BOT["positions"]["SOLUSDT"]
+    assert pos["side"] == "short"
+    assert abs(pos["entryPrice"] - 99.915) < 1e-9   # real avg entry from positionRisk
+    assert abs(pos["qty"] - 0.37) < 1e-9             # real size from positionRisk
+    _reset()
+    _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
 
 
 def test_sim_arm_and_fill_no_real_orders(monkeypatch):
@@ -190,14 +243,12 @@ def test_sim_arm_and_fill_no_real_orders(monkeypatch):
     asyncio.run(server.handle_signal(None, "ETHUSDT", "buy", 200.0, now, volume=1e6))
     s = server.BOT["binStraddles"]["ETHUSDT"]
     assert s["live"] is False and abs(s["longStop"] - 200.16) < 1e-6
-    # price breaks above the long stop -> SIM long fill
     server.STATE["latest"]["ETHUSDT"]["price"] = 201.0
     asyncio.run(server._process_bin_straddles(None, now + 1))
     assert "ETHUSDT" not in server.BOT["binStraddles"]
     pos = server.BOT["positions"]["ETHUSDT"]
     assert pos["side"] == "long" and pos["dryRun"] is True and pos["source"] == "bin_straddle"
-    # SIM qty scaled by leverage (3x * 100/200.16)
-    assert abs(pos["qty"] - (100.0 / 200.16) * 3) < 1e-6
+    assert abs(pos["qty"] - (100.0 / 200.16) * 3) < 1e-6   # SIM qty scaled by leverage
     _reset()
     _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
 
@@ -214,7 +265,7 @@ def test_short_fill_tp_below_sl_above(monkeypatch):
     s = {"symbol": "SOLUSDT", "base": "SOL", "mark": 100.0, "qty": 1.0, "lev": 1,
          "longStop": 100.08, "shortStop": 99.92, "longOid": None, "shortOid": None,
          "createdTs": now, "live": False, "lastPollTs": 0.0}
-    asyncio.run(server._register_bin_straddle_fill(None, s, "short", 99.92, now, live=False))
+    asyncio.run(server._register_bin_straddle_fill(None, s, "short", 99.92, 1.0, now, live=False))
     pos = server.BOT["positions"]["SOLUSDT"]
     assert pos["side"] == "short"
     assert abs(pos["tpPrice"] - 99.92 * 0.995) < 1e-6  # SHORT TP below entry
@@ -222,7 +273,7 @@ def test_short_fill_tp_below_sl_above(monkeypatch):
     _reset()
 
 
-def test_live_arm_expiry_cancels_both_legs(monkeypatch):
+def test_live_arm_expiry_cancels_both_algo_legs(monkeypatch):
     _reset()
     _cfg()
     cancels = []
@@ -230,7 +281,7 @@ def test_live_arm_expiry_cancels_both_legs(monkeypatch):
     async def fake_cancel(http, sym, oid):
         cancels.append(oid)
 
-    monkeypatch.setattr(server, "_fapi_cancel_order", fake_cancel)
+    monkeypatch.setattr(server, "_fapi_algo_cancel", fake_cancel)
     now = time.time()
     server.BOT["binStraddles"]["BTCUSDT"] = {
         "symbol": "BTCUSDT", "base": "BTC", "mark": 100.0, "qty": 1.0, "lev": 3,
@@ -239,7 +290,7 @@ def test_live_arm_expiry_cancels_both_legs(monkeypatch):
     }
     asyncio.run(server._process_bin_straddles(None, now))
     assert "BTCUSDT" not in server.BOT["binStraddles"]
-    assert set(cancels) == {"L1", "S1"}, "both resting legs must be cancelled on expiry"
+    assert set(cancels) == {"L1", "S1"}, "both resting algo legs must be cancelled on expiry"
     _reset()
     _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
 
@@ -248,6 +299,7 @@ def test_config_clamps_bin_straddle(monkeypatch):
     async def _noop():
         return None
     monkeypatch.setattr(server, "save_bot_config", _noop)
+
     async def run():
         return await server.bot_config(server.BotConfigUpdate(
             binStradEntryPct=99, binStradTpPct=0.0001, binStradSlPct=99))
@@ -256,7 +308,6 @@ def test_config_clamps_bin_straddle(monkeypatch):
     assert cfg["binStradEntryPct"] == 5.0
     assert cfg["binStradTpPct"] == 0.01
     assert cfg["binStradSlPct"] == 5.0
-    # toggle round-trips
     asyncio.run(server.bot_config(server.BotConfigUpdate(binStradEnabled=True)))
     assert server.BOT["config"]["binStradEnabled"] is True
     asyncio.run(server.bot_config(server.BotConfigUpdate(binStradEnabled=False)))
