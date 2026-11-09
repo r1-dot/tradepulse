@@ -215,6 +215,16 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Verified by testing_agent (iteration_21): 0 issues — 12/12 futures tests (incl. test_302_redirect_html_is_not_success, test_open_position_futures_failure_no_phantom) + 33/33 full mocked regression; diagnose healthy.
 - OPERATIONAL NOTE: from the Emergent preview, Binance futures WRITES (order/leverage POST) are 302-redirected to the geo-blocked host, so live futures orders cannot execute here — they will work from the user's Vultr/Singapore VPS (GET/read endpoints do work from preview). "Save to GitHub" is the way to push the fix (main agent cannot push).
 
+## Feature (2026-06) — Binance 500ms live reconciler (order/position state)
+- **Fix:** once a bin-straddle position was registered, nothing verified its real Binance state, so a position closed by TP/SL (or cancelled) lingered as a ghost in the panel. Added live reconciliation.
+- **New system `bin_fast_monitor`** (background task, mirrors the HL `fast_position_monitor`): polls Binance every `binStradMonitorMs` (default **500ms**, clamp 200–5000) whenever a LIVE Binance-futures straddle is armed or open. Gated by `binStradReconcile` + live + `binance_futures`.
+  - `_reconcile_bin_arms`: polls both CONDITIONAL algo entry legs → on trigger cancels the opposite (OCO) + registers the position (real fill price/size from positionRisk); both-cancelled ⇒ drops the straddle ("cancelled on Binance"); still-resting ⇒ `state="resting"`. Live expiry lives here now.
+  - `_reconcile_bin_position`: reads real positionRisk — if open, snapshots `liveState=open` + exchange uPnL/size for the panel; if FLAT, classifies the fired level (TP/SL vs entry), records win/loss + dailyPnl, cancels leftover algo exits, removes the position and logs `exit · Binance TP/SL`.
+  - `_process_bin_straddles` is now SIM-only (live owned solely by the monitor → no double-handling).
+- Panel: Binance straddle card gains a **Live State Check** control (`Every (ms)`); armed list shows a live **state badge** (resting / triggered / cancelled); open LIVE bin positions show a **live/checking** badge and use the exchange uPnL.
+- Config: `binStradReconcile` (True), `binStradMonitorMs` (500) + clamp + `BotConfigUpdate` + `_bot_status` (`liveState`, straddle `state`).
+- Tests: `tests/test_bin_straddle.py` grew to **11** (added exchange-close-by-TP, close-by-SL, open-snapshot; split live→`_reconcile_bin_arms`). 48/48 across all straddle+futures suites. Live path still only verifiable on the VPS (Binance writes geo-blocked in preview).
+
 ## Fix (2026-06) — Binance conditional-order migration (Algo Service / error -4120)
 - Binance USD-M Futures migrated ALL conditional orders (STOP_MARKET / TAKE_PROFIT_MARKET / etc.) to a dedicated **Algo Service on 2025-12-09**; the legacy `POST /fapi/v1/order` now rejects them with **-4120**. The Binance native straddle therefore failed to place live stop-entry orders.
 - Migrated ONLY the conditional paths to the Algo Service (classic market open/close stay on `/fapi/v1/order`):

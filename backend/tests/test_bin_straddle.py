@@ -168,7 +168,7 @@ def test_live_trigger_cancels_opposite_and_places_native_tpsl(monkeypatch):
         "longStop": 100.08, "shortStop": 99.92, "longOid": "L1", "shortOid": "S1",
         "createdTs": now, "live": True, "lastPollTs": 0.0,
     }
-    asyncio.run(server._process_bin_straddles(None, now + 3))
+    asyncio.run(server._reconcile_bin_arms(None, now + 3))
     assert "S1" in cancels, "opposite (SHORT) leg must be cancelled on LONG trigger (OCO)"
     assert "BTCUSDT" not in server.BOT["binStraddles"]
     pos = server.BOT["positions"]["BTCUSDT"]
@@ -215,7 +215,7 @@ def test_live_fill_price_refined_from_position_risk(monkeypatch):
         "longStop": 100.08, "shortStop": 99.92, "longOid": "L9", "shortOid": "S9",
         "createdTs": now, "live": True, "lastPollTs": 0.0,
     }
-    asyncio.run(server._process_bin_straddles(None, now + 3))
+    asyncio.run(server._reconcile_bin_arms(None, now + 3))
     pos = server.BOT["positions"]["SOLUSDT"]
     assert pos["side"] == "short"
     assert abs(pos["entryPrice"] - 99.915) < 1e-9   # real avg entry from positionRisk
@@ -288,11 +288,88 @@ def test_live_arm_expiry_cancels_both_algo_legs(monkeypatch):
         "longStop": 100.08, "shortStop": 99.92, "longOid": "L1", "shortOid": "S1",
         "createdTs": now - (server.STRADDLE_EXPIRY + 5), "live": True, "lastPollTs": 0.0,
     }
-    asyncio.run(server._process_bin_straddles(None, now))
+    asyncio.run(server._reconcile_bin_arms(None, now))
     assert "BTCUSDT" not in server.BOT["binStraddles"]
     assert set(cancels) == {"L1", "S1"}, "both resting algo legs must be cancelled on expiry"
     _reset()
     _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
+
+
+def test_reconcile_detects_exchange_close_by_tp(monkeypatch):
+    _reset()
+    server.BOT["wins"] = 0
+    server.BOT["losses"] = 0
+    server.BOT["dailyPnl"] = 0.0
+    cancels = []
+
+    async def fake_positions(http, sym=None):
+        return []  # FLAT on exchange -> closed
+
+    async def fake_cancel(http, sym, oid):
+        cancels.append(oid)
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(server, "_fapi_positions", fake_positions)
+    monkeypatch.setattr(server, "_fapi_algo_cancel", fake_cancel)
+    monkeypatch.setattr(server, "send_webhook", noop)
+    server.STATE["latest"] = {"BTCUSDT": {"base": "BTC", "price": 100.6, "quote": "USDT"}}
+    pos = {"symbol": "BTCUSDT", "base": "BTC", "side": "long", "entryPrice": 100.0, "qty": 1.0,
+           "quoteSpent": 100.0, "tpPrice": 100.5, "slPrice": 99.7, "openedTs": time.time(),
+           "dryRun": False, "source": "bin_straddle", "binTpOid": "t", "binSlOid": "s"}
+    server.BOT["positions"]["BTCUSDT"] = pos
+    asyncio.run(server._reconcile_bin_position(None, "BTCUSDT", pos, time.time()))
+    assert "BTCUSDT" not in server.BOT["positions"], "closed position must be removed (no ghost)"
+    assert server.BOT["wins"] == 1 and server.BOT["losses"] == 0
+    assert abs(server.BOT["dailyPnl"] - 0.5) < 1e-9     # (tp 100.5 - entry 100) * qty 1
+    assert set(cancels) == {"t", "s"}, "leftover native TP/SL algo orders must be cancelled"
+    _reset()
+
+
+def test_reconcile_detects_exchange_close_by_sl(monkeypatch):
+    _reset()
+    server.BOT["wins"] = 0
+    server.BOT["losses"] = 0
+    server.BOT["dailyPnl"] = 0.0
+
+    async def fake_positions(http, sym=None):
+        return []
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(server, "_fapi_positions", fake_positions)
+    monkeypatch.setattr(server, "_fapi_algo_cancel", noop)
+    monkeypatch.setattr(server, "send_webhook", noop)
+    server.STATE["latest"] = {"ETHUSDT": {"base": "ETH", "price": 99.6, "quote": "USDT"}}
+    pos = {"symbol": "ETHUSDT", "base": "ETH", "side": "long", "entryPrice": 100.0, "qty": 2.0,
+           "quoteSpent": 200.0, "tpPrice": 100.5, "slPrice": 99.7, "openedTs": time.time(),
+           "dryRun": False, "source": "bin_straddle"}
+    server.BOT["positions"]["ETHUSDT"] = pos
+    asyncio.run(server._reconcile_bin_position(None, "ETHUSDT", pos, time.time()))
+    assert "ETHUSDT" not in server.BOT["positions"]
+    assert server.BOT["losses"] == 1 and server.BOT["wins"] == 0
+    assert abs(server.BOT["dailyPnl"] - ((99.7 - 100.0) * 2.0)) < 1e-9   # SL hit
+    _reset()
+
+
+def test_reconcile_open_position_snapshots_live_state(monkeypatch):
+    _reset()
+
+    async def fake_positions(http, sym=None):
+        return [{"positionAmt": "1.0", "entryPrice": "100.0", "unRealizedProfit": "0.4"}]
+
+    monkeypatch.setattr(server, "_fapi_positions", fake_positions)
+    pos = {"symbol": "BTCUSDT", "base": "BTC", "side": "long", "entryPrice": 100.0, "qty": 1.0,
+           "quoteSpent": 100.0, "tpPrice": 100.5, "slPrice": 99.7, "openedTs": time.time(),
+           "dryRun": False, "source": "bin_straddle"}
+    server.BOT["positions"]["BTCUSDT"] = pos
+    asyncio.run(server._reconcile_bin_position(None, "BTCUSDT", pos, time.time()))
+    assert "BTCUSDT" in server.BOT["positions"], "open position must stay tracked"
+    assert pos["liveState"] == "open"
+    assert abs(pos["exUpnl"] - 0.4) < 1e-9 and abs(pos["exQty"] - 1.0) < 1e-9
+    _reset()
 
 
 def test_config_clamps_bin_straddle(monkeypatch):
@@ -302,12 +379,13 @@ def test_config_clamps_bin_straddle(monkeypatch):
 
     async def run():
         return await server.bot_config(server.BotConfigUpdate(
-            binStradEntryPct=99, binStradTpPct=0.0001, binStradSlPct=99))
+            binStradEntryPct=99, binStradTpPct=0.0001, binStradSlPct=99, binStradMonitorMs=99999))
     asyncio.run(run())
     cfg = server.BOT["config"]
     assert cfg["binStradEntryPct"] == 5.0
     assert cfg["binStradTpPct"] == 0.01
     assert cfg["binStradSlPct"] == 5.0
+    assert cfg["binStradMonitorMs"] == 5000
     asyncio.run(server.bot_config(server.BotConfigUpdate(binStradEnabled=True)))
     assert server.BOT["config"]["binStradEnabled"] is True
     asyncio.run(server.bot_config(server.BotConfigUpdate(binStradEnabled=False)))

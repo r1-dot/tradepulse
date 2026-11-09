@@ -80,6 +80,7 @@ export default function BotPanel({ open, onClose }) {
     binStradEntryPct: parseFloat(form.binStradEntryPct),
     binStradTpPct: parseFloat(form.binStradTpPct),
     binStradSlPct: parseFloat(form.binStradSlPct),
+    binStradMonitorMs: parseInt(form.binStradMonitorMs, 10),
     tradeAmtMin: parseFloat(form.tradeAmtMin),
     tradeAmtMax: parseFloat(form.tradeAmtMax),
     webhookUrl: form.webhookUrl || "",
@@ -553,6 +554,15 @@ export default function BotPanel({ open, onClose }) {
                       <NumField testid="bot-bin-straddle-tp" label="Take profit" step="0.01" value={form.binStradTpPct} onChange={(v) => setForm({ ...form, binStradTpPct: v })} suffix="%" />
                       <NumField testid="bot-bin-straddle-sl" label="Stop loss" step="0.01" value={form.binStradSlPct} onChange={(v) => setForm({ ...form, binStradSlPct: v })} suffix="%" />
                     </div>
+                    <div className="flex items-center justify-between border-t border-[#F0B90B]/25 pt-2">
+                      <div className="flex-1 pr-2">
+                        <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#A17A00]">Live state check</span>
+                        <p className="mono text-[8px] leading-relaxed text-zinc-500">Polls Binance for every order's real state (resting / triggered / closed by TP-SL / cancelled) and shows it live below.</p>
+                      </div>
+                      <div className="w-24">
+                        <NumField testid="bot-bin-straddle-monitor-ms" label="Every (ms)" step="100" value={form.binStradMonitorMs} onChange={(v) => setForm({ ...form, binStradMonitorMs: v })} suffix="ms" />
+                      </div>
+                    </div>
                     <p className="mono text-[8px] leading-relaxed text-amber-600">
                       ⚠ Requires the <b>Binance Futures</b> venue + <b>LIVE</b> for real orders (simulates in SIM). Independent of Smart Trailing / Fixed TP-SL — uses the dedicated levels above. Hit “Save settings” to apply.
                     </p>
@@ -656,6 +666,9 @@ export default function BotPanel({ open, onClose }) {
                         <div className="mono text-[12px] font-semibold text-zinc-900 flex items-center gap-1">
                           <span className={`rounded-sm px-1 text-[8px] font-bold uppercase ${p.side === "short" ? "bg-[#FF3B30] text-white" : "bg-[#00A004] text-white"}`}>{p.side === "short" ? "S" : "L"}</span>
                           {p.base}USDT<span className="text-[9px] text-zinc-300"> Perp</span>
+                          {p.source === "bin_straddle" && p.mode === "LIVE" && (
+                            <span data-testid={`bot-pos-state-${p.posKey || p.symbol}`} className="rounded-sm bg-[#F0B90B]/30 px-1 text-[7px] font-bold uppercase text-[#A17A00]">{p.liveState === "open" ? "live" : "checking"}</span>
+                          )}
                         </div>
                         <div className="mono text-[10px] text-zinc-400">e {p.entryPrice.toPrecision(5)} · tp {p.tpPrice ? p.tpPrice.toPrecision(5) : "trail"} · sl {p.slPrice ? p.slPrice.toPrecision(5) : "—"}{p.source === "adopted" ? " · adopted" : ""}</div>
                         <div className="flex flex-col items-end leading-tight">
@@ -701,10 +714,13 @@ export default function BotPanel({ open, onClose }) {
                     {st.pendingBinStraddles.map((s) => (
                       <div key={s.symbol} data-testid={`bot-bin-straddle-${s.symbol}`} className="flex items-center justify-between border border-[#F0B90B]/50 bg-[#F0B90B]/[0.08] px-2 py-1.5">
                         <div className="mono text-[12px] font-semibold text-zinc-900">{s.base}USDT<span className="text-[9px] text-zinc-300"> Perp</span> <span className={`text-[8px] ${s.mode === "LIVE" ? "text-[#FF3B30]" : "text-zinc-400"}`}>{s.mode}</span></div>
-                        <div className="mono text-[10px]">
-                          <span className="text-[#00A004]">↑{s.longEntry.toPrecision(5)}</span>
-                          <span className="text-zinc-300"> / </span>
-                          <span className="text-[#FF3B30]">↓{s.shortEntry.toPrecision(5)}</span>
+                        <div className="flex items-center gap-2">
+                          <span data-testid={`bot-bin-straddle-state-${s.symbol}`} className="mono text-[8px] font-bold uppercase tracking-wide rounded-sm bg-[#F0B90B]/30 px-1 py-0.5 text-[#A17A00]">{s.state || "resting"}</span>
+                          <div className="mono text-[10px]">
+                            <span className="text-[#00A004]">↑{s.longEntry.toPrecision(5)}</span>
+                            <span className="text-zinc-300"> / </span>
+                            <span className="text-[#FF3B30]">↓{s.shortEntry.toPrecision(5)}</span>
+                          </div>
                         </div>
                       </div>
                     ))}
