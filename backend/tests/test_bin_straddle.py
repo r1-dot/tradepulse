@@ -295,7 +295,7 @@ def test_live_arm_expiry_cancels_both_algo_legs(monkeypatch):
     _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
 
 
-def test_reconcile_detects_exchange_close_by_tp(monkeypatch):
+def test_reconcile_close_by_tp_is_readonly(monkeypatch):
     _reset()
     server.BOT["wins"] = 0
     server.BOT["losses"] = 0
@@ -303,7 +303,7 @@ def test_reconcile_detects_exchange_close_by_tp(monkeypatch):
     cancels = []
 
     async def fake_positions(http, sym=None):
-        return []  # FLAT on exchange -> closed
+        return []  # FLAT on exchange -> native TP/SL already closed it
 
     async def fake_cancel(http, sym, oid):
         cancels.append(oid)
@@ -323,7 +323,7 @@ def test_reconcile_detects_exchange_close_by_tp(monkeypatch):
     assert "BTCUSDT" not in server.BOT["positions"], "closed position must be removed (no ghost)"
     assert server.BOT["wins"] == 1 and server.BOT["losses"] == 0
     assert abs(server.BOT["dailyPnl"] - 0.5) < 1e-9     # (tp 100.5 - entry 100) * qty 1
-    assert set(cancels) == {"t", "s"}, "leftover native TP/SL algo orders must be cancelled"
+    assert cancels == [], "READ-ONLY: the monitor must NOT cancel/close anything on Binance"
     _reset()
 
 
@@ -367,9 +367,93 @@ def test_reconcile_open_position_snapshots_live_state(monkeypatch):
     server.BOT["positions"]["BTCUSDT"] = pos
     asyncio.run(server._reconcile_bin_position(None, "BTCUSDT", pos, time.time()))
     assert "BTCUSDT" in server.BOT["positions"], "open position must stay tracked"
-    assert pos["liveState"] == "open"
+    assert pos["liveState"] == "hold"
     assert abs(pos["exUpnl"] - 0.4) < 1e-9 and abs(pos["exQty"] - 1.0) < 1e-9
     _reset()
+
+
+def test_bin_rest_interval_ws_vs_fallback():
+    cfg = {"binStradMonitorMs": 500}
+    assert server._bin_rest_interval(cfg, True) == 2.0          # WS up -> slow safety sweep
+    assert server._bin_rest_interval(cfg, False) == 0.5         # WS down -> 500ms fast backup
+    assert server._bin_rest_interval({"binStradMonitorMs": 800}, False) == 0.8
+
+
+def test_ws_backoff_schedule():
+    seq = server._BIN_WS_BACKOFF
+    assert seq == [1, 2, 5]
+    waits = [seq[min(i, len(seq) - 1)] for i in range(5)]
+    assert waits == [1, 2, 5, 5, 5], "reconnect backoff must ramp 1s->2s->5s then hold at 5s"
+
+
+def test_ws_handle_account_update_readonly():
+    _reset()
+    pos = {"symbol": "BTCUSDT", "base": "BTC", "side": "long", "entryPrice": 100.0, "qty": 1.0,
+           "quoteSpent": 100.0, "tpPrice": 100.5, "slPrice": 99.7, "openedTs": time.time(),
+           "dryRun": False, "source": "bin_straddle"}
+    server.BOT["positions"]["BTCUSDT"] = pos
+    ev = {"e": "ACCOUNT_UPDATE", "a": {"P": [
+        {"s": "BTCUSDT", "pa": "0.5", "ep": "100.2", "up": "0.1", "ps": "LONG"}]}}
+    server._bin_ws_handle_event(ev)   # synchronous, read-only
+    assert "BTCUSDT" in server.BOT["positions"], "monitor must not remove positions"
+    assert pos["liveState"] == "hold"
+    assert abs(pos["exUpnl"] - 0.1) < 1e-9 and abs(pos["exEntry"] - 100.2) < 1e-9 and abs(pos["exQty"] - 0.5) < 1e-9
+    _reset()
+
+
+def test_ws_handle_algo_update_marks_tp_and_sl():
+    _reset()
+    long_pos = {"symbol": "BTCUSDT", "base": "BTC", "side": "long", "source": "bin_straddle",
+                "binTpOid": 111, "binSlOid": 222, "dryRun": False}
+    short_pos = {"symbol": "ETHUSDT", "base": "ETH", "side": "short", "source": "bin_straddle",
+                 "binTpOid": 333, "binSlOid": 444, "dryRun": False}
+    server.BOT["positions"]["BTCUSDT"] = long_pos
+    server.BOT["positions"]["ETHUSDT"] = short_pos
+    server._bin_ws_handle_event({"e": "ALGO_UPDATE", "o": {"aid": 111, "X": "FINISHED"}})
+    server._bin_ws_handle_event({"e": "ALGO_UPDATE", "o": {"aid": 444, "X": "TRIGGERED"}})
+    assert long_pos["liveState"] == "tp_hit"
+    assert short_pos["liveState"] == "sl_hit"
+    _reset()
+
+
+def test_ws_handle_account_update_flat_does_not_close():
+    _reset()
+    server.BOT["wins"] = 0
+    server.BOT["losses"] = 0
+    pos = {"symbol": "BTCUSDT", "base": "BTC", "side": "long", "source": "bin_straddle",
+           "dryRun": False, "liveState": "hold"}
+    server.BOT["positions"]["BTCUSDT"] = pos
+    # a flat ACCOUNT_UPDATE must NOT remove the position or touch counters (REST reconcile owns that)
+    server._bin_ws_handle_event({"e": "ACCOUNT_UPDATE", "a": {"P": [
+        {"s": "BTCUSDT", "pa": "0", "ep": "0", "up": "0", "ps": "LONG"}]}})
+    assert "BTCUSDT" in server.BOT["positions"]
+    assert server.BOT["wins"] == 0 and server.BOT["losses"] == 0
+    _reset()
+
+
+def test_listen_key_helper_is_apikey_only(monkeypatch):
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "MYKEY")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "SEC")
+    seen = {}
+
+    class R:
+        status_code = 200
+
+        def json(self):
+            return {"listenKey": "abc123"}
+
+    class H:
+        async def request(self, method, url, headers=None, params=None, timeout=None, follow_redirects=False):
+            seen["method"] = method
+            seen["url"] = url
+            seen["headers"] = headers
+            return R()
+
+    key = asyncio.run(server._fapi_listen_key(H(), "POST"))
+    assert key == "abc123"
+    assert seen["method"] == "POST" and seen["url"].endswith("/fapi/v1/listenKey")
+    assert seen["headers"].get("X-MBX-APIKEY") == "MYKEY"
+    assert "signature" not in seen["url"]  # listenKey endpoints are not HMAC-signed
 
 
 def test_config_clamps_bin_straddle(monkeypatch):

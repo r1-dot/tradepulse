@@ -557,10 +557,16 @@ export default function BotPanel({ open, onClose }) {
                     <div className="flex items-center justify-between border-t border-[#F0B90B]/25 pt-2">
                       <div className="flex-1 pr-2">
                         <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#A17A00]">Live state check</span>
-                        <p className="mono text-[8px] leading-relaxed text-zinc-500">Polls Binance for every order's real state (resting / triggered / closed by TP-SL / cancelled) and shows it live below.</p>
+                        <p className="mono text-[8px] leading-relaxed text-zinc-500">Read-only WebSocket shows each order's real state (HOLD / TP HIT / SL HIT) + live P/L. If it drops, it auto-reconnects (1s→2s→5s) and this REST poll backs it up meanwhile. The bot never closes or cancels a position itself.</p>
+                        {st.binWs && (
+                          <div className="mt-1 flex items-center gap-1" data-testid="bot-bin-ws-status">
+                            <span className={`inline-block h-1.5 w-1.5 rounded-full ${st.binWs.connected ? "bg-[#00A004]" : "bg-zinc-300"}`} />
+                            <span className={`mono text-[8px] font-bold uppercase ${st.binWs.connected ? "text-[#00A004]" : "text-zinc-400"}`}>{st.binWs.connected ? "WebSocket live" : "REST backup (500ms)"}</span>
+                          </div>
+                        )}
                       </div>
                       <div className="w-24">
-                        <NumField testid="bot-bin-straddle-monitor-ms" label="Every (ms)" step="100" value={form.binStradMonitorMs} onChange={(v) => setForm({ ...form, binStradMonitorMs: v })} suffix="ms" />
+                        <NumField testid="bot-bin-straddle-monitor-ms" label="Backup (ms)" step="100" value={form.binStradMonitorMs} onChange={(v) => setForm({ ...form, binStradMonitorMs: v })} suffix="ms" />
                       </div>
                     </div>
                     <p className="mono text-[8px] leading-relaxed text-amber-600">
@@ -666,9 +672,12 @@ export default function BotPanel({ open, onClose }) {
                         <div className="mono text-[12px] font-semibold text-zinc-900 flex items-center gap-1">
                           <span className={`rounded-sm px-1 text-[8px] font-bold uppercase ${p.side === "short" ? "bg-[#FF3B30] text-white" : "bg-[#00A004] text-white"}`}>{p.side === "short" ? "S" : "L"}</span>
                           {p.base}USDT<span className="text-[9px] text-zinc-300"> Perp</span>
-                          {p.source === "bin_straddle" && p.mode === "LIVE" && (
-                            <span data-testid={`bot-pos-state-${p.posKey || p.symbol}`} className="rounded-sm bg-[#F0B90B]/30 px-1 text-[7px] font-bold uppercase text-[#A17A00]">{p.liveState === "open" ? "live" : "checking"}</span>
-                          )}
+                          {p.source === "bin_straddle" && p.mode === "LIVE" && (() => {
+                            const ls = p.liveState;
+                            const map = { hold: ["HOLD", "bg-[#F0B90B]/30 text-[#A17A00]"], tp_hit: ["TP HIT", "bg-[#00A004] text-white"], sl_hit: ["SL HIT", "bg-[#FF3B30] text-white"] };
+                            const [txt, cls] = map[ls] || ["CHECKING", "bg-zinc-200 text-zinc-500"];
+                            return <span data-testid={`bot-pos-state-${p.posKey || p.symbol}`} className={`rounded-sm px-1 text-[7px] font-bold uppercase ${cls}`}>{txt}</span>;
+                          })()}
                         </div>
                         <div className="mono text-[10px] text-zinc-400">e {p.entryPrice.toPrecision(5)} · tp {p.tpPrice ? p.tpPrice.toPrecision(5) : "trail"} · sl {p.slPrice ? p.slPrice.toPrecision(5) : "—"}{p.source === "adopted" ? " · adopted" : ""}</div>
                         <div className="flex flex-col items-end leading-tight">

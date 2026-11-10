@@ -17,6 +17,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 import os
 import asyncio
+import random
 import time
 import math
 import json
@@ -59,6 +60,10 @@ BINANCE_FUTURES_TESTNET_URL = 'https://testnet.binancefuture.com'
 BINANCE_FUTURES_HOSTS = ["https://fapi1.binance.com", "https://fapi2.binance.com",
                          "https://fapi3.binance.com", "https://fapi4.binance.com"]
 BINANCE_FUTURES_UA = "Mozilla/5.0 (X11; Linux x86_64) TradePulse/1.0"
+# Binance USD-M Futures user-data WebSocket (read-only monitoring stream)
+BIN_FSTREAM_WS = os.environ.get('BIN_FSTREAM_WS', 'wss://fstream.binance.com/ws')
+BIN_FSTREAM_WS_TESTNET = 'wss://stream.binancefuture.com/ws'
+_BIN_WS_BACKOFF = [1, 2, 5]  # reconnect backoff seconds (1s -> 2s -> 5s, then hold at 5s)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("scanner")
@@ -200,6 +205,7 @@ BOT = {
     "positions": {},        # symbol -> position dict
     "straddles": {},        # symbol -> pending straddle (armed long/short stop levels)
     "binStraddles": {},     # symbol -> pending Binance native straddle (real stop-entry orders)
+    "binWs": {"connected": False, "lastEventTs": 0.0, "reconnects": 0, "listenKey": None},
     "pendingFutures": {},   # posKey -> pending slippage-limit futures entry (5-min timeout)
     "journal": deque(maxlen=300),
     "dailyPnl": 0.0,
@@ -1770,9 +1776,9 @@ async def _reconcile_bin_arms(http, now):
 
 
 async def _reconcile_bin_position(http, sym, pos, now):
-    """LIVE open bin-straddle position: read the real Binance position. If still open, snapshot the
-    live state (exchange uPnL/size) for the panel. If FLAT, the exchange closed it (native TP/SL
-    fired, cancelled, or manual) — classify win/loss, cancel leftover algo exits, record the exit."""
+    """LIVE open bin-straddle position, READ-ONLY. If still open, snapshot the live state (exchange
+    uPnL/size) for the panel (HOLD). If FLAT, the native TP/SL already closed it on Binance — we
+    only classify TP HIT / SL HIT, record the result and display it. We never cancel or close."""
     try:
         poss = await _fapi_positions(http, sym)
     except Exception as e:  # noqa: BLE001
@@ -1787,12 +1793,13 @@ async def _reconcile_bin_position(http, sym, pos, now):
         entry = float(p0.get("entryPrice") or entry) or entry
         upnl = float(p0.get("unRealizedProfit") or p0.get("unrealizedProfit") or 0)
     if amt != 0:
-        pos["liveState"] = "open"
+        pos["liveState"] = "hold"
         pos["exUpnl"] = upnl
         pos["exQty"] = abs(amt)
         pos["exEntry"] = entry
         return
-    # FLAT on exchange -> closed. Classify which native level fired.
+    # FLAT on exchange -> the native TP/SL (resting on Binance) closed it. READ-ONLY: we never
+    # cancel/close anything ourselves — just classify which level fired, record it, and display it.
     mark = STATE["latest"].get(sym, {}).get("price", entry)
     is_long = pos.get("side") == "long"
     tp = pos.get("tpPrice")
@@ -1813,29 +1820,169 @@ async def _reconcile_bin_position(http, sym, pos, now):
     exit_px = (tp if won else sl) or mark
     sgn = 1 if is_long else -1
     pnl = (exit_px - entry) * pos.get("qty", 0) * sgn
-    for oid in (pos.get("binTpOid"), pos.get("binSlOid")):
-        if oid:
-            try:
-                await _fapi_algo_cancel(http, sym, oid)
-            except Exception:  # noqa: BLE001
-                pass
     BOT["positions"].pop(sym, None)
     BOT["dailyPnl"] += pnl
     if pnl >= 0:
         BOT["wins"] += 1
     else:
         BOT["losses"] += 1
-    label = "TP" if won else "SL"
+    label = "TP HIT" if won else "SL HIT"
     jlog("exit", symbol=sym, base=pos["base"], side=pos["side"], price=exit_px, pnl=pnl,
          reason=f"Binance {label}", source="bin_straddle", mode="LIVE",
-         message=f"Binance closed {pos['base']} {pos['side'].upper()} via native {label} @ ~{exit_px:.6g} (pnl {pnl:+.4f})")
+         message=f"Binance closed {pos['base']} {pos['side'].upper()} — {label} @ ~{exit_px:.6g} (pnl {pnl:+.4f})")
     await send_webhook("sell" if is_long else "buy", sym, exit_px)
 
 
+def _bin_rest_interval(cfg, ws_connected):
+    """REST reconcile cadence: when the read-only WebSocket is live it drives instant display and
+    REST just does a slow safety sweep (2s); when the socket is DOWN, fall back to the fast
+    binStradMonitorMs poll (default 500ms) so no fill / TP / SL update is ever missed."""
+    if ws_connected:
+        return 2.0
+    return max(0.2, cfg.get("binStradMonitorMs", 500) / 1000.0)
+
+
+async def _fapi_listen_key(http, method="POST", key=None):
+    """Create (POST) / keepalive (PUT) / close (DELETE) a Binance futures user-data listenKey.
+    Uses only the API-key header — these endpoints are not HMAC-signed."""
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY, "User-Agent": BINANCE_FUTURES_UA}
+    params = {"listenKey": key} if key else None
+    url = f"{_fapi_base()}/fapi/v1/listenKey"
+    r = await http.request(method, url, headers=headers, params=params, timeout=15, follow_redirects=True)
+    if r.status_code >= 400:
+        raise RuntimeError(f"listenKey {r.status_code}: {r.text[:120]}")
+    try:
+        return (r.json() or {}).get("listenKey", key)
+    except Exception:  # noqa: BLE001
+        return key
+
+
+async def _bin_ws_keepalive(http, key):
+    """PUT the listenKey every 30 min (Binance expires it after 60 min of no keepalive)."""
+    while True:
+        await asyncio.sleep(30 * 60)
+        try:
+            await _fapi_listen_key(http, "PUT", key)
+        except Exception:  # noqa: BLE001
+            return
+
+
+async def _bin_ws_resync(http):
+    """On (re)connect, re-sync the live state of every tracked Binance straddle position from REST
+    positionRisk (read-only) so the panel is accurate even if we missed events while disconnected."""
+    for psym in list(BOT["positions"].keys()):
+        p = BOT["positions"].get(psym)
+        if not p or p.get("dryRun") or p.get("source") != "bin_straddle":
+            continue
+        try:
+            poss = await _fapi_positions(http, psym)
+            if poss:
+                amt = float(poss[0].get("positionAmt") or 0)
+                p["exEntry"] = float(poss[0].get("entryPrice") or 0) or p.get("exEntry")
+                p["exUpnl"] = float(poss[0].get("unRealizedProfit") or poss[0].get("unrealizedProfit") or 0)
+                p["exQty"] = abs(amt)
+                p["liveState"] = "hold" if amt != 0 else p.get("liveState")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _bin_ws_handle_event(ev):
+    """READ-ONLY: translate a Binance user-data event into panel display state for tracked
+    bin-straddle positions. Never places, cancels or closes anything."""
+    et = ev.get("e")
+    BOT["binWs"]["lastEventTs"] = time.time()
+    if et == "ACCOUNT_UPDATE":
+        for p in ev.get("a", {}).get("P", []):
+            sym = p.get("s")
+            pos = BOT["positions"].get(sym)
+            if pos and not pos.get("dryRun") and pos.get("source") == "bin_straddle":
+                amt = float(p.get("pa") or 0)
+                pos["exEntry"] = float(p.get("ep") or 0) or pos.get("exEntry")
+                pos["exUpnl"] = float(p.get("up") or 0)
+                pos["exQty"] = abs(amt)
+                if amt != 0:
+                    pos["liveState"] = "hold"
+    elif et == "ALGO_UPDATE":
+        o = ev.get("o", {})
+        aid = o.get("aid")
+        status = str(o.get("X") or "").upper()
+        if status in ("TRIGGERED", "FINISHED") and aid is not None:
+            for pos in BOT["positions"].values():
+                if pos.get("source") != "bin_straddle":
+                    continue
+                if pos.get("binTpOid") == aid:
+                    pos["liveState"] = "tp_hit"
+                elif pos.get("binSlOid") == aid:
+                    pos["liveState"] = "sl_hit"
+    elif et == "ORDER_TRADE_UPDATE":
+        o = ev.get("o", {})
+        sym = o.get("s")
+        pos = BOT["positions"].get(sym)
+        reduce_only = o.get("R") in (True, "true", "True")
+        if pos and pos.get("source") == "bin_straddle" and str(o.get("X")) == "FILLED" and reduce_only:
+            pos["exRealized"] = float(o.get("rp") or 0)
+
+
+async def bin_ws_monitor():
+    """READ-ONLY Binance user-data WebSocket monitor. Streams ORDER_TRADE_UPDATE / ACCOUNT_UPDATE /
+    ALGO_UPDATE to show HOLD / TP HIT / SL HIT + live uPnL in the panel. Auto-reconnects with a
+    1s -> 2s -> 5s backoff and, on connect, recreates the listenKey + re-syncs all tracked positions.
+    Never sends any trade/cancel/close over the socket. Only runs while a LIVE Binance straddle is
+    armed or open; otherwise the 500ms REST fallback (bin_fast_monitor) covers monitoring."""
+    try:
+        import websockets  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.error("bin ws monitor: websockets unavailable (%s)", e)
+        return
+    idx = 0
+    while True:
+        cfg = BOT["config"]
+        live_bin = (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures" and cfg.get("binStradReconcile", True) and bool(BINANCE_API_KEY)
+        active = any(s.get("live") for s in BOT["binStraddles"].values()) or \
+            any((not p.get("dryRun")) and p.get("source") == "bin_straddle" for p in BOT["positions"].values())
+        if not (live_bin and active):
+            BOT["binWs"]["connected"] = False
+            idx = 0
+            await asyncio.sleep(1.5)
+            continue
+        http = app.state.http
+        ka = None
+        try:
+            key = await _fapi_listen_key(http, "POST")
+            BOT["binWs"]["listenKey"] = key
+            await _bin_ws_resync(http)  # re-subscribe/re-sync tracked orders on (re)connect
+            ws_base = BIN_FSTREAM_WS_TESTNET if cfg.get("futuresTestnet") else BIN_FSTREAM_WS
+            url = f"{ws_base}/{key}"
+            ka = asyncio.create_task(_bin_ws_keepalive(http, key))
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=2 ** 20) as ws:
+                BOT["binWs"]["connected"] = True
+                idx = 0
+                logger.info("bin ws monitor connected")
+                async for raw in ws:
+                    try:
+                        ev = json.loads(raw)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if ev.get("e") == "listenKeyExpired":
+                        break
+                    _bin_ws_handle_event(ev)
+        except Exception as e:  # noqa: BLE001
+            logger.error("bin ws monitor: %s", str(e)[:150])
+        finally:
+            BOT["binWs"]["connected"] = False
+            if ka:
+                ka.cancel()
+        BOT["binWs"]["reconnects"] = BOT["binWs"].get("reconnects", 0) + 1
+        wait = _BIN_WS_BACKOFF[min(idx, len(_BIN_WS_BACKOFF) - 1)]
+        idx += 1
+        await asyncio.sleep(wait + random.random() * 0.3)
+
+
 async def bin_fast_monitor():
-    """Poll Binance every binStradMonitorMs (default 500ms) to track the live state of native
-    straddle orders/positions — resting / triggered / closed by TP-SL / cancelled — and surface it
-    in the bot panel. Active only while a LIVE Binance-futures straddle is armed or open."""
+    """REST monitoring + the single allowed action path (OCO opposite-leg cancel + native TP/SL
+    placement on fill). Runs at 500ms while the read-only WebSocket is DOWN (so no update is
+    missed); slows to a 2s safety sweep while the socket is up. Active only while a LIVE
+    Binance-futures straddle is armed or open."""
     while True:
         cfg = BOT["config"]
         try:
@@ -1851,7 +1998,7 @@ async def bin_fast_monitor():
                     if not p or p.get("dryRun") or p.get("source") != "bin_straddle":
                         continue
                     await _reconcile_bin_position(http, psym, p, now)
-                await asyncio.sleep(max(0.2, cfg.get("binStradMonitorMs", 500) / 1000.0))
+                await asyncio.sleep(_bin_rest_interval(cfg, BOT["binWs"].get("connected")))
             else:
                 await asyncio.sleep(1.5)
         except Exception as e:  # noqa: BLE001
@@ -2397,6 +2544,12 @@ def _bot_status():
              "state": s.get("state") or ("resting" if s.get("live") else "armed")}
             for s in BOT["binStraddles"].values()
         ],
+        "binWs": {
+            "connected": BOT["binWs"].get("connected", False),
+            "lastEventTs": BOT["binWs"].get("lastEventTs", 0.0),
+            "reconnects": BOT["binWs"].get("reconnects", 0),
+            "source": "ws" if BOT["binWs"].get("connected") else "rest",
+        },
         "pendingFutures": [
             {"symbol": p["symbol"], "base": p["base"], "side": p["side"], "limitPrice": p["limitPrice"],
              "posKey": p["posKey"], "ageSec": max(0, int(time.time() - p["createdTs"])), "mode": "SIM" if p["dryRun"] else "LIVE"}
@@ -2851,6 +3004,7 @@ async def startup():
     app.state.poller = asyncio.create_task(poll_binance(app.state.http))
     app.state.monitor = asyncio.create_task(fast_position_monitor())
     app.state.bin_monitor = asyncio.create_task(bin_fast_monitor())
+    app.state.bin_ws = asyncio.create_task(bin_ws_monitor())
     logger.info("scanner started, source=%s quote=%s", BINANCE_BASE, QUOTE)
 
 
