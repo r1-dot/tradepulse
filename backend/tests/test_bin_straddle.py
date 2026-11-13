@@ -34,11 +34,14 @@ class FakeHTTP:
                 return FakeResp(resp)
         return FakeResp({"code": -1, "msg": "unmatched"}, status=400)
 
-    async def request(self, method, url, headers=None, timeout=None, follow_redirects=False):
+    async def request(self, method, url, headers=None, timeout=None, follow_redirects=False, params=None, **kwargs):
         self.calls.append((method, url))
         return self._match(url)
 
-    async def get(self, url, headers=None, timeout=None, follow_redirects=False):
+    async def get(self, url, headers=None, timeout=None, follow_redirects=False, params=None, **kwargs):
+        if params:
+            q = "&".join(f"{k}={v}" for k, v in params.items())
+            url = f"{url}?{q}"
         self.calls.append(("GET", url))
         return self._match(url)
 
@@ -53,6 +56,7 @@ def _reset():
     server.BOT["binStraddles"].clear()
     server.BOT["straddles"].clear()
     server.BOT["lastTradeTs"].clear()
+    server.BOT.setdefault("_binPxCache", {}).clear()
 
 
 def _cfg(**over):
@@ -84,6 +88,7 @@ def test_arm_places_two_conditional_algo_stop_entries(monkeypatch):
         ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
         ("/fapi/v1/leverage", {"leverage": 3}),
         ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/ticker/price", {"price": "100.0"}),
         ("/fapi/v1/algoOrder", {"algoId": 111, "algoStatus": "NEW"}),
     ])
     asyncio.run(server.handle_signal(http, "BTCUSDT", "buy", 100.0, time.time(), volume=1e6))
@@ -454,6 +459,92 @@ def test_listen_key_helper_is_apikey_only(monkeypatch):
     assert seen["method"] == "POST" and seen["url"].endswith("/fapi/v1/listenKey")
     assert seen["headers"].get("X-MBX-APIKEY") == "MYKEY"
     assert "signature" not in seen["url"]  # listenKey endpoints are not HMAC-signed
+
+
+def test_guard_blocks_arm_when_price_already_outside_band(monkeypatch):
+    _reset()
+    _cfg()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+
+    async def fresh_price(http, sym):
+        return 100.20  # already above long entry (100.08) -> band breached
+
+    async def boom(*a, **k):
+        raise AssertionError("must NOT place any order when the guard blocks arming")
+
+    monkeypatch.setattr(server, "_fapi_last_price", fresh_price)
+    monkeypatch.setattr(server, "_fapi_place_stop_entry", boom)
+    server.STATE["latest"] = {"BTCUSDT": {"base": "BTC", "price": 100.0, "quoteVol": 1e6, "quote": "USDT"}}
+    asyncio.run(server.handle_signal(None, "BTCUSDT", "buy", 100.0, time.time(), volume=1e6))
+    assert "BTCUSDT" not in server.BOT["binStraddles"], "guard must prevent arming"
+    assert "BTCUSDT" not in server.BOT["positions"]
+    _reset()
+    _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
+
+
+def test_guard_market_closes_open_position_when_outside_band(monkeypatch):
+    _reset()
+    _cfg()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    server.BOT["wins"] = 0
+    server.BOT["losses"] = 0
+    server.BOT["dailyPnl"] = 0.0
+    closes = []
+    cancels = []
+
+    async def fresh_price(http, sym):
+        return 99.80  # below short entry (99.92) -> band breached
+
+    async def fake_close(http, sym, is_long, qty):
+        closes.append((sym, is_long, qty))
+        return {"fillPrice": 99.80}
+
+    async def fake_cancel(http, sym, oid):
+        cancels.append(oid)
+
+    monkeypatch.setattr(server, "_fapi_last_price", fresh_price)
+    monkeypatch.setattr(server, "_fapi_market_close", fake_close)
+    monkeypatch.setattr(server, "_fapi_algo_cancel", fake_cancel)
+    server.STATE["latest"] = {"BTCUSDT": {"base": "BTC", "price": 100.0, "quoteVol": 1e6, "quote": "USDT"}}
+    # an open LIVE bin-straddle long position already exists for the symbol
+    server.BOT["positions"]["BTCUSDT"] = {
+        "symbol": "BTCUSDT", "base": "BTC", "side": "long", "entryPrice": 100.0, "qty": 2.0,
+        "quoteSpent": 200.0, "tpPrice": 100.5, "slPrice": 99.7, "openedTs": time.time(),
+        "dryRun": False, "source": "bin_straddle", "binTpOid": "t", "binSlOid": "s"}
+    asyncio.run(server.handle_signal(None, "BTCUSDT", "buy", 100.0, time.time(), volume=1e6))
+    assert "BTCUSDT" not in server.BOT["positions"], "open position must be market-closed by the guard"
+    assert closes and closes[0][0] == "BTCUSDT" and closes[0][1] is True
+    assert set(cancels) == {"t", "s"}, "native TP/SL must be cancelled before the market close"
+    assert server.BOT["losses"] == 1  # (99.80 - 100) * 2 < 0
+    _reset()
+    _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
+
+
+def test_guard_allows_arm_when_price_inside_band(monkeypatch):
+    _reset()
+    _cfg()
+    monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
+    monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
+    placed = []
+
+    async def fresh_price(http, sym):
+        return 100.01  # inside band [99.92, 100.08]
+
+    async def fake_place(http, sym, is_long, qty, stop):
+        placed.append(is_long)
+        return {"algoId": 5 if is_long else 6, "qty": qty}
+
+    monkeypatch.setattr(server, "_fapi_last_price", fresh_price)
+    monkeypatch.setattr(server, "_fapi_set_leverage", lambda *a, **k: asyncio.sleep(0))
+    monkeypatch.setattr(server, "_fapi_place_stop_entry", fake_place)
+    server.STATE["latest"] = {"BTCUSDT": {"base": "BTC", "price": 100.0, "quoteVol": 1e6, "quote": "USDT"}}
+    asyncio.run(server.handle_signal(None, "BTCUSDT", "buy", 100.0, time.time(), volume=1e6))
+    assert server.BOT["binStraddles"].get("BTCUSDT"), "guard should allow arming when inside band"
+    assert set(placed) == {True, False}
+    _reset()
+    _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
 
 
 def test_config_clamps_bin_straddle(monkeypatch):

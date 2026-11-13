@@ -473,6 +473,17 @@ async def _fapi_market_close(http, symbol, is_long, qty):
     return {"fillPrice": ap, "orderId": _extract_order_id(res), "raw": res}
 
 
+async def _fapi_last_price(http, symbol):
+    """Fresh public last/mark price for one symbol (market-data endpoint, not geo-blocked and
+    not signed). Used by the signal-time straddle guard to compare against the entry band."""
+    url = f"{_fapi_base()}/fapi/v1/ticker/price"
+    r = await http.get(url, params={"symbol": symbol.upper()},
+                       headers={"User-Agent": BINANCE_FUTURES_UA}, timeout=10, follow_redirects=True)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ticker {r.status_code}")
+    return float((r.json() or {}).get("price") or 0)
+
+
 async def _fapi_positions(http, symbol=None):
     p = {"symbol": symbol.upper()} if symbol else {}
     rows = await fapi_signed(http, "GET", "/fapi/v2/positionRisk", p)
@@ -2006,6 +2017,71 @@ async def bin_fast_monitor():
             await asyncio.sleep(1.5)
 
 
+async def _bin_guard_price(http, sym, fallback):
+    """Freshest live Binance price for the signal-time guard (1s cache to avoid ticker spam)."""
+    now = time.time()
+    cache = BOT.setdefault("_binPxCache", {})
+    c = cache.get(sym)
+    if c and now - c[0] < 1.0:
+        return c[1]
+    try:
+        px = await _fapi_last_price(http, sym)
+    except Exception:  # noqa: BLE001
+        px = fallback
+    if not px or px <= 0:
+        px = fallback
+    cache[sym] = (now, px)
+    return px
+
+
+async def _bin_straddle_abort(http, sym, base, live, px, long_entry, short_entry):
+    """Signal-time guard tripped (live price already outside the entry band): do NOT arm, cancel any
+    resting legs, and market-close any OPEN bin-straddle position for this symbol. This is the one
+    user-approved case where the bot actively closes a position."""
+    acted = []
+    s = BOT["binStraddles"].pop(sym, None)
+    if s:
+        if s.get("live"):
+            for oid in (s.get("longOid"), s.get("shortOid")):
+                if oid:
+                    try:
+                        await _fapi_algo_cancel(http, sym, oid)
+                    except Exception:  # noqa: BLE001
+                        pass
+        acted.append("cancelled resting legs")
+    pos = BOT["positions"].get(sym)
+    if pos and pos.get("source") == "bin_straddle":
+        is_long = pos.get("side") == "long"
+        if not pos.get("dryRun") and live:
+            for oid in (pos.get("binTpOid"), pos.get("binSlOid")):
+                if oid:
+                    try:
+                        await _fapi_algo_cancel(http, sym, oid)
+                    except Exception:  # noqa: BLE001
+                        pass
+            try:
+                await _fapi_market_close(http, sym, is_long, pos.get("qty", 0))
+            except Exception as e:  # noqa: BLE001
+                logger.error("bin abort close %s: %s", sym, e)
+        entry = pos["entryPrice"]
+        sgn = 1 if is_long else -1
+        pnl = (px - entry) * pos.get("qty", 0) * sgn
+        BOT["positions"].pop(sym, None)
+        BOT["dailyPnl"] += pnl
+        if pnl >= 0:
+            BOT["wins"] += 1
+        else:
+            BOT["losses"] += 1
+        acted.append(f"market-closed {pos['side'].upper()} @ ~{px:.6g} (pnl {pnl:+.4f})")
+    BOT["lastTradeTs"][sym] = time.time()
+    msg = "Binance straddle NOT armed — market already outside the entry band"
+    if acted:
+        msg += " · " + "; ".join(acted)
+    jlog("straddle_cancel", symbol=sym, base=base, reason="price outside entry band",
+         longEntry=long_entry, shortEntry=short_entry, price=px, mode="LIVE" if live else "SIM",
+         message=msg)
+
+
 async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: float, now: float, volume: float = 0.0, trade_amt: float = 0.0):
     """Consume one alert-history event; fire a trade on `streak` consecutive
     same-direction alerts for the same symbol within ~1s. BUY only on buy signals,
@@ -2046,22 +2122,29 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
     # leg is closed by native Binance TP/SL trigger orders. Own measurement + TP/SL (independent).
     if cfg.get("binStradEnabled"):
         base = sym[: -len(QUOTE)]
+        live = (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures"
+        eo = cfg["binStradEntryPct"] / 100
+        long_stop = price * (1 + eo)
+        short_stop = price * (1 - eo)
+        # SIGNAL-TIME GUARD: if the freshest live Binance price has already broken outside the
+        # measured entry band, the straddle setup is stale -> do NOT arm, and flatten this symbol
+        # (cancel resting legs + market-close any open leg). Checked at signal time only.
+        guard_px = await _bin_guard_price(http, sym, price) if live else price
+        if guard_px >= long_stop or guard_px <= short_stop:
+            await _bin_straddle_abort(http, sym, base, live, guard_px, long_stop, short_stop)
+            return
         if sym in BOT["positions"] or sym in BOT["binStraddles"] or sym in BOT["straddles"]:
             return
         if (now - BOT["lastTradeTs"].get(sym, 0)) < cfg["cooldownSec"]:
             return
         if (len(BOT["positions"]) + len(BOT["binStraddles"])) >= cfg["maxOpenPositions"]:
             return
-        live = (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures"
         if (not cfg["dryRun"]) and cfg.get("exchange") != "binance_futures":
             if (now - BOT.get("_binStradSkipTs", 0)) > 15:
                 BOT["_binStradSkipTs"] = now
                 jlog("skip", symbol=sym, base=base,
                      message="Binance native straddle needs the Binance Futures venue — not armed")
             return
-        eo = cfg["binStradEntryPct"] / 100
-        long_stop = price * (1 + eo)
-        short_stop = price * (1 - eo)
         qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
         lev = cfg.get("futuresLeverage", 3)
         entry = {"symbol": sym, "base": base, "mark": price, "qty": qty, "lev": lev,
