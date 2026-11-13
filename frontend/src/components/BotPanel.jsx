@@ -574,6 +574,29 @@ export default function BotPanel({ open, onClose }) {
                     </p>
                   </div>
 
+                  {/* AUTO TP/SL — attaches TP/SL to every open Binance position */}
+                  <div className="space-y-2 border border-[#2563EB]/40 bg-[#2563EB]/[0.06] p-2.5" data-testid="bot-auto-tpsl-section">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] font-semibold uppercase tracking-wider text-[#1D4ED8]">Auto TP/SL · all positions</span>
+                      <button
+                        data-testid="bot-auto-tpsl-toggle"
+                        onClick={() => patch({ autoTpSlEnabled: !st.config.autoTpSlEnabled })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.autoTpSlEnabled ? "border-[#1D4ED8] bg-[#2563EB] text-white" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.autoTpSlEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <p className="mono text-[9px] leading-relaxed text-zinc-500">
+                      Watches your <b>whole Binance Futures account</b> and auto-attaches a reduce-only <b>TP {form.binStradTpPct}%</b> / <b>SL {form.binStradSlPct}%</b> (same levels as the straddle above) to <b>every open position</b> — including ones opened manually or elsewhere. If a position already has a TP/SL, it's <b>left untouched</b> (never duplicates or overrides). It only adds protection — it never closes a position.
+                    </p>
+                    {st.autoTpSl && st.config.autoTpSlEnabled && (
+                      <p className="mono text-[8px] text-[#1D4ED8]" data-testid="bot-auto-tpsl-count">Protecting {st.autoTpSl.protected} open position(s).</p>
+                    )}
+                    <p className="mono text-[8px] leading-relaxed text-amber-600">
+                      ⚠ Requires the <b>Binance Futures</b> venue + <b>LIVE</b> (inactive in SIM). Uses the straddle card's TP/SL values — change them there.
+                    </p>
+                  </div>
+
                   {/* FIXED TP/SL — used when Smart Trailing TP is OFF */}
                   <div className="space-y-2 border border-[#FF3B30]/25 bg-[#FF3B30]/[0.03] p-2.5" data-testid="bot-fixed-tpsl-section">
                     <div className="flex items-center justify-between">
@@ -790,6 +813,7 @@ const JournalLine = ({ j }) => {
   if (j.kind === "exit") return <span className={j.pnl >= 0 ? "text-[#00A004]" : "text-[#FF3B30]"}>{j.side === "cover" ? "COVER" : "SELL"} {j.base} @ {Number(j.price).toPrecision(5)} · {j.reason} · pnl {j.pnl >= 0 ? "+" : ""}{Number(j.pnl).toFixed(4)}</span>;
   if (j.kind === "straddle") return <span className="text-[#7C3AED]">STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
   if (j.kind === "bin_straddle") return <span className="text-[#A17A00] font-semibold">BINANCE STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
+  if (j.kind === "auto_tpsl") return <span className="text-[#1D4ED8] font-semibold">AUTO TP/SL {j.base} {String(j.side || "").toUpperCase()} · TP {Number(j.tp).toPrecision(5)} / SL {Number(j.sl).toPrecision(5)}</span>;
   if (j.kind === "straddle_fill") return <span className="text-[#7C3AED] font-semibold">{j.message || `${j.side === "short" ? "SHORT" : "LONG"} leg filled ${j.base} — opposite cancelled`}</span>;
   if (j.kind === "straddle_cancel") return <span className="text-zinc-400">straddle {j.base} cancelled ({j.reason})</span>;
   if (j.kind === "halt") return <span className="text-[#FF3B30] font-semibold">⛔ {j.message}</span>;

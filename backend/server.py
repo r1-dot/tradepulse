@@ -166,6 +166,10 @@ BOT_DEFAULTS = {
     "binStradSlPct": 0.3,      # native stop-loss for the filled leg (0.0001 - 5 %)
     "binStradReconcile": True, # poll Binance for live order/position state (fast monitor)
     "binStradMonitorMs": 500,  # Binance live state-check cadence in ms (200 - 5000)
+    # --- AUTO TP/SL: attach a reduce-only TP/SL to EVERY open Binance position (known or unknown,
+    # incl. manually opened). Reuses the straddle TP/SL levels. Leaves positions that already have
+    # a protective TP/SL untouched. Live Binance Futures only.
+    "autoTpSlEnabled": False,
     # --- HYPERLIQUID PERPS: leverage + margin mode (applied per coin before each order)
     "hlLeverage": 1,           # target leverage (clamped to each coin's max)
     "hlCrossMargin": True,     # True = cross margin, False = isolated
@@ -206,6 +210,7 @@ BOT = {
     "straddles": {},        # symbol -> pending straddle (armed long/short stop levels)
     "binStraddles": {},     # symbol -> pending Binance native straddle (real stop-entry orders)
     "binWs": {"connected": False, "lastEventTs": 0.0, "reconnects": 0, "listenKey": None},
+    "autoTpSl": {},         # position key -> auto TP/SL record (attached / external)
     "pendingFutures": {},   # posKey -> pending slippage-limit futures entry (5-min timeout)
     "journal": deque(maxlen=300),
     "dailyPnl": 0.0,
@@ -543,6 +548,56 @@ async def _fapi_algo_status(http, symbol, algo_id):
 async def _fapi_algo_cancel(http, symbol, algo_id):
     """Cancel one CONDITIONAL algo order by algoId (/fapi/v1/algoOrder)."""
     return await fapi_signed(http, "DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id})
+
+
+async def _fapi_open_algo_orders(http, symbol):
+    """Currently-open conditional algo orders for a symbol (post Dec-2025 migration)."""
+    rows = await fapi_signed(http, "GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol.upper(), "algoType": "CONDITIONAL"})
+    return rows if isinstance(rows, list) else (rows or {}).get("orders", []) if isinstance(rows, dict) else []
+
+
+async def _fapi_open_orders(http, symbol):
+    """Classic open orders for a symbol (legacy reduce-only TP/SL still surface here)."""
+    rows = await fapi_signed(http, "GET", "/fapi/v1/openOrders", {"symbol": symbol.upper()})
+    return rows if isinstance(rows, list) else []
+
+
+async def _bin_position_protected(http, sym, closing_side, position_side):
+    """True if the open position already has a NEW reduce-only / close-all protective TP or SL
+    (STOP_MARKET / TAKE_PROFIT_MARKET) on Binance — checks both the algo and classic collections."""
+    def _is_prot(o):
+        t = str(o.get("orderType") or o.get("origType") or o.get("type") or "").upper()
+        if t not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            return False
+        ro = o.get("reduceOnly") is True or str(o.get("reduceOnly")).lower() == "true"
+        cp = o.get("closePosition") is True or str(o.get("closePosition")).lower() == "true"
+        if not (ro or cp):
+            return False
+        st = str(o.get("algoStatus") or o.get("status") or "NEW").upper()
+        if st not in ("NEW", "WORKING"):
+            return False
+        if o.get("symbol") and o.get("symbol") != sym:
+            return False
+        if closing_side and o.get("side") and o.get("side") != closing_side:
+            return False
+        ps = o.get("positionSide", "BOTH")
+        if ps != "BOTH" and position_side != "BOTH" and ps != position_side:
+            return False
+        return True
+    try:
+        for o in (await _fapi_open_algo_orders(http, sym)) or []:
+            if _is_prot(o):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for o in (await _fapi_open_orders(http, sym)) or []:
+            if _is_prot(o):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
 
 
 
@@ -1989,6 +2044,75 @@ async def bin_ws_monitor():
         await asyncio.sleep(wait + random.random() * 0.3)
 
 
+async def auto_tpsl_scan(http):
+    """Attach a reduce-only TP/SL (reusing the straddle levels) to EVERY open Binance position that
+    doesn't already have one. Leaves protected positions alone; never cancels/overrides. Skips the
+    bot's own straddle positions (the straddle engine owns their TP/SL)."""
+    cfg = BOT["config"]
+    try:
+        positions = await _fapi_positions(http)
+    except Exception as e:  # noqa: BLE001
+        logger.error("auto-tpsl positions: %s", e)
+        return
+    tp = cfg["binStradTpPct"] / 100
+    sl = cfg["binStradSlPct"] / 100
+    seen = set()
+    for p in positions or []:
+        try:
+            amt = float(p.get("positionAmt") or 0)
+            if amt == 0:
+                continue
+            sym = p.get("symbol")
+            ps = p.get("positionSide", "BOTH")
+            is_long = (ps == "LONG") or (ps == "BOTH" and amt > 0)
+            side = "long" if is_long else "short"
+            key = f"{sym}:{ps}:{side}"
+            seen.add(key)
+            bp = BOT["positions"].get(sym)
+            if bp and bp.get("source") == "bin_straddle":
+                continue  # straddle engine manages these
+            if key in BOT["autoTpSl"]:
+                continue
+            entry = float(p.get("entryPrice") or 0)
+            qty = abs(amt)
+            if entry <= 0 or qty <= 0:
+                continue
+            closing = "SELL" if is_long else "BUY"
+            if await _bin_position_protected(http, sym, closing, ps):
+                BOT["autoTpSl"][key] = {"external": True, "ts": time.time()}
+                continue
+            tp_price = entry * (1 + tp) if is_long else entry * (1 - tp)
+            sl_price = entry * (1 - sl) if is_long else entry * (1 + sl)
+            out = await _fapi_place_native_tpsl(http, sym, is_long, qty, tp_price, sl_price)
+            BOT["autoTpSl"][key] = {"placed": True, "ts": time.time(), "entry": entry, "qty": qty,
+                                    "tpOid": (out.get("tp") or {}).get("algoId"),
+                                    "slOid": (out.get("sl") or {}).get("algoId")}
+            base = sym[: -len(QUOTE)] if sym.endswith(QUOTE) else sym
+            jlog("auto_tpsl", symbol=sym, base=base, side=side, tp=tp_price, sl=sl_price,
+                 message=f"Auto TP/SL attached to {base} {side.upper()} @ entry {entry:.6g} — TP {tp_price:.6g} / SL {sl_price:.6g}")
+        except Exception as e:  # noqa: BLE001
+            logger.error("auto-tpsl %s: %s", p.get("symbol"), e)
+    for key in list(BOT["autoTpSl"].keys()):
+        if key not in seen:
+            BOT["autoTpSl"].pop(key, None)
+
+
+async def auto_tpsl_monitor():
+    """Scan every open Binance position ~2s and auto-attach TP/SL. Live Binance Futures only."""
+    while True:
+        cfg = BOT["config"]
+        try:
+            run = cfg.get("autoTpSlEnabled") and (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures" and bool(BINANCE_API_KEY)
+            if run:
+                await auto_tpsl_scan(app.state.http)
+            elif BOT["autoTpSl"]:
+                BOT["autoTpSl"].clear()
+            await asyncio.sleep(2.0)
+        except Exception as e:  # noqa: BLE001
+            logger.error("auto-tpsl monitor: %s", e)
+            await asyncio.sleep(3.0)
+
+
 async def bin_fast_monitor():
     """REST monitoring + the single allowed action path (OCO opposite-leg cancel + native TP/SL
     placement on fill). Runs at 500ms while the read-only WebSocket is DOWN (so no update is
@@ -2545,6 +2669,7 @@ class BotConfigUpdate(BaseModel):
     binStradSlPct: Optional[float] = None
     binStradReconcile: Optional[bool] = None
     binStradMonitorMs: Optional[int] = None
+    autoTpSlEnabled: Optional[bool] = None
     hlLeverage: Optional[int] = None
     hlCrossMargin: Optional[bool] = None
     hlNativeTpsl: Optional[bool] = None
@@ -2632,6 +2757,10 @@ def _bot_status():
             "lastEventTs": BOT["binWs"].get("lastEventTs", 0.0),
             "reconnects": BOT["binWs"].get("reconnects", 0),
             "source": "ws" if BOT["binWs"].get("connected") else "rest",
+        },
+        "autoTpSl": {
+            "enabled": BOT["config"].get("autoTpSlEnabled", False),
+            "protected": len(BOT["autoTpSl"]),
         },
         "pendingFutures": [
             {"symbol": p["symbol"], "base": p["base"], "side": p["side"], "limitPrice": p["limitPrice"],
@@ -3088,6 +3217,7 @@ async def startup():
     app.state.monitor = asyncio.create_task(fast_position_monitor())
     app.state.bin_monitor = asyncio.create_task(bin_fast_monitor())
     app.state.bin_ws = asyncio.create_task(bin_ws_monitor())
+    app.state.auto_tpsl = asyncio.create_task(auto_tpsl_monitor())
     logger.info("scanner started, source=%s quote=%s", BINANCE_BASE, QUOTE)
 
 
