@@ -517,24 +517,30 @@ async def _fapi_place_stop_entry(http, symbol, is_long, qty, stop_price):
     return {"algoId": algo_id, "triggerPrice": tp, "qty": qty, "raw": res}
 
 
-async def _fapi_place_native_tpsl(http, symbol, is_long, qty, tp_price, sl_price):
-    """After a leg fills, place native reduce-only TP (TAKE_PROFIT_MARKET) + SL (STOP_MARKET)
-    CONDITIONAL algo orders so the exchange closes the position. The Dec-2025 algo migration
-    dropped closePosition for these types → carry quantity + reduceOnly (one-way) instead."""
+async def _fapi_place_native_tpsl(http, symbol, is_long, qty, tp_price, sl_price, close_position=False):
+    """Place native TP (TAKE_PROFIT_MARKET) + SL (STOP_MARKET) CONDITIONAL algo orders so the
+    exchange closes the position. With close_position=True the orders carry closePosition=true
+    (no qty/reduceOnly) — used to PRE-PLACE TP/SL before/with the entry so there is zero bot delay
+    and leftover opposite orders can never open a reverse position. Otherwise quantity + reduceOnly
+    (one-way) to attach to an existing position."""
     hedge = await fapi_position_mode(http)
     exit_side = "SELL" if is_long else "BUY"
     pos_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
-    qty = await _fapi_round_qty(http, symbol, qty)
+    qty = await _fapi_round_qty(http, symbol, qty) if (qty and not close_position) else qty
     out = {}
     for tag, otype, px in (("tp", "TAKE_PROFIT_MARKET", tp_price), ("sl", "STOP_MARKET", sl_price)):
         if px is None or px <= 0:
             continue
         tp = await _fapi_round_price(http, symbol, px)
         params = {"symbol": symbol.upper(), "side": exit_side, "type": otype,
-                  "algoType": "CONDITIONAL", "triggerPrice": tp, "quantity": qty,
+                  "algoType": "CONDITIONAL", "triggerPrice": tp,
                   "workingType": "MARK_PRICE", "positionSide": pos_side}
-        if not hedge:
-            params["reduceOnly"] = "true"
+        if close_position:
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = qty
+            if not hedge:
+                params["reduceOnly"] = "true"
         try:
             res = await fapi_signed(http, "POST", "/fapi/v1/algoOrder", params)
             out[tag] = {"algoId": res.get("algoId") or _extract_order_id(res), "triggerPrice": tp}
@@ -1701,9 +1707,9 @@ async def process_bot(http: httpx.AsyncClient, now: float):
 
 
 async def _register_bin_straddle_fill(http, s, side, fill, qty, now, live):
-    """A Binance native straddle leg filled — register the position with native algo TP/SL (live)
-    or simulated TP/SL (dry-run). Uses the dedicated binStrad TP/SL measurement, independent of the
-    global trailing / fixed TP-SL settings. `qty` is the real position size (live) / sim size."""
+    """A Binance native straddle leg filled — register the position. TP/SL are ALREADY live on
+    Binance (pre-placed with the entry), so we place nothing here; we just attach the pre-placed
+    oids + levels to the position. SIM derives the levels from the fill (same value as the entry)."""
     cfg = BOT["config"]
     sym = s["symbol"]
     base = s["base"]
@@ -1711,31 +1717,26 @@ async def _register_bin_straddle_fill(http, s, side, fill, qty, now, live):
     tp = cfg["binStradTpPct"] / 100
     sl = cfg["binStradSlPct"] / 100
     if is_long:
-        tp_price = fill * (1 + tp)
-        sl_price = fill * (1 - sl)
+        tp_price = s.get("longTp") or (fill * (1 + tp))
+        sl_price = s.get("longSl") or (fill * (1 - sl))
+        tp_oid = s.get("longTpOid")
+        sl_oid = s.get("longSlOid")
     else:
-        tp_price = fill * (1 - tp)
-        sl_price = fill * (1 + sl)
-    native = None
-    if live:
-        try:
-            native = await _fapi_place_native_tpsl(http, sym, is_long, qty, tp_price, sl_price)
-        except Exception as e:  # noqa: BLE001
-            jlog("warn", symbol=sym, base=base, live=True, venue="binance_futures",
-                 message=f"Binance native TP/SL failed ({str(e)[:120]}) — software monitor will close on target/stop")
+        tp_price = s.get("shortTp") or (fill * (1 - tp))
+        sl_price = s.get("shortSl") or (fill * (1 + sl))
+        tp_oid = s.get("shortTpOid")
+        sl_oid = s.get("shortSlOid")
     pos = {
         "symbol": sym, "base": base, "side": side, "entryPrice": fill,
         "qty": qty, "quoteSpent": fill * qty, "tpPrice": tp_price, "slPrice": sl_price,
         "openedTs": now, "orderId": None, "dryRun": not live, "source": "bin_straddle",
+        "binTpOid": tp_oid, "binSlOid": sl_oid,
     }
     pos["posKey"] = sym
-    if native:
-        pos["binTpOid"] = (native.get("tp") or {}).get("algoId")
-        pos["binSlOid"] = (native.get("sl") or {}).get("algoId")
     BOT["positions"][sym] = pos
     BOT["lastTradeTs"][sym] = now
     jlog("straddle_fill", symbol=sym, base=base, side=side, entry=fill,
-         message=f"Binance {('LONG' if is_long else 'SHORT')} leg filled @ {fill:.6g} — opposite cancelled (OCO) · native TP {tp_price:.6g} / SL {sl_price:.6g} ({'LIVE' if live else 'SIM'})")
+         message=f"Binance {('LONG' if is_long else 'SHORT')} leg filled @ {fill:.6g} — opposite entry + TP/SL cancelled (OCO) · pre-placed TP {tp_price:.6g} / SL {sl_price:.6g} ({'LIVE' if live else 'SIM'})")
     jlog("entry", symbol=sym, base=base, side="buy" if is_long else "short", price=fill,
          qty=qty, spent=pos["quoteSpent"], tp=tp_price, sl=sl_price, source="bin_straddle",
          mode="LIVE" if live else "SIM")
@@ -1786,7 +1787,8 @@ async def _reconcile_bin_arms(http, now):
         if not s or not s.get("live"):
             continue
         if now - s["createdTs"] > STRADDLE_EXPIRY:
-            for oid in (s.get("longOid"), s.get("shortOid")):
+            for oid in (s.get("longOid"), s.get("shortOid"), s.get("longTpOid"),
+                        s.get("longSlOid"), s.get("shortTpOid"), s.get("shortSlOid")):
                 if oid:
                     try:
                         await _fapi_algo_cancel(http, sym, oid)
@@ -1798,12 +1800,14 @@ async def _reconcile_bin_arms(http, now):
         won = None
         fill_px = None
         fill_qty = s.get("qty", 0)
-        loser_oid = None
+        loser_oids = []
         cancelled = 0
         try:
-            for leg, oid, lose, lvl in (
-                ("long", s.get("longOid"), s.get("shortOid"), s["longStop"]),
-                ("short", s.get("shortOid"), s.get("longOid"), s["shortStop"]),
+            for leg, oid, losers, lvl in (
+                ("long", s.get("longOid"),
+                 (s.get("shortOid"), s.get("shortTpOid"), s.get("shortSlOid")), s["longStop"]),
+                ("short", s.get("shortOid"),
+                 (s.get("longOid"), s.get("longTpOid"), s.get("longSlOid")), s["shortStop"]),
             ):
                 if won or not oid:
                     continue
@@ -1813,7 +1817,7 @@ async def _reconcile_bin_arms(http, now):
                     won = leg
                     fill_px = float(st.get("actualPrice") or st.get("avgPrice") or 0) or lvl
                     fill_qty = float(st.get("actualQty") or st.get("executedQty") or 0) or s.get("qty", 0)
-                    loser_oid = lose
+                    loser_oids = [o for o in losers if o]
                 elif status in _ALGO_CANCELLED:
                     cancelled += 1
         except Exception as e:  # noqa: BLE001
@@ -1821,6 +1825,12 @@ async def _reconcile_bin_arms(http, now):
             continue
         if won is None:
             if cancelled >= 2:
+                for oid in (s.get("longTpOid"), s.get("longSlOid"), s.get("shortTpOid"), s.get("shortSlOid")):
+                    if oid:
+                        try:
+                            await _fapi_algo_cancel(http, sym, oid)
+                        except Exception:  # noqa: BLE001
+                            pass
                 BOT["binStraddles"].pop(sym, None)
                 jlog("straddle_cancel", symbol=sym, base=s["base"], reason="cancelled on Binance")
             else:
@@ -1835,9 +1845,11 @@ async def _reconcile_bin_arms(http, now):
                     fill_qty = abs(amt) or fill_qty
         except Exception:  # noqa: BLE001
             pass
-        if loser_oid:
+        # OCO: cancel the OPPOSITE entry AND its pre-placed TP/SL (never leave the losing side's
+        # TP/SL on Binance — a stray close-opposite order could otherwise mis-trigger).
+        for oid in loser_oids:
             try:
-                await _fapi_algo_cancel(http, sym, loser_oid)
+                await _fapi_algo_cancel(http, sym, oid)
             except Exception:  # noqa: BLE001
                 pass
         BOT["binStraddles"].pop(sym, None)
@@ -2169,13 +2181,14 @@ async def _bin_straddle_abort(http, sym, base, live, px, long_entry, short_entry
     s = BOT["binStraddles"].pop(sym, None)
     if s:
         if s.get("live"):
-            for oid in (s.get("longOid"), s.get("shortOid")):
+            for oid in (s.get("longOid"), s.get("shortOid"), s.get("longTpOid"),
+                        s.get("longSlOid"), s.get("shortTpOid"), s.get("shortSlOid")):
                 if oid:
                     try:
                         await _fapi_algo_cancel(http, sym, oid)
                     except Exception:  # noqa: BLE001
                         pass
-        acted.append("cancelled resting legs")
+        acted.append("cancelled resting legs + pre-placed TP/SL")
     pos = BOT["positions"].get(sym)
     if pos and pos.get("source") == "bin_straddle":
         is_long = pos.get("side") == "long"
@@ -2275,24 +2288,51 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
             return
         qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
         lev = cfg.get("futuresLeverage", 3)
+        tpf = cfg["binStradTpPct"] / 100
+        slf = cfg["binStradSlPct"] / 100
+        # TP/SL levels per side, measured from each entry (committed before fill — no race).
+        long_tp = long_stop * (1 + tpf)
+        long_sl = long_stop * (1 - slf)
+        short_tp = short_stop * (1 - tpf)
+        short_sl = short_stop * (1 + slf)
         entry = {"symbol": sym, "base": base, "mark": price, "qty": qty, "lev": lev,
                  "longStop": long_stop, "shortStop": short_stop,
-                 "longOid": None, "shortOid": None, "createdTs": now, "live": live, "lastPollTs": 0.0}
+                 "longTp": long_tp, "longSl": long_sl, "shortTp": short_tp, "shortSl": short_sl,
+                 "longOid": None, "shortOid": None,
+                 "longTpOid": None, "longSlOid": None, "shortTpOid": None, "shortSlOid": None,
+                 "createdTs": now, "live": live, "lastPollTs": 0.0}
         if live:
+            placed = []
             try:
                 await _fapi_set_leverage(http, sym, lev)
                 lo = await _fapi_place_stop_entry(http, sym, True, qty, long_stop)
-                so = await _fapi_place_stop_entry(http, sym, False, qty, short_stop)
                 entry["longOid"] = lo["algoId"]
+                placed.append(lo["algoId"])
+                so = await _fapi_place_stop_entry(http, sym, False, qty, short_stop)
                 entry["shortOid"] = so["algoId"]
+                placed.append(so["algoId"])
                 entry["qty"] = lo.get("qty", qty)
+                # PRE-PLACE both sides' TP/SL (closePosition) so Binance triggers them in 0ms.
+                ltp = await _fapi_place_native_tpsl(http, sym, True, 0, long_tp, long_sl, close_position=True)
+                entry["longTpOid"] = (ltp.get("tp") or {}).get("algoId")
+                entry["longSlOid"] = (ltp.get("sl") or {}).get("algoId")
+                stp = await _fapi_place_native_tpsl(http, sym, False, 0, short_tp, short_sl, close_position=True)
+                entry["shortTpOid"] = (stp.get("tp") or {}).get("algoId")
+                entry["shortSlOid"] = (stp.get("sl") or {}).get("algoId")
+                placed += [entry["longTpOid"], entry["longSlOid"], entry["shortTpOid"], entry["shortSlOid"]]
             except Exception as e:  # noqa: BLE001
+                for oid in placed:
+                    if oid:
+                        try:
+                            await _fapi_algo_cancel(http, sym, oid)
+                        except Exception:  # noqa: BLE001
+                            pass
                 jlog("error", symbol=sym, base=base, live=True, venue="binance_futures",
                      message=f"Binance native straddle arm failed: {str(e)[:160]}")
                 return
         BOT["binStraddles"][sym] = entry
         jlog("bin_straddle", symbol=sym, base=base, mark=price, longEntry=long_stop, shortEntry=short_stop,
-             message=f"Binance native straddle armed ±{cfg['binStradEntryPct']}% · native TP {cfg['binStradTpPct']}% / SL {cfg['binStradSlPct']}% ({'LIVE' if live else 'SIM'})")
+             message=f"Binance native straddle armed ±{cfg['binStradEntryPct']}% · pre-placed TP {cfg['binStradTpPct']}% / SL {cfg['binStradSlPct']}% both sides ({'LIVE' if live else 'SIM'})")
         return
 
     # STRADDLE MODE: a qualifying volume-spike alert arms a long/short breakout straddle
@@ -2913,7 +2953,8 @@ async def bot_close_all():
     bin_n = len(BOT["binStraddles"])
     for sym, s in list(BOT["binStraddles"].items()):
         if s.get("live"):
-            for oid in (s.get("longOid"), s.get("shortOid")):
+            for oid in (s.get("longOid"), s.get("shortOid"), s.get("longTpOid"),
+                        s.get("longSlOid"), s.get("shortTpOid"), s.get("shortSlOid")):
                 if oid:
                     try:
                         await _fapi_algo_cancel(app.state.http, sym, oid)
