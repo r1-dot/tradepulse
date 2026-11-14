@@ -569,6 +569,19 @@ export default function BotPanel({ open, onClose }) {
                         <NumField testid="bot-bin-straddle-monitor-ms" label="Backup (ms)" step="100" value={form.binStradMonitorMs} onChange={(v) => setForm({ ...form, binStradMonitorMs: v })} suffix="ms" />
                       </div>
                     </div>
+                    <div className="flex items-center justify-between border-t border-[#F0B90B]/25 pt-2">
+                      <div className="flex-1 pr-2">
+                        <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#A17A00]">Entry-band guard</span>
+                        <p className="mono text-[8px] leading-relaxed text-zinc-500">When ON, if the live price is already outside the entry band at signal time, the bot skips arming and flattens that symbol. Off by default — can trigger often on a tight band in fast markets.</p>
+                      </div>
+                      <button
+                        data-testid="bot-bin-band-guard-toggle"
+                        onClick={() => patch({ binStradBandGuard: !st.config.binStradBandGuard })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.binStradBandGuard ? "border-[#A17A00] bg-[#F0B90B] text-zinc-900" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.binStradBandGuard ? "ON" : "OFF"}
+                      </button>
+                    </div>
                     <p className="mono text-[8px] leading-relaxed text-amber-600">
                       ⚠ Requires the <b>Binance Futures</b> venue + <b>LIVE</b> for real orders (simulates in SIM). Independent of Smart Trailing / Fixed TP-SL — uses the dedicated levels above. Hit “Save settings” to apply.
                     </p>

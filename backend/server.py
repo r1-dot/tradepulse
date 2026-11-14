@@ -170,6 +170,9 @@ BOT_DEFAULTS = {
     # incl. manually opened). Reuses the straddle TP/SL levels. Leaves positions that already have
     # a protective TP/SL untouched. Live Binance Futures only.
     "autoTpSlEnabled": False,
+    # Optional signal-time guard: skip arming (and flatten) when live price is already outside the
+    # entry band. Off by default — can fire a lot on a tight band in fast markets.
+    "binStradBandGuard": False,
     # --- HYPERLIQUID PERPS: leverage + margin mode (applied per coin before each order)
     "hlLeverage": 1,           # target leverage (clamped to each coin's max)
     "hlCrossMargin": True,     # True = cross margin, False = isolated
@@ -2250,13 +2253,14 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
         eo = cfg["binStradEntryPct"] / 100
         long_stop = price * (1 + eo)
         short_stop = price * (1 - eo)
-        # SIGNAL-TIME GUARD: if the freshest live Binance price has already broken outside the
-        # measured entry band, the straddle setup is stale -> do NOT arm, and flatten this symbol
-        # (cancel resting legs + market-close any open leg). Checked at signal time only.
-        guard_px = await _bin_guard_price(http, sym, price) if live else price
-        if guard_px >= long_stop or guard_px <= short_stop:
-            await _bin_straddle_abort(http, sym, base, live, guard_px, long_stop, short_stop)
-            return
+        # SIGNAL-TIME GUARD (optional, off by default via binStradBandGuard): if the freshest live
+        # Binance price has already broken outside the measured entry band, the straddle setup is
+        # stale -> do NOT arm, and flatten this symbol. Checked at signal time only, LIVE only.
+        if cfg.get("binStradBandGuard") and live:
+            guard_px = await _bin_guard_price(http, sym, price)
+            if guard_px >= long_stop or guard_px <= short_stop:
+                await _bin_straddle_abort(http, sym, base, live, guard_px, long_stop, short_stop)
+                return
         if sym in BOT["positions"] or sym in BOT["binStraddles"] or sym in BOT["straddles"]:
             return
         if (now - BOT["lastTradeTs"].get(sym, 0)) < cfg["cooldownSec"]:
@@ -2670,6 +2674,7 @@ class BotConfigUpdate(BaseModel):
     binStradReconcile: Optional[bool] = None
     binStradMonitorMs: Optional[int] = None
     autoTpSlEnabled: Optional[bool] = None
+    binStradBandGuard: Optional[bool] = None
     hlLeverage: Optional[int] = None
     hlCrossMargin: Optional[bool] = None
     hlNativeTpsl: Optional[bool] = None

@@ -464,6 +464,7 @@ def test_listen_key_helper_is_apikey_only(monkeypatch):
 def test_guard_blocks_arm_when_price_already_outside_band(monkeypatch):
     _reset()
     _cfg()
+    server.BOT["config"]["binStradBandGuard"] = True
     monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
     monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
 
@@ -486,6 +487,7 @@ def test_guard_blocks_arm_when_price_already_outside_band(monkeypatch):
 def test_guard_market_closes_open_position_when_outside_band(monkeypatch):
     _reset()
     _cfg()
+    server.BOT["config"]["binStradBandGuard"] = True
     monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
     monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
     server.BOT["wins"] = 0
@@ -525,6 +527,7 @@ def test_guard_market_closes_open_position_when_outside_band(monkeypatch):
 def test_guard_allows_arm_when_price_inside_band(monkeypatch):
     _reset()
     _cfg()
+    server.BOT["config"]["binStradBandGuard"] = True
     monkeypatch.setattr(server, "BINANCE_API_KEY", "K")
     monkeypatch.setattr(server, "BINANCE_API_SECRET", "S")
     placed = []
