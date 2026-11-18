@@ -104,22 +104,19 @@ def test_arm_places_two_conditional_algo_stop_entries(monkeypatch):
     assert "algoType=CONDITIONAL" in joined
     assert "triggerPrice=" in joined and "stopPrice=" not in joined
     assert "workingType=MARK_PRICE" in joined and "triggerType=" not in joined
-    assert "timeInForce" not in joined
+    assert "timeInForce=GTC" in joined          # stop-LIMIT / limit-close now carry a TIF
+    assert "price=" in joined                    # every leg carries a limit price
     assert not any(u.endswith("/fapi/v1/order") or "/fapi/v1/order?" in u for _, u in http.calls)
-    # entries: STOP_MARKET with quantity, no closePosition
-    entries = [u for u in order_urls if "type=STOP_MARKET" in u and "quantity=" in u]
-    assert len(entries) == 2
-    buy = [u for u in entries if "side=BUY" in u]
-    sell = [u for u in entries if "side=SELL" in u]
-    assert buy and sell
-    assert abs(_sp(buy[0]) - 100.08) < 1e-3 and _sp(buy[0]) > 100.0   # LONG entry above
-    assert abs(_sp(sell[0]) - 99.92) < 1e-3 and _sp(sell[0]) < 100.0  # SHORT entry below
-    # pre-placed TP/SL: closePosition=true, both TP and SL types present
-    closers = [u for u in order_urls if "closePosition=true" in u]
-    assert len(closers) == 4
-    assert any("type=TAKE_PROFIT_MARKET" in u for u in closers)
-    assert any("type=STOP_MARKET" in u for u in closers)
-    assert all("quantity=" not in u and "reduceOnly" not in u for u in closers)
+    # all 6 legs are quantity-bearing limit conditionals; none use closePosition
+    assert "closePosition" not in joined
+    assert all("quantity=" in u for u in order_urls)
+    # 2 TAKE_PROFIT + 4 STOP (2 breakout entries + 2 stop-losses)
+    assert sum("type=TAKE_PROFIT&" in u for u in order_urls) == 2
+    assert sum("type=STOP&" in u for u in order_urls) == 4
+    # the two breakout ENTRIES: BUY stop just above mark, SELL stop just below
+    buy_entry = [u for u in order_urls if "side=BUY" in u and _sp(u) and abs(_sp(u) - 100.08) < 1e-2]
+    sell_entry = [u for u in order_urls if "side=SELL" in u and _sp(u) and abs(_sp(u) - 99.92) < 1e-2]
+    assert buy_entry and sell_entry
     _cfg(dryRun=True, exchange="binance", binStradEnabled=False)
 
 
@@ -136,12 +133,13 @@ def test_native_tpsl_uses_reduceonly_quantity_not_closeposition(monkeypatch):
     order_urls = [u for _, u in http.calls if "/fapi/v1/algoOrder" in u]
     assert len(order_urls) == 2
     joined = " ".join(order_urls)
-    assert "type=TAKE_PROFIT_MARKET" in joined and "type=STOP_MARKET" in joined
+    assert "type=TAKE_PROFIT&" in joined and "type=STOP&" in joined
     assert "algoType=CONDITIONAL" in joined and "triggerPrice=" in joined
-    # closing a LONG -> SELL triggers, reduce-only + quantity (Dec-2025: closePosition dropped)
+    # closing a LONG -> SELL triggers, reduce-only + quantity, limit price + GTC (no closePosition)
     assert all("side=SELL" in u for u in order_urls)
     assert "closePosition" not in joined
     assert "reduceOnly=true" in joined and "quantity=0.5" in joined
+    assert "timeInForce=GTC" in joined and "price=" in joined
     assert out["tp"]["algoId"] == 7 and out["sl"]["algoId"] == 7
 
 
@@ -547,7 +545,7 @@ def test_guard_allows_arm_when_price_inside_band(monkeypatch):
         placed.append(is_long)
         return {"algoId": 5 if is_long else 6, "qty": qty}
 
-    async def fake_tpsl(http, sym, is_long, qty, tp, sl, close_position=False):
+    async def fake_tpsl(http, sym, is_long, qty, tp, sl, reduce_only=True):
         return {"tp": {"algoId": 9}, "sl": {"algoId": 10}}
 
     monkeypatch.setattr(server, "_fapi_last_price", fresh_price)

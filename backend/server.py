@@ -31,6 +31,7 @@ from collections import deque
 from typing import Optional
 import hyperliquid_converter as hlconv
 import hybrid_power as hybrid
+from binance_fmt import floor_to_step as _floor_step, round_price as _round_tick
 import httpx
 
 ROOT_DIR = Path(__file__).parent
@@ -143,6 +144,7 @@ BOT_DEFAULTS = {
     "futShortBufferPct": 0.0,      # max slippage for SHORT entries
     "futPendingTimeoutSec": 300,   # how long a pending slippage-trigger entry waits (1-300s)
     "futuresTestnet": False,       # use testnet.binancefuture.com instead of fapi.binance.com
+    "limitSlippagePct": 0.05,      # aggressive crossing-LIMIT slippage cap % for all futures orders
     "maxLossPerTradeUsdt": 0.0002,  # hard cap: auto-close any position at this $ loss
     # --- STRADDLE SYSTEM: on a volume spike, arm a LONG stop above + SHORT stop below.
     # Whichever side price hits first fills; the other is cancelled (OCO breakout).
@@ -284,7 +286,8 @@ async def _live_market(http, symbol, side, quote_qty=None, base_qty=None):
 
 
 # ----------------------------- Binance USD-M Futures -----------------------------
-_FAPI = {"mode": None, "modeTs": 0.0, "lots": {}, "ticks": {}, "lotsTs": 0.0, "activeHost": None}
+_FAPI = {"mode": None, "modeTs": 0.0, "lots": {}, "ticks": {}, "lotsStr": {}, "ticksStr": {},
+         "lotsTs": 0.0, "activeHost": None, "timeOffsetMs": 0, "timeSyncTs": 0.0}
 
 
 def _fapi_hosts():
@@ -309,12 +312,36 @@ def _fapi_base():
     return _FAPI["activeHost"] or BINANCE_FUTURES_BASE_URL
 
 
-async def fapi_signed(http, method, path, params):
+async def _fapi_sync_time(http):
+    """Sync the local clock to Binance server time (fixes -1021 'Timestamp outside recvWindow').
+    Stores a signed ms offset applied to every signed timestamp. The midpoint method removes
+    one-way network-delay bias."""
+    for base in _fapi_hosts():
+        try:
+            t0 = int(time.time() * 1000)
+            r = await http.get(f"{base}/fapi/v1/time", headers={"User-Agent": BINANCE_FUTURES_UA},
+                               timeout=10, follow_redirects=True)
+            if r.status_code >= 400:
+                continue
+            srv = int((r.json() or {}).get("serverTime") or 0)
+            if srv <= 0:
+                continue
+            t1 = int(time.time() * 1000)
+            _FAPI["timeOffsetMs"] = int(srv - (t0 + t1) / 2)
+            _FAPI["timeSyncTs"] = time.time()
+            _FAPI["activeHost"] = base
+            return _FAPI["timeOffsetMs"]
+        except Exception:  # noqa: BLE001
+            continue
+    return _FAPI.get("timeOffsetMs", 0)
+
+
+async def fapi_signed(http, method, path, params, _retry=True):
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         raise RuntimeError("Binance API key/secret not configured (Futures permission required)")
     p = {k: (str(v).lower() if isinstance(v, bool) else str(v)) for k, v in params.items() if v is not None}
-    p["timestamp"] = int(time.time() * 1000)
-    p.setdefault("recvWindow", "5000")
+    p["timestamp"] = str(int(time.time() * 1000) + int(_FAPI.get("timeOffsetMs", 0)))
+    p.setdefault("recvWindow", "10000")
     query = urlencode(p)
     sig = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY, "User-Agent": BINANCE_FUTURES_UA}
@@ -343,7 +370,12 @@ async def fapi_signed(http, method, path, params):
         if not isinstance(data, (dict, list)):
             last = f"{base} -> unexpected body"
             continue
-        if r.status_code >= 400 or (isinstance(data, dict) and int(data.get("code", 0) or 0) < 0):
+        code = int(data.get("code", 0) or 0) if isinstance(data, dict) else 0
+        if r.status_code >= 400 or code < 0:
+            # clock drift -> resync Binance server time and retry ONCE with a fresh signature
+            if code == -1021 and _retry:
+                await _fapi_sync_time(http)
+                return await fapi_signed(http, method, path, params, _retry=False)
             raise RuntimeError(f"binance-futures {r.status_code}: {str(data)[:200]}")
         _FAPI["activeHost"] = base  # remember the working mirror
         return data
@@ -381,6 +413,8 @@ async def _fapi_round_qty(http, symbol, qty):
                     continue
             lots = {}
             ticks = {}
+            lots_s = {}
+            ticks_s = {}
             for s in (info or {}).get("symbols", []):
                 step = None
                 tick = None
@@ -391,11 +425,15 @@ async def _fapi_round_qty(http, symbol, qty):
                         tick = f.get("tickSize")
                 if step:
                     lots[s["symbol"]] = float(step)
+                    lots_s[s["symbol"]] = str(step)
                 if tick:
                     ticks[s["symbol"]] = float(tick)
+                    ticks_s[s["symbol"]] = str(tick)
             if lots:
                 _FAPI["lots"] = lots
                 _FAPI["ticks"] = ticks
+                _FAPI["lotsStr"] = lots_s
+                _FAPI["ticksStr"] = ticks_s
                 _FAPI["lotsTs"] = now
         step = _FAPI["lots"].get(symbol.upper())
         if step and step > 0:
@@ -420,6 +458,56 @@ async def _fapi_round_price(http, symbol, price):
     return price
 
 
+async def _fapi_warm_filters(http, symbol):
+    """Ensure the stepSize/tickSize string caches are populated (warms via exchangeInfo)."""
+    if not _FAPI.get("lotsStr"):
+        await _fapi_round_qty(http, symbol, 1.0)
+
+
+async def _fapi_fmt_qty(http, symbol, qty):
+    """Quantity as an exact stepSize-multiple decimal STRING, floored (fixes -1111)."""
+    await _fapi_warm_filters(http, symbol)
+    step = _FAPI.get("lotsStr", {}).get(symbol.upper())
+    if step:
+        return _floor_step(qty, step)
+    return (format(float(qty), ".8f").rstrip("0").rstrip(".")) or "0"
+
+
+async def _fapi_fmt_price(http, symbol, price, direction="down"):
+    """Price/trigger as an exact tickSize-multiple decimal STRING (fixes -1111). direction 'up'/
+    'down' controls rounding so stop triggers stay on the correct side of the mark (fixes -2021)."""
+    await _fapi_warm_filters(http, symbol)
+    tick = _FAPI.get("ticksStr", {}).get(symbol.upper())
+    if tick:
+        return _round_tick(price, tick, direction)
+    return (format(float(price), ".8f").rstrip("0").rstrip(".")) or "0"
+
+
+async def _fapi_book_ticker(http, symbol):
+    """Best bid/ask (public market-data) used to price an aggressive crossing LIMIT order."""
+    try:
+        r = await http.get(f"{_fapi_base()}/fapi/v1/ticker/bookTicker",
+                           params={"symbol": symbol.upper()},
+                           headers={"User-Agent": BINANCE_FUTURES_UA}, timeout=10, follow_redirects=True)
+        if r.status_code < 400:
+            d = r.json() or {}
+            bid = float(d.get("bidPrice") or 0)
+            ask = float(d.get("askPrice") or 0)
+            if bid > 0 and ask > 0:
+                return bid, ask
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def _limit_slip():
+    """Aggressive-limit slippage cap as a fraction (config limitSlippagePct, percent)."""
+    try:
+        return max(0.001, min(5.0, float(BOT["config"].get("limitSlippagePct", 0.05)))) / 100.0
+    except Exception:  # noqa: BLE001
+        return 0.0005
+
+
 async def _fapi_set_leverage(http, symbol, lev):
     lev = max(1, min(125, int(lev or 1)))
     return await fapi_signed(http, "POST", "/fapi/v1/leverage", {"symbol": symbol.upper(), "leverage": lev})
@@ -439,17 +527,25 @@ def _extract_order_id(res):
 
 
 async def _fapi_market_open(http, symbol, is_long, qty, lev, limit_price=None):
-    # Entry is always a plain MARKET order (instant fill at mark). The buffer only shapes the
-    # SIM preview fill; a live market order has no price, so limit_price is accepted but unused.
+    # Aggressive crossing LIMIT (IOC): fills immediately against the book like a market order but
+    # never worse than the slippage cap (limitSlippagePct). Replaces the old plain MARKET entry.
     hedge = await fapi_position_mode(http)
     await _fapi_set_leverage(http, symbol, lev)
-    qty = await _fapi_round_qty(http, symbol, qty)
-    params = {"symbol": symbol.upper(), "side": "BUY" if is_long else "SELL", "type": "MARKET",
-              "quantity": qty, "newOrderRespType": "RESULT",
+    slip = _limit_slip()
+    bid, ask = await _fapi_book_ticker(http, symbol)
+    if is_long:
+        ref = ask or await _fapi_last_price(http, symbol)
+        px = await _fapi_fmt_price(http, symbol, ref * (1 + slip), "up")
+    else:
+        ref = bid or await _fapi_last_price(http, symbol)
+        px = await _fapi_fmt_price(http, symbol, ref * (1 - slip), "down")
+    qty_s = await _fapi_fmt_qty(http, symbol, qty)
+    params = {"symbol": symbol.upper(), "side": "BUY" if is_long else "SELL", "type": "LIMIT",
+              "timeInForce": "IOC", "quantity": qty_s, "price": px, "newOrderRespType": "RESULT",
               "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
     res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
-    logger.info("FUTURES open raw response (%s %s MARKET): %s", symbol, "BUY" if is_long else "SELL", res)
-    executed = float(res.get("executedQty", 0) or 0) or qty
+    logger.info("FUTURES open raw response (%s %s LIMIT IOC @%s): %s", symbol, "BUY" if is_long else "SELL", px, res)
+    executed = float(res.get("executedQty", 0) or 0) or float(qty_s or 0)
     ap = float(res.get("avgPrice", 0) or 0)
     return {"executedQty": executed, "fillPrice": ap, "orderId": _extract_order_id(res), "raw": res}
 
@@ -465,18 +561,29 @@ async def _fapi_cancel_order(http, symbol, order_id):
 
 
 async def _fapi_market_close(http, symbol, is_long, qty):
-    """Close by sending the opposite side. One-way: reduceOnly=true. Hedge: positionSide leg."""
+    """Close via an aggressive crossing LIMIT (IOC) in the opposite direction. One-way:
+    reduceOnly=true. Hedge: positionSide leg (reduceOnly not allowed)."""
     hedge = await fapi_position_mode(http)
-    qty = await _fapi_round_qty(http, symbol, qty)
-    params = {"symbol": symbol.upper(), "side": "SELL" if is_long else "BUY", "type": "MARKET",
-              "quantity": qty, "newOrderRespType": "RESULT"}
+    slip = _limit_slip()
+    bid, ask = await _fapi_book_ticker(http, symbol)
+    if is_long:
+        side = "SELL"
+        ref = bid or await _fapi_last_price(http, symbol)
+        px = await _fapi_fmt_price(http, symbol, ref * (1 - slip), "down")
+    else:
+        side = "BUY"
+        ref = ask or await _fapi_last_price(http, symbol)
+        px = await _fapi_fmt_price(http, symbol, ref * (1 + slip), "up")
+    qty_s = await _fapi_fmt_qty(http, symbol, qty)
+    params = {"symbol": symbol.upper(), "side": side, "type": "LIMIT", "timeInForce": "IOC",
+              "quantity": qty_s, "price": px, "newOrderRespType": "RESULT"}
     if hedge:
         params["positionSide"] = "LONG" if is_long else "SHORT"
     else:
         params["positionSide"] = "BOTH"
         params["reduceOnly"] = True
     res = await fapi_signed(http, "POST", "/fapi/v1/order", params)
-    logger.info("FUTURES close raw response (%s): %s", symbol, res)
+    logger.info("FUTURES close raw response (%s LIMIT IOC @%s): %s", symbol, px, res)
     ap = float(res.get("avgPrice", 0) or 0)
     return {"fillPrice": ap, "orderId": _extract_order_id(res), "raw": res}
 
@@ -501,49 +608,66 @@ async def _fapi_positions(http, symbol=None):
 
 
 async def _fapi_place_stop_entry(http, symbol, is_long, qty, stop_price):
-    """Place a CONDITIONAL breakout entry via Binance's Algo Service (Dec-2025 migration):
-    BUY triggers when mark >= triggerPrice (LONG), SELL when mark <= triggerPrice (SHORT).
-    Classic /fapi/v1/order now rejects STOP_MARKET with -4120 — must use /fapi/v1/algoOrder."""
+    """Place a CONDITIONAL breakout entry as a STOP (stop-LIMIT) via Binance's Algo Service.
+    BUY triggers when mark >= triggerPrice (LONG), SELL when mark <= triggerPrice (SHORT); on
+    trigger a crossing LIMIT fills within the slippage cap. Trigger is rounded AWAY from mark
+    (long up / short down) so it is never 'already triggered' (-2021); qty/price are exact
+    step/tick multiples (-1111). Uses /fapi/v1/algoOrder (classic /order rejects STOP -4120)."""
     hedge = await fapi_position_mode(http)
-    qty = await _fapi_round_qty(http, symbol, qty)
-    tp = await _fapi_round_price(http, symbol, stop_price)
+    slip = _limit_slip()
+    qty_s = await _fapi_fmt_qty(http, symbol, qty)
+    trig = await _fapi_fmt_price(http, symbol, stop_price, "up" if is_long else "down")
+    if is_long:
+        lim = await _fapi_fmt_price(http, symbol, float(trig) * (1 + slip), "up")
+    else:
+        lim = await _fapi_fmt_price(http, symbol, float(trig) * (1 - slip), "down")
     params = {"symbol": symbol.upper(), "side": "BUY" if is_long else "SELL",
-              "type": "STOP_MARKET", "algoType": "CONDITIONAL", "triggerPrice": tp,
-              "quantity": qty, "workingType": "MARK_PRICE",
+              "type": "STOP", "algoType": "CONDITIONAL", "triggerPrice": trig, "price": lim,
+              "timeInForce": "GTC", "quantity": qty_s, "workingType": "MARK_PRICE",
+              "priceProtect": "false", "newOrderRespType": "RESULT",
               "positionSide": ("LONG" if is_long else "SHORT") if hedge else "BOTH"}
     res = await fapi_signed(http, "POST", "/fapi/v1/algoOrder", params)
-    logger.info("FUTURES algo stop-entry raw (%s %s @%s): %s", symbol, "BUY" if is_long else "SELL", tp, res)
+    logger.info("FUTURES algo STOP entry raw (%s %s trig@%s lim@%s): %s", symbol,
+                "BUY" if is_long else "SELL", trig, lim, res)
     algo_id = res.get("algoId") or res.get("clientAlgoId") or _extract_order_id(res)
-    return {"algoId": algo_id, "triggerPrice": tp, "qty": qty, "raw": res}
+    return {"algoId": algo_id, "triggerPrice": float(trig), "qty": float(qty_s or 0), "raw": res}
 
 
-async def _fapi_place_native_tpsl(http, symbol, is_long, qty, tp_price, sl_price, close_position=False):
-    """Place native TP (TAKE_PROFIT_MARKET) + SL (STOP_MARKET) CONDITIONAL algo orders so the
-    exchange closes the position. With close_position=True the orders carry closePosition=true
-    (no qty/reduceOnly) — used to PRE-PLACE TP/SL before/with the entry so there is zero bot delay
-    and leftover opposite orders can never open a reverse position. Otherwise quantity + reduceOnly
-    (one-way) to attach to an existing position."""
+async def _fapi_place_native_tpsl(http, symbol, is_long, qty, tp_price, sl_price, reduce_only=True):
+    """Place native TP (TAKE_PROFIT limit) + SL (STOP limit) CONDITIONAL algo orders so the
+    exchange closes the position with a crossing LIMIT within the slippage cap. Each leg carries
+    quantity; reduce_only=True (one-way) attaches to an existing position; reduce_only=False is
+    used to PRE-PLACE the straddle's TP/SL with the entry (no position yet), the OPPOSITE leg
+    being cancelled on fill (OCO). Triggers rounded to the correct side of mark; qty/price exact."""
     hedge = await fapi_position_mode(http)
     exit_side = "SELL" if is_long else "BUY"
     pos_side = ("LONG" if is_long else "SHORT") if hedge else "BOTH"
-    qty = await _fapi_round_qty(http, symbol, qty) if (qty and not close_position) else qty
+    slip = _limit_slip()
+    qty_s = await _fapi_fmt_qty(http, symbol, qty) if qty else None
     out = {}
-    for tag, otype, px in (("tp", "TAKE_PROFIT_MARKET", tp_price), ("sl", "STOP_MARKET", sl_price)):
+    # long: TP above (round up) / SL below (round down).  short: TP below (down) / SL above (up).
+    legs = (("tp", "TAKE_PROFIT", tp_price, "up" if is_long else "down"),
+            ("sl", "STOP", sl_price, "down" if is_long else "up"))
+    for tag, otype, px, trig_dir in legs:
         if px is None or px <= 0:
             continue
-        tp = await _fapi_round_price(http, symbol, px)
-        params = {"symbol": symbol.upper(), "side": exit_side, "type": otype,
-                  "algoType": "CONDITIONAL", "triggerPrice": tp,
-                  "workingType": "MARK_PRICE", "positionSide": pos_side}
-        if close_position:
-            params["closePosition"] = "true"
+        trig = await _fapi_fmt_price(http, symbol, px, trig_dir)
+        # crossing LIMIT past the trigger in the fill direction (SELL below / BUY above)
+        if exit_side == "SELL":
+            lim = await _fapi_fmt_price(http, symbol, float(trig) * (1 - slip), "down")
         else:
-            params["quantity"] = qty
-            if not hedge:
-                params["reduceOnly"] = "true"
+            lim = await _fapi_fmt_price(http, symbol, float(trig) * (1 + slip), "up")
+        params = {"symbol": symbol.upper(), "side": exit_side, "type": otype,
+                  "algoType": "CONDITIONAL", "triggerPrice": trig, "price": lim,
+                  "timeInForce": "GTC", "workingType": "MARK_PRICE", "priceProtect": "false",
+                  "positionSide": pos_side, "newOrderRespType": "RESULT"}
+        if qty_s:
+            params["quantity"] = qty_s
+        if reduce_only and not hedge:
+            params["reduceOnly"] = "true"
         try:
             res = await fapi_signed(http, "POST", "/fapi/v1/algoOrder", params)
-            out[tag] = {"algoId": res.get("algoId") or _extract_order_id(res), "triggerPrice": tp}
+            out[tag] = {"algoId": res.get("algoId") or _extract_order_id(res), "triggerPrice": float(trig)}
         except Exception as e:  # noqa: BLE001
             out[tag] = {"error": str(e)[:150]}
     return out
@@ -2312,11 +2436,12 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
                 entry["shortOid"] = so["algoId"]
                 placed.append(so["algoId"])
                 entry["qty"] = lo.get("qty", qty)
-                # PRE-PLACE both sides' TP/SL (closePosition) so Binance triggers them in 0ms.
-                ltp = await _fapi_place_native_tpsl(http, sym, True, 0, long_tp, long_sl, close_position=True)
+                # PRE-PLACE both sides' TP/SL (limit, quantity, no reduceOnly since no position
+                # exists yet) so Binance triggers them in 0ms; the losing side is OCO-cancelled.
+                ltp = await _fapi_place_native_tpsl(http, sym, True, entry["qty"], long_tp, long_sl, reduce_only=False)
                 entry["longTpOid"] = (ltp.get("tp") or {}).get("algoId")
                 entry["longSlOid"] = (ltp.get("sl") or {}).get("algoId")
-                stp = await _fapi_place_native_tpsl(http, sym, False, 0, short_tp, short_sl, close_position=True)
+                stp = await _fapi_place_native_tpsl(http, sym, False, entry["qty"], short_tp, short_sl, reduce_only=False)
                 entry["shortTpOid"] = (stp.get("tp") or {}).get("algoId")
                 entry["shortSlOid"] = (stp.get("sl") or {}).get("algoId")
                 placed += [entry["longTpOid"], entry["longSlOid"], entry["shortTpOid"], entry["shortSlOid"]]
@@ -2699,6 +2824,7 @@ class BotConfigUpdate(BaseModel):
     futShortBufferPct: Optional[float] = None
     futPendingTimeoutSec: Optional[int] = None
     futuresTestnet: Optional[bool] = None
+    limitSlippagePct: Optional[float] = None
     maxLossPerTradeUsdt: Optional[float] = None
     straddleEnabled: Optional[bool] = None
     straddleDualSide: Optional[bool] = None
@@ -2867,6 +2993,8 @@ async def bot_config(update: BotConfigUpdate):
             data[_bk] = 0.0 if _v <= 0 else max(0.00000001, min(5.0, _v))
     if "futPendingTimeoutSec" in data:
         data["futPendingTimeoutSec"] = max(1, min(300, int(float(data["futPendingTimeoutSec"]))))
+    if "limitSlippagePct" in data:
+        data["limitSlippagePct"] = max(0.001, min(5.0, float(data["limitSlippagePct"])))
     if "obStraddleMaxSymbols" in data:
         data["obStraddleMaxSymbols"] = max(1, min(50, int(float(data["obStraddleMaxSymbols"]))))
     if "straddleEntryPct" in data:
@@ -3259,6 +3387,10 @@ async def startup():
         await load_bot_config()
     except Exception as e:  # noqa: BLE001
         logger.error("bot config load failed: %s", e)
+    try:
+        await _fapi_sync_time(app.state.http)  # sync Binance server clock (fixes -1021)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("fapi time sync skipped: %s", e)
     app.state.poller = asyncio.create_task(poll_binance(app.state.http))
     app.state.monitor = asyncio.create_task(fast_position_monitor())
     app.state.bin_monitor = asyncio.create_task(bin_fast_monitor())

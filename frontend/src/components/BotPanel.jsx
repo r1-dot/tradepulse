@@ -220,7 +220,19 @@ export default function BotPanel({ open, onClose }) {
                       />
                       <span className="mono text-[11px] font-bold text-[#F3BA2F]">x</span>
                     </div>
-                    <span className="mono text-[9px] leading-tight text-zinc-400">per-trade default (1–125) · long &amp; short · reduce-only close · position side auto-detected</span>
+                    <div className="flex items-center gap-1 border border-zinc-200 px-2 py-1" data-testid="bot-futures-limitslip-box">
+                      <span className="mono text-[10px] text-zinc-500">Limit slip</span>
+                      <input
+                        data-testid="bot-futures-limitslip"
+                        type="number" min="0.001" max="5" step="0.01"
+                        value={form.limitSlippagePct}
+                        onChange={(e) => setForm({ ...form, limitSlippagePct: e.target.value })}
+                        onBlur={() => patch({ limitSlippagePct: parseFloat(form.limitSlippagePct) || 0.05 })}
+                        className="mono w-14 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
+                      />
+                      <span className="mono text-[11px] font-bold text-[#F3BA2F]">%</span>
+                    </div>
+                    <span className="mono text-[9px] leading-tight text-zinc-400">leverage 1–125 · all orders are aggressive LIMIT (cross book, cap slip) · reduce-only close</span>
                   </div>
                 )}
                 {(st.config.exchange === "hyperliquid" || (st.config.dryRun && st.config.exchange !== "binance_futures")) && (

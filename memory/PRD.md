@@ -275,6 +275,17 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Tests: `tests/test_bin_straddle.py` (7) — live arm places 2 STOP_MARKET legs (BUY above/SELL below, no timeInForce), live fill cancels opposite + places native close-all TP/SL, native TP/SL payload shape, SIM arm+fill with NO real orders, short TP-below/SL-above, expiry cancels both legs, config clamps. 44/44 across all straddle+futures suites, no regressions. LIVE execution untestable from preview (Binance writes 302-redirected / geo-blocked) — works from the user's VPS.
 - NOTE: tests calling `bot_config` persist to the shared Mongo; `test_config_clamps_bin_straddle` now monkeypatches `save_bot_config`. Safe defaults (OFF, 0.08/0.5/0.3) restored on the running server after the run.
 
+## Fix + Feature (2026-06) — VPS 400 errors resolved + MARKET→LIMIT conversion
+- Deployed to the user's VPS (http://45.77.251.215) — geo-block gone; diagnosed 4 distinct Binance `400`s from the live journal and fixed each:
+  - **-1111 Precision** → new `binance_fmt.py` (Decimal) + async `_fapi_fmt_qty`/`_fapi_fmt_price`; qty floored to exact `stepSize`, price to exact `tickSize` as fixed-point strings (no float artifacts). `exchangeInfo` cache now also stores raw step/tick strings (`_FAPI["lotsStr"]`/`["ticksStr"]`).
+  - **-2021 Order would immediately trigger** → directional tick rounding: long stop-entry rounds UP, short DOWN (stays strictly beyond mark); TP/SL triggers rounded to their correct side.
+  - **-1021 Timestamp outside recvWindow** → `_fapi_sync_time()` syncs Binance server clock (midpoint offset) at startup; `fapi_signed` applies the offset, uses `recvWindow=10000`, and on a -1021 resyncs + retries once.
+  - **-4411 TradFi-Perps agreement** → left as-is per user (user signs the agreement on Binance for XAU/SOXL/SOXS/SPCX/MU/NVDX…).
+- **All bot futures orders are now aggressive crossing LIMIT (IOC)** per user request, capped by new config `limitSlippagePct` (default 0.05%, clamp 0.001–5): plain entries/closes (`_fapi_market_open`/`_fapi_market_close`) → `type=LIMIT timeInForce=IOC`, priced past best bid/ask (`_fapi_book_ticker`) by the cap; native-straddle breakout entries (`_fapi_place_stop_entry`) → `type=STOP` stop-LIMIT (triggerPrice + limit price + GTC); native TP/SL (`_fapi_place_native_tpsl`) → `TAKE_PROFIT`/`STOP` LIMIT with `quantity` (+`reduceOnly` when attaching to an existing position; pre-placed straddle legs use quantity-only, OCO-cancelled — `closePosition` dropped since LIMIT types can't use it).
+- BotPanel: new "Limit slip %" input next to Leverage (`data-testid="bot-futures-limitslip"`).
+- Tests: updated `test_binance_futures.py` + `test_bin_straddle.py` for the LIMIT/STOP payloads; **86/86 mocked unit tests pass**. LIVE execution still only verifiable on the VPS (preview geo-blocked).
+
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

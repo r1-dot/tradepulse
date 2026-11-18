@@ -36,12 +36,12 @@ class FakeHTTP:
                 return FakeResp(resp, status=status)
         return FakeResp({"code": -1, "msg": "unmatched"}, status=400)
 
-    async def request(self, method, url, headers=None, timeout=None, follow_redirects=False):
+    async def request(self, method, url, headers=None, timeout=None, follow_redirects=False, **kwargs):
         self.calls.append((method, url))
         self.headers.append(headers or {})
         return self._match(url)
 
-    async def get(self, url, headers=None, timeout=None, follow_redirects=False):
+    async def get(self, url, headers=None, timeout=None, follow_redirects=False, params=None, **kwargs):
         self.calls.append(("GET", url))
         self.headers.append(headers or {})
         return self._match(url)
@@ -51,6 +51,9 @@ def _reset_mode():
     server._FAPI["mode"] = None
     server._FAPI["modeTs"] = 0.0
     server._FAPI["lots"] = {}
+    server._FAPI["ticks"] = {}
+    server._FAPI["lotsStr"] = {}
+    server._FAPI["ticksStr"] = {}
     server._FAPI["lotsTs"] = 0.0
     server._FAPI["activeHost"] = None
 
@@ -117,12 +120,15 @@ def test_open_oneway_uses_both(monkeypatch):
         ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
         ("/fapi/v1/leverage", {"leverage": 5}),
         ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/ticker/bookTicker", {"bidPrice": "100.0", "askPrice": "100.0"}),
+        ("/fapi/v1/ticker/price", {"price": "100.0"}),
         ("/fapi/v1/order", {"executedQty": "0.5", "avgPrice": "100.0", "orderId": 1}),
     ])
     r = asyncio.run(server._fapi_market_open(http, "BTCUSDT", True, 0.5, 5))
     assert r["fillPrice"] == 100.0 and r["executedQty"] == 0.5
     order_url = [u for _, u in http.calls if "/fapi/v1/order" in u][0]
     assert "positionSide=BOTH" in order_url and "side=BUY" in order_url
+    assert "type=LIMIT" in order_url and "timeInForce=IOC" in order_url and "price=" in order_url
 
 
 def test_close_oneway_is_reduce_only(monkeypatch):
@@ -132,11 +138,14 @@ def test_close_oneway_is_reduce_only(monkeypatch):
     http = FakeHTTP([
         ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
         ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/ticker/bookTicker", {"bidPrice": "99.0", "askPrice": "99.0"}),
+        ("/fapi/v1/ticker/price", {"price": "99.0"}),
         ("/fapi/v1/order", {"avgPrice": "99.0"}),
     ])
     asyncio.run(server._fapi_market_close(http, "BTCUSDT", True, 0.5))  # closing a LONG
     order_url = [u for _, u in http.calls if "/fapi/v1/order" in u][0]
     assert "reduceOnly=true" in order_url and "side=SELL" in order_url and "positionSide=BOTH" in order_url
+    assert "type=LIMIT" in order_url and "timeInForce=IOC" in order_url
 
 
 def test_close_hedge_no_reduce_only_leg_side(monkeypatch):
@@ -146,6 +155,8 @@ def test_close_hedge_no_reduce_only_leg_side(monkeypatch):
     http = FakeHTTP([
         ("/fapi/v1/positionSide/dual", {"dualSidePosition": True}),
         ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/ticker/bookTicker", {"bidPrice": "99.0", "askPrice": "99.0"}),
+        ("/fapi/v1/ticker/price", {"price": "99.0"}),
         ("/fapi/v1/order", {"avgPrice": "99.0"}),
     ])
     asyncio.run(server._fapi_market_close(http, "BTCUSDT", False, 0.5))  # closing a SHORT in hedge
@@ -163,6 +174,8 @@ def test_order_id_returned_various_shapes(monkeypatch):
         ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
         ("/fapi/v1/leverage", {"leverage": 3}),
         ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/ticker/bookTicker", {"bidPrice": "100.0", "askPrice": "100.0"}),
+        ("/fapi/v1/ticker/price", {"price": "100.0"}),
         ("/fapi/v1/order", {"orderId": 283194212, "executedQty": "0.5", "avgPrice": "100.0"}),
     ])
     r = asyncio.run(server._fapi_market_open(http, "BTCUSDT", True, 0.5, 3))
@@ -184,6 +197,8 @@ def test_close_returns_order_id(monkeypatch):
     http = FakeHTTP([
         ("/fapi/v1/positionSide/dual", {"dualSidePosition": False}),
         ("/fapi/v1/exchangeInfo", {"symbols": []}),
+        ("/fapi/v1/ticker/bookTicker", {"bidPrice": "99.0", "askPrice": "99.0"}),
+        ("/fapi/v1/ticker/price", {"price": "99.0"}),
         ("/fapi/v1/order", {"orderId": 555, "avgPrice": "99.0"}),
     ])
     r = asyncio.run(server._fapi_market_close(http, "BTCUSDT", True, 0.5))
