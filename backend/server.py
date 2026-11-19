@@ -172,6 +172,11 @@ BOT_DEFAULTS = {
     # incl. manually opened). Reuses the straddle TP/SL levels. Leaves positions that already have
     # a protective TP/SL untouched. Live Binance Futures only.
     "autoTpSlEnabled": False,
+    # Smart Trailing TP applied to EVERY open Binance position (incl. manual) — separate switch,
+    # TAKES PRIORITY over the fixed Auto TP/SL above (when ON it owns every position). Reuses the
+    # shared Smart Trailing TP settings, mirrors the moving stop as a real native SL on Binance,
+    # and takes over (cancels) any existing TP/SL on each position. Live Binance Futures only.
+    "autoTrailEnabled": False,
     # Optional signal-time guard: skip arming (and flatten) when live price is already outside the
     # entry band. Off by default — can fire a lot on a tight band in fast markets.
     "binStradBandGuard": False,
@@ -216,6 +221,7 @@ BOT = {
     "binStraddles": {},     # symbol -> pending Binance native straddle (real stop-entry orders)
     "binWs": {"connected": False, "lastEventTs": 0.0, "reconnects": 0, "listenKey": None},
     "autoTpSl": {},         # position key -> auto TP/SL record (attached / external)
+    "autoTrail": {},        # position key -> All-Positions Smart Trailing TP state (external)
     "pendingFutures": {},   # posKey -> pending slippage-limit futures entry (5-min timeout)
     "journal": deque(maxlen=300),
     "dailyPnl": 0.0,
@@ -2210,6 +2216,8 @@ async def auto_tpsl_scan(http):
             bp = BOT["positions"].get(sym)
             if bp and bp.get("source") == "bin_straddle":
                 continue  # straddle engine manages these
+            if key in BOT["autoTrail"]:
+                continue  # Smart Trailing TP (All Positions) takes priority and owns this one
             if key in BOT["autoTpSl"]:
                 continue
             entry = float(p.get("entryPrice") or 0)
@@ -2236,13 +2244,184 @@ async def auto_tpsl_scan(http):
             BOT["autoTpSl"].pop(key, None)
 
 
+async def _bin_cancel_tpsl(http, sym, closing_side, position_side):
+    """Cancel every protective conditional (STOP / TAKE_PROFIT) for this symbol+side on Binance.
+    Used to TAKE OVER a position (remove any existing TP/SL) and to keep exactly one trailing SL
+    resting (cancel-replace). Best-effort; returns how many were cancelled."""
+    n = 0
+    try:
+        for o in (await _fapi_open_algo_orders(http, sym)) or []:
+            t = str(o.get("orderType") or o.get("origType") or o.get("type") or "").upper()
+            if "STOP" not in t and "TAKE_PROFIT" not in t:
+                continue
+            if closing_side and o.get("side") and o.get("side") != closing_side:
+                continue
+            ps = o.get("positionSide", "BOTH")
+            if ps != "BOTH" and position_side != "BOTH" and ps != position_side:
+                continue
+            aid = o.get("algoId") or o.get("clientAlgoId")
+            if aid is None:
+                continue
+            try:
+                await _fapi_algo_cancel(http, sym, aid)
+                n += 1
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
+async def _bin_trail_sync_stop(http, rec, sym, stop_price):
+    """CANCEL-REPLACE the native reduce-only SL on Binance so the exchange always holds exactly
+    ONE stop at the latest trailed price (survives an app restart). Mirrors _hl_sync_stop."""
+    is_long = rec["side"] == "long"
+    closing = "SELL" if is_long else "BUY"
+    old = rec.get("nativeSlPrice")
+    cancelled = await _bin_cancel_tpsl(http, sym, closing, rec.get("ps", "BOTH"))
+    out = await _fapi_place_native_tpsl(http, sym, is_long, rec["qty"], None, stop_price)
+    oid = (out.get("sl") or {}).get("algoId")
+    rec["nativeSlPrice"] = stop_price
+    rec["slOid"] = oid
+    base = sym[: -len(QUOTE)] if sym.endswith(QUOTE) else sym
+    _op = f"{old:.6g}" if isinstance(old, (int, float)) else "none"
+    jlog("auto_trail", symbol=sym, base=base, sl=stop_price, live=True,
+         message=f"{base} trail SL {_op} -> {stop_price:.6g} (native, cancelled {cancelled}, oid={oid})")
+
+
+async def _auto_trail_close(http, key, rec, sym, price, reason):
+    """Market-close an All-Positions trailing position (aggressive LIMIT IOC), sweep its native
+    orders, drop tracking."""
+    is_long = rec["side"] == "long"
+    base = sym[: -len(QUOTE)] if sym.endswith(QUOTE) else sym
+    try:
+        await _fapi_market_close(http, sym, is_long, rec["qty"])
+    except Exception as e:  # noqa: BLE001
+        jlog("warn", symbol=sym, base=base, live=True, message=f"trail close failed ({str(e)[:100]})")
+    await _bin_cancel_tpsl(http, sym, "SELL" if is_long else "BUY", rec.get("ps", "BOTH"))
+    BOT["autoTrail"].pop(key, None)
+    jlog("auto_trail", symbol=sym, base=base, live=True,
+         message=f"{base} {rec['side'].upper()} CLOSED @ {price:.6g} — {reason}")
+
+
+async def auto_trail_scan(http):
+    """Apply Smart Trailing TP to EVERY open Binance position (except the bot's own tracked ones,
+    which the main loop already trails). Takes over each position (cancels existing TP/SL), places
+    a tight initial native SL, then secures to BE+ and trails the native SL up locking profit.
+    Uses the shared trailing settings. Live Binance Futures only."""
+    cfg = BOT["config"]
+    try:
+        positions = await _fapi_positions(http)
+    except Exception as e:  # noqa: BLE001
+        logger.error("auto-trail positions: %s", e)
+        return
+    secure = cfg.get("trailSecure", 0.40)
+    be = cfg.get("trailBE", 0.05)
+    step = cfg.get("trailStep", 0.5)
+    cb = cfg.get("trailCallback", 0.30)
+    init = cfg.get("trailInitialSlPct", 0.30) / 100.0
+    latest = STATE["latest"]
+    seen = set()
+    for p in positions or []:
+        try:
+            amt = float(p.get("positionAmt") or 0)
+            if amt == 0:
+                continue
+            sym = p.get("symbol")
+            if sym in BOT["positions"]:
+                continue  # bot-owned (straddle/hybrid/directional) — main loop trails these
+            ps = p.get("positionSide", "BOTH")
+            is_long = (ps == "LONG") or (ps == "BOTH" and amt > 0)
+            side = "long" if is_long else "short"
+            key = f"{sym}:{ps}:{side}"
+            seen.add(key)
+            entry = float(p.get("entryPrice") or 0)
+            qty = abs(amt)
+            if entry <= 0 or qty <= 0:
+                continue
+            base = sym[: -len(QUOTE)] if sym.endswith(QUOTE) else sym
+            v = latest.get(sym)
+            price = float(v["price"]) if v else (await _fapi_last_price(http, sym))
+            if price <= 0:
+                continue
+            rec = BOT["autoTrail"].get(key)
+            if not rec:
+                # ADOPT + TAKE OVER: cancel any existing TP/SL, place tight initial native SL
+                closing = "SELL" if is_long else "BUY"
+                cancelled = await _bin_cancel_tpsl(http, sym, closing, ps)
+                stop0 = entry * (1 - init) if is_long else entry * (1 + init)
+                out = await _fapi_place_native_tpsl(http, sym, is_long, qty, None, stop0)
+                rec = {"entry": entry, "qty": qty, "side": side, "ps": ps, "base": base,
+                       "peakPct": 0.0, "slOffPct": None, "nativeSlPrice": stop0,
+                       "slOid": (out.get("sl") or {}).get("algoId"), "ts": time.time()}
+                BOT["autoTrail"][key] = rec
+                jlog("auto_trail", symbol=sym, base=base, side=side, sl=stop0, live=True,
+                     message=f"Smart Trailing adopted {base} {side.upper()} @ {entry:.6g} — init SL {stop0:.6g} (took over {cancelled} order(s))")
+                continue
+            # TRAIL: update peak, secure to BE+, step the stop up, exit on callback/stop hit
+            e = rec["entry"]
+            profit_pct = ((price - e) / e * 100.0) if is_long else ((e - price) / e * 100.0)
+            if profit_pct > rec["peakPct"]:
+                rec["peakPct"] = profit_pct
+            peak = rec["peakPct"]
+            base_off = rec.get("slOffPct")
+            new_off = hybrid.trail_stop_offset(peak, secure, be, step)
+            stepped = False
+            if new_off is not None and (base_off is None or new_off > base_off + 1e-9):
+                first = base_off is None
+                rec["slOffPct"] = new_off
+                base_off = new_off
+                stepped = True
+                jlog("auto_trail", symbol=sym, base=base, live=True,
+                     message=(f"{base} +{peak:.2f}% -> SECURED BE+{be:.2f}%" if first
+                              else f"{base} +{peak:.2f}% -> TRAIL SL to +{new_off:.2f}%"))
+            if base_off is not None:
+                step_sl = e * (1 + base_off / 100.0) if is_long else e * (1 - base_off / 100.0)
+                peak_price = e * (1 + peak / 100.0) if is_long else e * (1 - peak / 100.0)
+                cb_sl = peak_price * (1 - cb / 100.0) if is_long else peak_price * (1 + cb / 100.0)
+                stop = max(step_sl, cb_sl) if is_long else min(step_sl, cb_sl)
+                hit = price <= stop if is_long else price >= stop
+                if hit:
+                    await _auto_trail_close(http, key, rec, sym, price, f"trail-exit +{peak:.2f}%")
+                    continue
+                last_native = rec.get("nativeSlPrice")
+                should_sync = stepped
+                if not should_sync and last_native is not None:
+                    favorable = (stop > last_native) if is_long else (stop < last_native)
+                    moved = abs(stop - last_native) / e * 100.0
+                    if favorable and moved >= cfg.get("hlStopSyncPct", 0.05):
+                        should_sync = True
+                if should_sync:
+                    await _bin_trail_sync_stop(http, rec, sym, stop)
+            else:
+                # not yet secured -> rely on the resting initial native SL (exchange closes it)
+                stop = rec.get("nativeSlPrice")
+                if stop and (price <= stop if is_long else price >= stop):
+                    await _auto_trail_close(http, key, rec, sym, price, "stop-loss")
+                    continue
+        except Exception as e:  # noqa: BLE001
+            logger.error("auto-trail %s: %s", p.get("symbol"), e)
+    # position closed on the exchange -> drop tracking (native orders auto-cancel at 0 size)
+    for key in list(BOT["autoTrail"].keys()):
+        if key not in seen:
+            BOT["autoTrail"].pop(key, None)
+
+
 async def auto_tpsl_monitor():
-    """Scan every open Binance position ~2s and auto-attach TP/SL. Live Binance Futures only."""
+    """Scan every open Binance position ~2s. Smart Trailing TP (All Positions) takes priority when
+    ON (manages every position); otherwise the fixed Auto TP/SL attaches protection. Live Binance
+    Futures only."""
     while True:
         cfg = BOT["config"]
         try:
-            run = cfg.get("autoTpSlEnabled") and (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures" and bool(BINANCE_API_KEY)
-            if run:
+            live = (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures" and bool(BINANCE_API_KEY)
+            run_trail = bool(cfg.get("autoTrailEnabled")) and live
+            run_fixed = bool(cfg.get("autoTpSlEnabled")) and live
+            if run_trail:
+                await auto_trail_scan(app.state.http)
+            elif BOT["autoTrail"]:
+                BOT["autoTrail"].clear()  # trailing off -> stop tracking (last native SL rests on)
+            if run_fixed:
                 await auto_tpsl_scan(app.state.http)
             elif BOT["autoTpSl"]:
                 BOT["autoTpSl"].clear()
@@ -2840,6 +3019,7 @@ class BotConfigUpdate(BaseModel):
     binStradReconcile: Optional[bool] = None
     binStradMonitorMs: Optional[int] = None
     autoTpSlEnabled: Optional[bool] = None
+    autoTrailEnabled: Optional[bool] = None
     binStradBandGuard: Optional[bool] = None
     hlLeverage: Optional[int] = None
     hlCrossMargin: Optional[bool] = None
@@ -2932,6 +3112,10 @@ def _bot_status():
         "autoTpSl": {
             "enabled": BOT["config"].get("autoTpSlEnabled", False),
             "protected": len(BOT["autoTpSl"]),
+        },
+        "autoTrail": {
+            "enabled": BOT["config"].get("autoTrailEnabled", False),
+            "managed": len(BOT["autoTrail"]),
         },
         "pendingFutures": [
             {"symbol": p["symbol"], "base": p["base"], "side": p["side"], "limitPrice": p["limitPrice"],

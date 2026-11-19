@@ -286,6 +286,15 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Tests: updated `test_binance_futures.py` + `test_bin_straddle.py` for the LIMIT/STOP payloads; **86/86 mocked unit tests pass**. LIVE execution still only verifiable on the VPS (preview geo-blocked).
 
 
+## Feature (2026-06) — SMART TRAILING TP · ALL POSITIONS (separate from Auto TP/SL)
+- New independent system under the "All Positions" umbrella with its own switch `autoTrailEnabled` (default OFF). Applies the Smart Trailing TP engine to EVERY open Binance Futures position (incl. manually opened) — not just the bot's own legs.
+- **Priority**: when ON it OWNS every external position; the fixed `Auto TP/SL · All Positions` (`auto_tpsl_scan`) skips any key present in `BOT["autoTrail"]`. The two never double-manage the same position.
+- Behavior (user choices): **takes over** each position (cancels any existing TP/SL via `_bin_cancel_tpsl`), places a tight **initial native SL** (`trailInitialSlPct`), secures to **BE+** then **trails the native SL up** locking profit; **mirrors the moving stop as a real native SL on Binance** (`_bin_trail_sync_stop` = cancel-replace, survives restarts); exits via aggressive LIMIT IOC (`_auto_trail_close`) when the trailed/callback stop is hit. **Reuses the shared Smart Trailing TP settings** (`trailSecure/trailBE/trailStep/trailCallback/hlStopSyncPct`). Skips bot-owned positions (main loop trails those). Live Binance Futures only.
+- New helpers: `_bin_cancel_tpsl`, `_bin_trail_sync_stop`, `_auto_trail_close`, `auto_trail_scan`. `auto_tpsl_monitor` now runs trailing first (priority) then fixed; clears each dict when its switch is OFF (last native SL left resting as protection). `/api/bot/status` exposes `autoTrail {enabled, managed}`. Config `autoTrailEnabled` + `BotConfigUpdate`.
+- BotPanel: new purple "SMART TRAILING TP · ALL POSITIONS" card (`bot-auto-trail-toggle`, `bot-auto-trail-count`) + `auto_trail` journal line renderer.
+- Tests: `tests/test_auto_trail.py` (8) — adopt+take-over, trail-up+native-sync, trail-exit close, short init stop, skip bot-owned, cleanup, priority over fixed Auto TP/SL, config toggle. **94/94 mocked unit tests pass**, no regressions. LIVE only verifiable on the VPS.
+
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

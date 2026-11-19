@@ -622,6 +622,29 @@ export default function BotPanel({ open, onClose }) {
                     </p>
                   </div>
 
+                  {/* SMART TRAILING TP — ALL POSITIONS (separate switch, takes priority) */}
+                  <div className="space-y-2 border border-[#7C3AED]/40 bg-[#7C3AED]/[0.06] p-2.5" data-testid="bot-auto-trail-section">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] font-semibold uppercase tracking-wider text-[#7C3AED]">Smart Trailing TP · all positions</span>
+                      <button
+                        data-testid="bot-auto-trail-toggle"
+                        onClick={() => patch({ autoTrailEnabled: !st.config.autoTrailEnabled })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.autoTrailEnabled ? "border-[#6D28D9] bg-[#7C3AED] text-white" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.autoTrailEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <p className="mono text-[9px] leading-relaxed text-zinc-500">
+                      Applies <b>Smart Trailing TP</b> to <b>every open Binance position</b> (incl. manual): a tight initial stop, secures to <b>BE+</b> in profit, then <b>trails the stop up</b> — mirrored as a <b>real native SL on Binance</b> (survives restarts). <b>Takes priority</b> over Auto TP/SL above (when ON it owns every position) and <b>takes over</b> any existing TP/SL. Uses the shared Smart Trailing TP settings below.
+                    </p>
+                    {st.autoTrail && st.config.autoTrailEnabled && (
+                      <p className="mono text-[8px] text-[#7C3AED]" data-testid="bot-auto-trail-count">Trailing {st.autoTrail.managed} open position(s).</p>
+                    )}
+                    <p className="mono text-[8px] leading-relaxed text-amber-600">
+                      ⚠ Requires the <b>Binance Futures</b> venue + <b>LIVE</b> (inactive in SIM). Tune Init SL / Secure / BE+ / Step / Callback in the <b>Smart Trailing TP</b> panel.
+                    </p>
+                  </div>
+
                   {/* FIXED TP/SL — used when Smart Trailing TP is OFF */}
                   <div className="space-y-2 border border-[#FF3B30]/25 bg-[#FF3B30]/[0.03] p-2.5" data-testid="bot-fixed-tpsl-section">
                     <div className="flex items-center justify-between">
@@ -839,6 +862,7 @@ const JournalLine = ({ j }) => {
   if (j.kind === "straddle") return <span className="text-[#7C3AED]">STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
   if (j.kind === "bin_straddle") return <span className="text-[#A17A00] font-semibold">BINANCE STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
   if (j.kind === "auto_tpsl") return <span className="text-[#1D4ED8] font-semibold">AUTO TP/SL {j.base} {String(j.side || "").toUpperCase()} · TP {Number(j.tp).toPrecision(5)} / SL {Number(j.sl).toPrecision(5)}</span>;
+  if (j.kind === "auto_trail") return <span className="text-[#7C3AED] font-semibold">AUTO-TRAIL {j.message}</span>;
   if (j.kind === "straddle_fill") return <span className="text-[#7C3AED] font-semibold">{j.message || `${j.side === "short" ? "SHORT" : "LONG"} leg filled ${j.base} — opposite cancelled`}</span>;
   if (j.kind === "straddle_cancel") return <span className="text-zinc-400">straddle {j.base} cancelled ({j.reason})</span>;
   if (j.kind === "halt") return <span className="text-[#FF3B30] font-semibold">⛔ {j.message}</span>;
