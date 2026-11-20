@@ -295,6 +295,16 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Tests: `tests/test_auto_trail.py` (8) — adopt+take-over, trail-up+native-sync, trail-exit close, short init stop, skip bot-owned, cleanup, priority over fixed Auto TP/SL, config toggle. **94/94 mocked unit tests pass**, no regressions. LIVE only verifiable on the VPS.
 
 
+## Feature (2026-06) — Smart Trailing TP INSIDE the Binance Native Straddle
+- New switch `binStradTrailEnabled` (default OFF) in the Native Straddle card. Controls how a filled straddle leg's pre-placed TP/SL are managed:
+  - **OFF** → pre-placed **fixed** TP/SL (current exchange-native behavior, unchanged).
+  - **ON** → pre-placed **smart trailing** TP/SL: on fill the fixed TP is cancelled (`_fapi_algo_cancel`, LIVE only) so profit runs, `tpPrice` set to None + `trailManaged=True`, and the native SL is **trailed up on Binance** (cancel-replace via `_bin_trail_sync_stop`) as `_update_trailing` secures to BE+ and locks profit. Reuses the shared Smart Trailing TP settings.
+- `_update_trailing` now branches on `is_bin_live` (source `bin_straddle` + not dryRun): syncs the native SL via `_bin_trail_sync_stop` (not `_hl_sync_stop`) and **never software-closes** a LIVE straddle — the resting/trailed native SL executes on the exchange (keeps the straddle's exchange-native, read-only guarantee). SIM straddle trailing still closes in software.
+- process_bot exit loop trails when `tpPrice is None` and (`trailEnabled` OR `trailManaged`), so straddle trailing is independent of the global trail switch. `_reconcile_bin_position` labels a trail-managed close as `TRAIL TP` (pnl≥0) / `SL HIT`.
+- BotPanel: `bot-bin-straddle-trail-toggle` row inside the straddle card. Config `binStradTrailEnabled` + `BotConfigUpdate`.
+- Tests: `tests/test_bin_straddle_trail.py` (6) — OFF keeps fixed TP/SL; ON cancels TP + arms trailing; SIM arms trailing w/o cancel; LIVE trails native SL up w/o software close; LIVE stop-hit lets exchange close; config toggle. **100/100 mocked unit tests pass**, no regressions. LIVE only verifiable on the VPS.
+
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

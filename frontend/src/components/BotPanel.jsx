@@ -594,6 +594,21 @@ export default function BotPanel({ open, onClose }) {
                         {st.config.binStradBandGuard ? "ON" : "OFF"}
                       </button>
                     </div>
+                    <div className="flex items-center justify-between border-t border-[#F0B90B]/25 pt-2" data-testid="bot-bin-straddle-trail-row">
+                      <div className="flex-1 pr-2">
+                        <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#A17A00]">Smart Trailing TP</span>
+                        <p className="mono text-[8px] leading-relaxed text-zinc-500">
+                          When <b>ON</b>, a filled leg is read as a <b>pre-placed smart trailing TP/SL</b>: the fixed Take-profit is cancelled and the <b>native stop-loss trails up</b> on Binance (secure to BE+, then lock profit) so winners run. When <b>OFF</b>, it stays a <b>pre-placed fixed TP/SL</b>. Uses the shared Smart Trailing TP settings.
+                        </p>
+                      </div>
+                      <button
+                        data-testid="bot-bin-straddle-trail-toggle"
+                        onClick={() => patch({ binStradTrailEnabled: !st.config.binStradTrailEnabled })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.binStradTrailEnabled ? "border-[#A17A00] bg-[#F0B90B] text-zinc-900" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.binStradTrailEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
                     <p className="mono text-[8px] leading-relaxed text-amber-600">
                       ⚠ Requires the <b>Binance Futures</b> venue + <b>LIVE</b> for real orders (simulates in SIM). Independent of Smart Trailing / Fixed TP-SL — uses the dedicated levels above. Hit “Save settings” to apply.
                     </p>

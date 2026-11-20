@@ -166,6 +166,10 @@ BOT_DEFAULTS = {
     "binStradEntryPct": 0.08,  # breakout offset from mark for each stop-entry leg (0.000001 - 5 %)
     "binStradTpPct": 0.5,      # native take-profit for the filled leg (0.01 - 10 %)
     "binStradSlPct": 0.3,      # native stop-loss for the filled leg (0.0001 - 5 %)
+    # When ON, a filled native-straddle leg is managed as SMART TRAILING TP/SL: the pre-placed
+    # fixed TP is cancelled and the native SL is trailed up (cancel-replace) locking profit; when
+    # OFF the pre-placed TP/SL stay fixed. Reuses the shared Smart Trailing TP settings.
+    "binStradTrailEnabled": False,
     "binStradReconcile": True, # poll Binance for live order/position state (fast monitor)
     "binStradMonitorMs": 500,  # Binance live state-check cadence in ms (200 - 5000)
     # --- AUTO TP/SL: attach a reduce-only TP/SL to EVERY open Binance position (known or unknown,
@@ -1643,13 +1647,13 @@ async def _update_trailing(http, sym, pos, price):
         cb_sl = peak_price * (1 - cb / 100.0) if long else peak_price * (1 + cb / 100.0)
         stop = max(step_sl, cb_sl) if long else min(step_sl, cb_sl)
         pos["slPrice"] = stop
+        is_bin_live = pos.get("source") == "bin_straddle" and not pos.get("dryRun")
         hit = price <= stop if long else price >= stop
-        if hit:
+        if hit and not is_bin_live:
             await _close_position(http, sym, price, f"trail-exit +{peak:.2f}%")
             return
-        # keep the EXCHANGE native SL in lockstep with the software trailing stop (LIVE HL):
-        # sync on every discrete step-up AND whenever the stop drifts favorably past a small
-        # threshold (the callback-based stop tightens continuously between step-ups).
+        # keep the EXCHANGE native SL in lockstep with the software trailing stop. For a LIVE Binance
+        # native straddle the SL is a native Binance order (cancel-replace); for HL via _hl_sync_stop.
         last_native = pos.get("nativeSlPrice")
         should_sync = stepped
         if not should_sync and last_native is not None:
@@ -1658,12 +1662,17 @@ async def _update_trailing(http, sym, pos, price):
             if favorable and moved_pct >= cfg.get("hlStopSyncPct", 0.05):
                 should_sync = True
         if should_sync:
-            await _hl_sync_stop(pos, sym, stop)
+            if is_bin_live:
+                await _bin_trail_sync_stop(http, pos, sym, stop)
+            else:
+                await _hl_sync_stop(pos, sym, stop)
     else:
-        # not yet secured -> initial tight stop
+        # not yet secured -> initial tight stop. For a LIVE native straddle the pre-placed native SL
+        # already rests on Binance and closes it; we never software-close those (exchange-native).
         stop = pos["slPrice"]
+        is_bin_live = pos.get("source") == "bin_straddle" and not pos.get("dryRun")
         hit = price <= stop if long else price >= stop
-        if hit:
+        if hit and not is_bin_live:
             await _close_position(http, sym, price, "stop-loss")
 
 
@@ -1810,10 +1819,9 @@ async def process_bot(http: httpx.AsyncClient, now: float):
         if not v:
             continue
         price = v["price"]
-        if _trail and pos.get("tpPrice") is None:
+        if (_trail or pos.get("trailManaged")) and pos.get("tpPrice") is None:
             await _update_trailing(http, pkey, pos, price)
             continue
-        # fixed TP/SL fallback (used when trailing off or a fixed TP was set, e.g. straddle)
         if pos.get("side", "long") == "long":
             if pos.get("tpPrice") and price >= pos["tpPrice"]:
                 await _close_position(http, pkey, price, "take-profit")
@@ -1856,20 +1864,33 @@ async def _register_bin_straddle_fill(http, s, side, fill, qty, now, live):
         sl_price = s.get("shortSl") or (fill * (1 + sl))
         tp_oid = s.get("shortTpOid")
         sl_oid = s.get("shortSlOid")
+    trail_on = bool(cfg.get("binStradTrailEnabled"))
     pos = {
         "symbol": sym, "base": base, "side": side, "entryPrice": fill,
-        "qty": qty, "quoteSpent": fill * qty, "tpPrice": tp_price, "slPrice": sl_price,
-        "openedTs": now, "orderId": None, "dryRun": not live, "source": "bin_straddle",
-        "binTpOid": tp_oid, "binSlOid": sl_oid,
+        "qty": qty, "quoteSpent": fill * qty, "tpPrice": (None if trail_on else tp_price),
+        "slPrice": sl_price, "openedTs": now, "orderId": None, "dryRun": not live,
+        "source": "bin_straddle", "binTpOid": tp_oid, "binSlOid": sl_oid,
     }
+    if trail_on:
+        # manage as SMART TRAILING TP/SL: no fixed TP (profit runs), native SL trails up
+        pos["trailManaged"] = True
+        pos["peakPct"] = 0.0
+        pos["slOffPct"] = None
+        pos["nativeSlPrice"] = sl_price  # pre-placed SL is the initial trailing stop
+        if live and tp_oid:  # cancel the pre-placed fixed TP so the trail can capture the move
+            try:
+                await _fapi_algo_cancel(http, sym, tp_oid)
+            except Exception:  # noqa: BLE001
+                pass
     pos["posKey"] = sym
     BOT["positions"][sym] = pos
     BOT["lastTradeTs"][sym] = now
+    _mode = f"TRAIL · init SL {sl_price:.6g}" if trail_on else f"TP {tp_price:.6g} / SL {sl_price:.6g}"
     jlog("straddle_fill", symbol=sym, base=base, side=side, entry=fill,
-         message=f"Binance {('LONG' if is_long else 'SHORT')} leg filled @ {fill:.6g} — opposite entry + TP/SL cancelled (OCO) · pre-placed TP {tp_price:.6g} / SL {sl_price:.6g} ({'LIVE' if live else 'SIM'})")
+         message=f"Binance {('LONG' if is_long else 'SHORT')} leg filled @ {fill:.6g} — opposite entry + TP/SL cancelled (OCO) · {('pre-placed smart trailing · ' if trail_on else 'pre-placed ')}{_mode} ({'LIVE' if live else 'SIM'})")
     jlog("entry", symbol=sym, base=base, side="buy" if is_long else "short", price=fill,
-         qty=qty, spent=pos["quoteSpent"], tp=tp_price, sl=sl_price, source="bin_straddle",
-         mode="LIVE" if live else "SIM")
+         qty=qty, spent=pos["quoteSpent"], tp=(None if trail_on else tp_price), sl=sl_price,
+         source="bin_straddle", mode="LIVE" if live else "SIM")
     await send_webhook("buy" if is_long else "sell", sym, fill)
 
 
@@ -2037,7 +2058,7 @@ async def _reconcile_bin_position(http, sym, pos, now):
         BOT["wins"] += 1
     else:
         BOT["losses"] += 1
-    label = "TP HIT" if won else "SL HIT"
+    label = ("TRAIL TP" if pnl >= 0 else "SL HIT") if pos.get("trailManaged") else ("TP HIT" if won else "SL HIT")
     jlog("exit", symbol=sym, base=pos["base"], side=pos["side"], price=exit_px, pnl=pnl,
          reason=f"Binance {label}", source="bin_straddle", mode="LIVE",
          message=f"Binance closed {pos['base']} {pos['side'].upper()} — {label} @ ~{exit_px:.6g} (pnl {pnl:+.4f})")
@@ -3016,6 +3037,7 @@ class BotConfigUpdate(BaseModel):
     binStradEntryPct: Optional[float] = None
     binStradTpPct: Optional[float] = None
     binStradSlPct: Optional[float] = None
+    binStradTrailEnabled: Optional[bool] = None
     binStradReconcile: Optional[bool] = None
     binStradMonitorMs: Optional[int] = None
     autoTpSlEnabled: Optional[bool] = None
