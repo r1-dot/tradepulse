@@ -305,6 +305,15 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Tests: `tests/test_bin_straddle_trail.py` (6) — OFF keeps fixed TP/SL; ON cancels TP + arms trailing; SIM arms trailing w/o cancel; LIVE trails native SL up w/o software close; LIVE stop-hit lets exchange close; config toggle. **100/100 mocked unit tests pass**, no regressions. LIVE only verifiable on the VPS.
 
 
+## Feature (2026-06) — CHECKPOINT (signal gate before the Native Straddle)
+- New on/off system `checkpointEnabled` that intercepts every bot signal in `handle_signal` BEFORE the Native Straddle arms. Holds the signal for a chosen window, measures Buy/Sell pressure (taker flow = `hybrid.get_signal(...)["buy"]`, same metric as the dashboard BUY/SELL signal), averages it over the window, then arms ONLY the confirmed side or auto-cancels.
+- Config: `checkpointHoldSec` (10/20/30/60, default 20), `checkpointBuyPct` (60/70/90, default 70), `checkpointSellPct` (60/70/90, default 70). Clamps: hold 1–600s, pct 50–99.
+- Flow: signal → `BOT["checkpoints"][sym]` hold (counts toward capacity). `_process_checkpoints` (run each tick in process_bot) samples Buy% ~1s. At the deadline: avg Buy% ≥ buyPct → `_arm_bin_straddle(sym, ("long",))`; else avg Sell% ≥ sellPct → `("short",)`; else SKIP with reason logged (e.g. "CHECKPOINT SKIP BTC — Buy 55% / Sell 45% (need Buy≥70% or Sell≥70%)"). Never left pending past the window.
+- Native Straddle refactored into `_arm_bin_straddle(http, sym, now, sides)` — arms both sides (normal) or one confirmed side (checkpoint). Entry always sets all level keys + `armedSides`; SIM fill (`_process_bin_straddles`) and LIVE reconciler (`legs_placed` drop) honor one-sided arms. Signal-time band guard stays in `handle_signal` (flattens an existing position on a stale signal).
+- Live display: `/api/bot/status` exposes `checkpoints [{base, holdSec, remainingSec, avgBuy, samples}]`. BotPanel: teal CHECKPOINT card above the straddle card — ON/OFF, Hold-time chips, Buying%/Selling% chips, live "holding Ns · Buy X%" per coin, and `checkpoint` journal renderer.
+- Tests: `tests/test_checkpoint.py` (10) — hold-not-arm, off=both-sides, buy→long-only, sell→short-only, weak→skip+auto-cancel, window averaging, no-duplicate-hold, system-off clears, config toggle+clamps. **109/109 mocked unit tests pass**, no regressions. LIVE only verifiable on the VPS.
+
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

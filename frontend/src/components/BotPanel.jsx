@@ -546,6 +546,74 @@ export default function BotPanel({ open, onClose }) {
                     </p>
                   </div>
 
+                  {/* CHECKPOINT — holds each signal, verifies Buy/Sell pressure, then arms one side */}
+                  <div className="space-y-2.5 border border-[#0E7490]/40 bg-[#0E7490]/[0.06] p-2.5" data-testid="bot-checkpoint-section">
+                    <div className="flex items-center justify-between">
+                      <span className="mono text-[10px] font-semibold uppercase tracking-wider text-[#0E7490]">Checkpoint</span>
+                      <button
+                        data-testid="bot-checkpoint-toggle"
+                        onClick={() => patch({ checkpointEnabled: !st.config.checkpointEnabled })}
+                        className={`mono border px-2 py-0.5 text-[10px] font-semibold transition-colors ${st.config.checkpointEnabled ? "border-[#0E7490] bg-[#0E7490] text-white" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.checkpointEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <p className="mono text-[9px] leading-relaxed text-zinc-500">
+                      Every bot signal is <b>held</b> before it reaches the Native Straddle. During the hold it measures <b>Buy vs Sell pressure</b> (taker flow). If <b className="text-[#00A004]">Buy</b> ≥ your % → sends a <b>BUY</b> (arms the <b>LONG</b> side only); if <b className="text-[#FF3B30]">Sell</b> ≥ your % → sends a <b>SELL</b> (arms the <b>SHORT</b> side only). If neither passes within the hold time, the signal is <b>auto-cancelled</b>.
+                    </p>
+                    <div>
+                      <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#0E7490]">Hold time</span>
+                      <div className="mt-1 grid grid-cols-4 gap-1.5" data-testid="bot-checkpoint-hold">
+                        {[10, 20, 30, 60].map((s) => (
+                          <button key={s} data-testid={`bot-checkpoint-hold-${s}`}
+                            onClick={() => patch({ checkpointHoldSec: s })}
+                            className={`mono border py-1 text-[11px] font-bold transition-colors ${Number(st.config.checkpointHoldSec) === s ? "border-[#0E7490] bg-[#0E7490] text-white" : "border-zinc-300 text-zinc-600 hover:border-[#0E7490]"}`}>
+                            {s}s
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#00A004]">Buying %</span>
+                      <div className="mt-1 grid grid-cols-3 gap-1.5" data-testid="bot-checkpoint-buy">
+                        {[60, 70, 90].map((p) => (
+                          <button key={p} data-testid={`bot-checkpoint-buy-${p}`}
+                            onClick={() => patch({ checkpointBuyPct: p })}
+                            className={`mono border py-1 text-[11px] font-bold transition-colors ${Number(st.config.checkpointBuyPct) === p ? "border-[#00A004] bg-[#00A004] text-white" : "border-zinc-300 text-zinc-600 hover:border-[#00A004]"}`}>
+                            {p}%
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#FF3B30]">Selling %</span>
+                      <div className="mt-1 grid grid-cols-3 gap-1.5" data-testid="bot-checkpoint-sell">
+                        {[60, 70, 90].map((p) => (
+                          <button key={p} data-testid={`bot-checkpoint-sell-${p}`}
+                            onClick={() => patch({ checkpointSellPct: p })}
+                            className={`mono border py-1 text-[11px] font-bold transition-colors ${Number(st.config.checkpointSellPct) === p ? "border-[#FF3B30] bg-[#FF3B30] text-white" : "border-zinc-300 text-zinc-600 hover:border-[#FF3B30]"}`}>
+                            {p}%
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    {st.checkpoints && st.checkpoints.length > 0 && (
+                      <div className="space-y-1 border-t border-[#0E7490]/25 pt-2" data-testid="bot-checkpoint-live">
+                        <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#0E7490]">Live holds</span>
+                        {st.checkpoints.map((cp) => (
+                          <div key={cp.symbol} className="flex items-center justify-between" data-testid={`bot-checkpoint-live-${cp.base}`}>
+                            <span className="mono text-[10px] font-bold text-zinc-800">{cp.base}</span>
+                            <span className="mono text-[9px] text-[#0E7490]">holding {cp.remainingSec}s</span>
+                            <span className="mono text-[9px] font-bold text-[#00A004]">Buy {cp.avgBuy != null ? `${cp.avgBuy}%` : "—"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <p className="mono text-[8px] leading-relaxed text-amber-600">
+                      ⚠ Works with <b>Binance Native Straddle</b> below. When ON, signals arm only the confirmed side; when OFF, straddle arms both sides as usual. Tap a value to apply instantly.
+                    </p>
+                  </div>
+
                   {/* BINANCE NATIVE STRADDLE — real orders placed directly on Binance Futures */}
                   <div className="space-y-2 border border-[#F0B90B]/40 bg-[#F0B90B]/[0.06] p-2.5" data-testid="bot-bin-straddle-section">
                     <div className="flex items-center justify-between">
@@ -878,6 +946,7 @@ const JournalLine = ({ j }) => {
   if (j.kind === "bin_straddle") return <span className="text-[#A17A00] font-semibold">BINANCE STRADDLE armed {j.base} · ↑{Number(j.longEntry).toPrecision(5)} / ↓{Number(j.shortEntry).toPrecision(5)}</span>;
   if (j.kind === "auto_tpsl") return <span className="text-[#1D4ED8] font-semibold">AUTO TP/SL {j.base} {String(j.side || "").toUpperCase()} · TP {Number(j.tp).toPrecision(5)} / SL {Number(j.sl).toPrecision(5)}</span>;
   if (j.kind === "auto_trail") return <span className="text-[#7C3AED] font-semibold">AUTO-TRAIL {j.message}</span>;
+  if (j.kind === "checkpoint") return <span className="text-[#0E7490] font-semibold">{j.message}</span>;
   if (j.kind === "straddle_fill") return <span className="text-[#7C3AED] font-semibold">{j.message || `${j.side === "short" ? "SHORT" : "LONG"} leg filled ${j.base} — opposite cancelled`}</span>;
   if (j.kind === "straddle_cancel") return <span className="text-zinc-400">straddle {j.base} cancelled ({j.reason})</span>;
   if (j.kind === "halt") return <span className="text-[#FF3B30] font-semibold">⛔ {j.message}</span>;

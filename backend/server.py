@@ -170,6 +170,12 @@ BOT_DEFAULTS = {
     # fixed TP is cancelled and the native SL is trailed up (cancel-replace) locking profit; when
     # OFF the pre-placed TP/SL stay fixed. Reuses the shared Smart Trailing TP settings.
     "binStradTrailEnabled": False,
+    # --- CHECKPOINT: holds each bot signal before the Native Straddle, verifies Buy/Sell pressure
+    # over a chosen window, then arms ONLY the confirmed side (Buy->long, Sell->short) or skips.
+    "checkpointEnabled": False,
+    "checkpointHoldSec": 20,     # hold window seconds (10 / 20 / 30 / 60)
+    "checkpointBuyPct": 70,      # avg Buy% over the window >= this -> send BUY (long) to straddle
+    "checkpointSellPct": 70,     # avg Sell% over the window >= this -> send SELL (short) to straddle
     "binStradReconcile": True, # poll Binance for live order/position state (fast monitor)
     "binStradMonitorMs": 500,  # Binance live state-check cadence in ms (200 - 5000)
     # --- AUTO TP/SL: attach a reduce-only TP/SL to EVERY open Binance position (known or unknown,
@@ -223,6 +229,7 @@ BOT = {
     "positions": {},        # symbol -> position dict
     "straddles": {},        # symbol -> pending straddle (armed long/short stop levels)
     "binStraddles": {},     # symbol -> pending Binance native straddle (real stop-entry orders)
+    "checkpoints": {},      # symbol -> CHECKPOINT hold (samples Buy/Sell% before arming straddle)
     "binWs": {"connected": False, "lastEventTs": 0.0, "reconnects": 0, "listenKey": None},
     "autoTpSl": {},         # position key -> auto TP/SL record (attached / external)
     "autoTrail": {},        # position key -> All-Positions Smart Trailing TP state (external)
@@ -1803,6 +1810,10 @@ async def process_bot(http: httpx.AsyncClient, now: float):
 
     # BINANCE NATIVE STRADDLE: poll real stop-entry orders (LIVE) / watch mark (SIM); OCO on fill.
     try:
+        await _process_checkpoints(http, now)
+    except Exception as cpe:  # noqa: BLE001
+        logger.error("checkpoint error: %s", cpe)
+    try:
         await _process_bin_straddles(http, now)
     except Exception as bse:  # noqa: BLE001
         logger.error("bin-straddle error: %s", bse)
@@ -1916,11 +1927,12 @@ async def _process_bin_straddles(http, now):
             continue
         price = v["price"]
         lev = max(1, int(s.get("lev") or 1))
-        if price >= s["longStop"]:
+        armed = s.get("armedSides") or ("long", "short")
+        if "long" in armed and price >= s["longStop"]:
             BOT["binStraddles"].pop(sym, None)
             sim_qty = (BOT["config"]["maxPositionUsdt"] / s["longStop"]) * lev
             await _register_bin_straddle_fill(http, s, "long", s["longStop"], sim_qty, now, live=False)
-        elif price <= s["shortStop"]:
+        elif "short" in armed and price <= s["shortStop"]:
             BOT["binStraddles"].pop(sym, None)
             sim_qty = (BOT["config"]["maxPositionUsdt"] / s["shortStop"]) * lev
             await _register_bin_straddle_fill(http, s, "short", s["shortStop"], sim_qty, now, live=False)
@@ -1975,7 +1987,8 @@ async def _reconcile_bin_arms(http, now):
             logger.error("bin arm poll %s: %s", sym, e)
             continue
         if won is None:
-            if cancelled >= 2:
+            legs_placed = sum(1 for o in (s.get("longOid"), s.get("shortOid")) if o)
+            if legs_placed and cancelled >= legs_placed:
                 for oid in (s.get("longTpOid"), s.get("longSlOid"), s.get("shortTpOid"), s.get("shortSlOid")):
                     if oid:
                         try:
@@ -2546,6 +2559,131 @@ async def _bin_straddle_abort(http, sym, base, live, px, long_entry, short_entry
          message=msg)
 
 
+async def _arm_bin_straddle(http, sym, now, sides):
+    """Arm the Binance native straddle on `sides` ("long","short") — both for a normal arm, or a
+    single confirmed side when CHECKPOINT passes. Places real stop-entry + pre-placed TP/SL (LIVE)
+    or watches the mark (SIM). All level keys are always set; only armed sides place orders."""
+    cfg = BOT["config"]
+    info = STATE["latest"].get(sym)
+    if not info or info["price"] <= 0:
+        return
+    price = info["price"]
+    base = sym[: -len(QUOTE)]
+    live = (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures"
+    eo = cfg["binStradEntryPct"] / 100
+    long_stop = price * (1 + eo)
+    short_stop = price * (1 - eo)
+    # SIGNAL-TIME GUARD (optional): if the live price already broke outside the band, setup is stale.
+    if cfg.get("binStradBandGuard") and live:
+        guard_px = await _bin_guard_price(http, sym, price)
+        if guard_px >= long_stop or guard_px <= short_stop:
+            await _bin_straddle_abort(http, sym, base, live, guard_px, long_stop, short_stop)
+            return
+    if sym in BOT["positions"] or sym in BOT["binStraddles"] or sym in BOT["straddles"]:
+        return
+    qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
+    lev = cfg.get("futuresLeverage", 3)
+    tpf = cfg["binStradTpPct"] / 100
+    slf = cfg["binStradSlPct"] / 100
+    long_tp = long_stop * (1 + tpf)
+    long_sl = long_stop * (1 - slf)
+    short_tp = short_stop * (1 - tpf)
+    short_sl = short_stop * (1 + slf)
+    want_long = "long" in sides
+    want_short = "short" in sides
+    entry = {"symbol": sym, "base": base, "mark": price, "qty": qty, "lev": lev,
+             "longStop": long_stop, "shortStop": short_stop,
+             "longTp": long_tp, "longSl": long_sl, "shortTp": short_tp, "shortSl": short_sl,
+             "longOid": None, "shortOid": None,
+             "longTpOid": None, "longSlOid": None, "shortTpOid": None, "shortSlOid": None,
+             "createdTs": now, "live": live, "lastPollTs": 0.0,
+             "armedSides": [s for s in ("long", "short") if s in sides]}
+    if live:
+        placed = []
+        try:
+            await _fapi_set_leverage(http, sym, lev)
+            if want_long:
+                lo = await _fapi_place_stop_entry(http, sym, True, qty, long_stop)
+                entry["longOid"] = lo["algoId"]
+                placed.append(lo["algoId"])
+                entry["qty"] = lo.get("qty", qty)
+                ltp = await _fapi_place_native_tpsl(http, sym, True, entry["qty"], long_tp, long_sl, reduce_only=False)
+                entry["longTpOid"] = (ltp.get("tp") or {}).get("algoId")
+                entry["longSlOid"] = (ltp.get("sl") or {}).get("algoId")
+                placed += [entry["longTpOid"], entry["longSlOid"]]
+            if want_short:
+                so = await _fapi_place_stop_entry(http, sym, False, qty, short_stop)
+                entry["shortOid"] = so["algoId"]
+                placed.append(so["algoId"])
+                entry["qty"] = so.get("qty", entry.get("qty", qty))
+                stp = await _fapi_place_native_tpsl(http, sym, False, entry["qty"], short_tp, short_sl, reduce_only=False)
+                entry["shortTpOid"] = (stp.get("tp") or {}).get("algoId")
+                entry["shortSlOid"] = (stp.get("sl") or {}).get("algoId")
+                placed += [entry["shortTpOid"], entry["shortSlOid"]]
+        except Exception as e:  # noqa: BLE001
+            for oid in placed:
+                if oid:
+                    try:
+                        await _fapi_algo_cancel(http, sym, oid)
+                    except Exception:  # noqa: BLE001
+                        pass
+            jlog("error", symbol=sym, base=base, live=True, venue="binance_futures",
+                 message=f"Binance native straddle arm failed: {str(e)[:160]}")
+            return
+    BOT["binStraddles"][sym] = entry
+    _side_lbl = "both sides" if (want_long and want_short) else ("LONG-only" if want_long else "SHORT-only")
+    jlog("bin_straddle", symbol=sym, base=base, mark=price, longEntry=long_stop, shortEntry=short_stop,
+         message=f"Binance native straddle armed {_side_lbl} ±{cfg['binStradEntryPct']}% · pre-placed TP {cfg['binStradTpPct']}% / SL {cfg['binStradSlPct']}% ({'LIVE' if live else 'SIM'})")
+
+
+async def _process_checkpoints(http, now):
+    """CHECKPOINT engine: sample each held signal's Buy/Sell pressure (taker flow, same metric as
+    the dashboard BUY/SELL signal) ~1s. At the end of the hold window, average it and arm ONLY the
+    confirmed side (Buy% >= threshold -> long, Sell% >= threshold -> short) or skip with a reason.
+    If the window elapses without confirmation, the signal is auto-cancelled (never left pending)."""
+    cfg = BOT["config"]
+    if not BOT["checkpoints"]:
+        return
+    if not (cfg.get("binStradEnabled") and cfg.get("checkpointEnabled") and cfg.get("enabled") and not BOT["stopped"]):
+        BOT["checkpoints"].clear()  # system off -> drop all holds
+        return
+    latest = STATE["latest"]
+    trades_1s, _ = compute_trades(1)
+    params = {k: cfg.get(k) for k in ("min_power_1m", "max_power_1m", "burst_power")}
+    buy_th = cfg.get("checkpointBuyPct", 70)
+    sell_th = cfg.get("checkpointSellPct", 70)
+    for sym in list(BOT["checkpoints"].keys()):
+        cp = BOT["checkpoints"][sym]
+        base = cp["base"]
+        v = latest.get(sym)
+        if v and (now - cp.get("lastSampleTs", 0)) >= 1.0:
+            cp["lastSampleTs"] = now
+            cell = trades_1s.get(sym)
+            tc = cell["trades"] if cell else 0
+            if tc > 0 and v.get("count24h"):
+                tick_usd = tc * (v["quoteVol"] / v["count24h"])
+                hybrid.update(base, tick_usd, cell["side"], now, count=tc)
+            sig = hybrid.get_signal(base, v["quoteVol"], params, now)
+            cp["lastBuy"] = float(sig.get("buy", 50.0))
+            cp["samples"].append(cp["lastBuy"])
+        if now >= cp["deadline"]:
+            samples = cp["samples"]
+            avg_buy = (sum(samples) / len(samples)) if samples else (cp.get("lastBuy") or 50.0)
+            avg_sell = 100.0 - avg_buy
+            BOT["checkpoints"].pop(sym, None)
+            if avg_buy >= buy_th:
+                jlog("checkpoint", symbol=sym, base=base, state="pass", side="buy", buy=round(avg_buy, 1),
+                     message=f"CHECKPOINT PASS {base} — Buy {avg_buy:.0f}% ≥ {buy_th}% → BUY to straddle")
+                await _arm_bin_straddle(http, sym, now, ("long",))
+            elif avg_sell >= sell_th:
+                jlog("checkpoint", symbol=sym, base=base, state="pass", side="sell", buy=round(avg_buy, 1),
+                     message=f"CHECKPOINT PASS {base} — Sell {avg_sell:.0f}% ≥ {sell_th}% → SELL to straddle")
+                await _arm_bin_straddle(http, sym, now, ("short",))
+            else:
+                jlog("skip", symbol=sym, base=base, state="fail", buy=round(avg_buy, 1),
+                     message=f"CHECKPOINT SKIP {base} — Buy {avg_buy:.0f}% / Sell {avg_sell:.0f}% (need Buy≥{buy_th}% or Sell≥{sell_th}%)")
+
+
 async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: float, now: float, volume: float = 0.0, trade_amt: float = 0.0):
     """Consume one alert-history event; fire a trade on `streak` consecutive
     same-direction alerts for the same symbol within ~1s. BUY only on buy signals,
@@ -2586,23 +2724,22 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
     # leg is closed by native Binance TP/SL trigger orders. Own measurement + TP/SL (independent).
     if cfg.get("binStradEnabled"):
         base = sym[: -len(QUOTE)]
-        live = (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures"
-        eo = cfg["binStradEntryPct"] / 100
-        long_stop = price * (1 + eo)
-        short_stop = price * (1 - eo)
-        # SIGNAL-TIME GUARD (optional, off by default via binStradBandGuard): if the freshest live
-        # Binance price has already broken outside the measured entry band, the straddle setup is
-        # stale -> do NOT arm, and flatten this symbol. Checked at signal time only, LIVE only.
-        if cfg.get("binStradBandGuard") and live:
+        # SIGNAL-TIME GUARD (optional): if the freshest live price already broke outside the entry
+        # band, the setup is stale -> flatten any open position for this symbol and don't arm.
+        if cfg.get("binStradBandGuard") and (not cfg["dryRun"]) and cfg.get("exchange") == "binance_futures":
+            eo = cfg["binStradEntryPct"] / 100
+            long_stop = price * (1 + eo)
+            short_stop = price * (1 - eo)
             guard_px = await _bin_guard_price(http, sym, price)
             if guard_px >= long_stop or guard_px <= short_stop:
-                await _bin_straddle_abort(http, sym, base, live, guard_px, long_stop, short_stop)
+                await _bin_straddle_abort(http, sym, base, True, guard_px, long_stop, short_stop)
                 return
-        if sym in BOT["positions"] or sym in BOT["binStraddles"] or sym in BOT["straddles"]:
+        # shared guards (also apply to a CHECKPOINT hold so we never hold a symbol that can't arm)
+        if sym in BOT["positions"] or sym in BOT["binStraddles"] or sym in BOT["straddles"] or sym in BOT["checkpoints"]:
             return
         if (now - BOT["lastTradeTs"].get(sym, 0)) < cfg["cooldownSec"]:
             return
-        if (len(BOT["positions"]) + len(BOT["binStraddles"])) >= cfg["maxOpenPositions"]:
+        if (len(BOT["positions"]) + len(BOT["binStraddles"]) + len(BOT["checkpoints"])) >= cfg["maxOpenPositions"]:
             return
         if (not cfg["dryRun"]) and cfg.get("exchange") != "binance_futures":
             if (now - BOT.get("_binStradSkipTs", 0)) > 15:
@@ -2610,54 +2747,17 @@ async def handle_signal(http: httpx.AsyncClient, sym: str, side: str, price: flo
                 jlog("skip", symbol=sym, base=base,
                      message="Binance native straddle needs the Binance Futures venue — not armed")
             return
-        qty = cfg["maxPositionUsdt"] / price if price > 0 else 0
-        lev = cfg.get("futuresLeverage", 3)
-        tpf = cfg["binStradTpPct"] / 100
-        slf = cfg["binStradSlPct"] / 100
-        # TP/SL levels per side, measured from each entry (committed before fill — no race).
-        long_tp = long_stop * (1 + tpf)
-        long_sl = long_stop * (1 - slf)
-        short_tp = short_stop * (1 - tpf)
-        short_sl = short_stop * (1 + slf)
-        entry = {"symbol": sym, "base": base, "mark": price, "qty": qty, "lev": lev,
-                 "longStop": long_stop, "shortStop": short_stop,
-                 "longTp": long_tp, "longSl": long_sl, "shortTp": short_tp, "shortSl": short_sl,
-                 "longOid": None, "shortOid": None,
-                 "longTpOid": None, "longSlOid": None, "shortTpOid": None, "shortSlOid": None,
-                 "createdTs": now, "live": live, "lastPollTs": 0.0}
-        if live:
-            placed = []
-            try:
-                await _fapi_set_leverage(http, sym, lev)
-                lo = await _fapi_place_stop_entry(http, sym, True, qty, long_stop)
-                entry["longOid"] = lo["algoId"]
-                placed.append(lo["algoId"])
-                so = await _fapi_place_stop_entry(http, sym, False, qty, short_stop)
-                entry["shortOid"] = so["algoId"]
-                placed.append(so["algoId"])
-                entry["qty"] = lo.get("qty", qty)
-                # PRE-PLACE both sides' TP/SL (limit, quantity, no reduceOnly since no position
-                # exists yet) so Binance triggers them in 0ms; the losing side is OCO-cancelled.
-                ltp = await _fapi_place_native_tpsl(http, sym, True, entry["qty"], long_tp, long_sl, reduce_only=False)
-                entry["longTpOid"] = (ltp.get("tp") or {}).get("algoId")
-                entry["longSlOid"] = (ltp.get("sl") or {}).get("algoId")
-                stp = await _fapi_place_native_tpsl(http, sym, False, entry["qty"], short_tp, short_sl, reduce_only=False)
-                entry["shortTpOid"] = (stp.get("tp") or {}).get("algoId")
-                entry["shortSlOid"] = (stp.get("sl") or {}).get("algoId")
-                placed += [entry["longTpOid"], entry["longSlOid"], entry["shortTpOid"], entry["shortSlOid"]]
-            except Exception as e:  # noqa: BLE001
-                for oid in placed:
-                    if oid:
-                        try:
-                            await _fapi_algo_cancel(http, sym, oid)
-                        except Exception:  # noqa: BLE001
-                            pass
-                jlog("error", symbol=sym, base=base, live=True, venue="binance_futures",
-                     message=f"Binance native straddle arm failed: {str(e)[:160]}")
-                return
-        BOT["binStraddles"][sym] = entry
-        jlog("bin_straddle", symbol=sym, base=base, mark=price, longEntry=long_stop, shortEntry=short_stop,
-             message=f"Binance native straddle armed ±{cfg['binStradEntryPct']}% · pre-placed TP {cfg['binStradTpPct']}% / SL {cfg['binStradSlPct']}% both sides ({'LIVE' if live else 'SIM'})")
+        # CHECKPOINT: don't arm yet — hold the signal, verify Buy/Sell pressure over the window,
+        # then arm ONLY the confirmed side (handled in _process_checkpoints). Else arm now (both).
+        if cfg.get("checkpointEnabled"):
+            hold = int(cfg.get("checkpointHoldSec", 20) or 20)
+            BOT["checkpoints"][sym] = {"base": base, "start": now, "deadline": now + hold,
+                                       "holdSec": hold, "samples": [], "lastSampleTs": 0.0,
+                                       "lastBuy": None, "price": price}
+            jlog("checkpoint", symbol=sym, base=base, state="holding", holdSec=hold,
+                 message=f"CHECKPOINT {base} holding {hold}s — verifying Buy/Sell pressure")
+            return
+        await _arm_bin_straddle(http, sym, now, ("long", "short"))
         return
 
     # STRADDLE MODE: a qualifying volume-spike alert arms a long/short breakout straddle
@@ -3038,6 +3138,10 @@ class BotConfigUpdate(BaseModel):
     binStradTpPct: Optional[float] = None
     binStradSlPct: Optional[float] = None
     binStradTrailEnabled: Optional[bool] = None
+    checkpointEnabled: Optional[bool] = None
+    checkpointHoldSec: Optional[int] = None
+    checkpointBuyPct: Optional[float] = None
+    checkpointSellPct: Optional[float] = None
     binStradReconcile: Optional[bool] = None
     binStradMonitorMs: Optional[int] = None
     autoTpSlEnabled: Optional[bool] = None
@@ -3125,6 +3229,13 @@ def _bot_status():
              "state": s.get("state") or ("resting" if s.get("live") else "armed")}
             for s in BOT["binStraddles"].values()
         ],
+        "checkpoints": [
+            {"symbol": sym, "base": cp["base"], "holdSec": cp.get("holdSec", 0),
+             "remainingSec": max(0, round(cp["deadline"] - time.time())),
+             "avgBuy": round(sum(cp["samples"]) / len(cp["samples"]), 0) if cp["samples"] else (round(cp["lastBuy"], 0) if cp.get("lastBuy") is not None else None),
+             "samples": len(cp["samples"])}
+            for sym, cp in BOT["checkpoints"].items()
+        ],
         "binWs": {
             "connected": BOT["binWs"].get("connected", False),
             "lastEventTs": BOT["binWs"].get("lastEventTs", 0.0),
@@ -3201,6 +3312,12 @@ async def bot_config(update: BotConfigUpdate):
         data["futPendingTimeoutSec"] = max(1, min(300, int(float(data["futPendingTimeoutSec"]))))
     if "limitSlippagePct" in data:
         data["limitSlippagePct"] = max(0.001, min(5.0, float(data["limitSlippagePct"])))
+    if "checkpointHoldSec" in data:
+        data["checkpointHoldSec"] = max(1, min(600, int(float(data["checkpointHoldSec"]))))
+    if "checkpointBuyPct" in data:
+        data["checkpointBuyPct"] = max(50.0, min(99.0, float(data["checkpointBuyPct"])))
+    if "checkpointSellPct" in data:
+        data["checkpointSellPct"] = max(50.0, min(99.0, float(data["checkpointSellPct"])))
     if "obStraddleMaxSymbols" in data:
         data["obStraddleMaxSymbols"] = max(1, min(50, int(float(data["obStraddleMaxSymbols"]))))
     if "straddleEntryPct" in data:
@@ -3295,7 +3412,9 @@ async def bot_close_all():
                     except Exception:  # noqa: BLE001
                         pass
     BOT["binStraddles"].clear()
-    jlog("kill_switch", message=f"Manually closed {closed} position(s) · cancelled {straddle_n} straddle(s) · {bin_n} Binance native straddle(s)")
+    cp_n = len(BOT["checkpoints"])
+    BOT["checkpoints"].clear()
+    jlog("kill_switch", message=f"Manually closed {closed} position(s) · cancelled {straddle_n} straddle(s) · {bin_n} Binance native straddle(s) · {cp_n} checkpoint(s)")
     return _bot_status()
 
 

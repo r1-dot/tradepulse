@@ -68,7 +68,7 @@ def _cfg(**over):
         "straddleEnabled": False, "cooldownSec": 0, "maxOpenPositions": 50,
         "minVolumeUsd": 0.0, "maxVolumeUsd": 0.0, "tradeAmtEnabled": False,
         "maxPositionUsdt": 100.0, "futuresLeverage": 3, "dailyLossLimit": 1e9,
-        "binStradBandGuard": False,
+        "binStradBandGuard": False, "checkpointEnabled": False,
     })
     cfg.update(over)
     return cfg
