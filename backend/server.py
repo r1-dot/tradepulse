@@ -3313,7 +3313,7 @@ async def bot_config(update: BotConfigUpdate):
     if "limitSlippagePct" in data:
         data["limitSlippagePct"] = max(0.001, min(5.0, float(data["limitSlippagePct"])))
     if "checkpointHoldSec" in data:
-        data["checkpointHoldSec"] = max(1, min(600, int(float(data["checkpointHoldSec"]))))
+        data["checkpointHoldSec"] = max(1, min(43200, int(float(data["checkpointHoldSec"]))))
     if "checkpointBuyPct" in data:
         data["checkpointBuyPct"] = max(50.0, min(99.0, float(data["checkpointBuyPct"])))
     if "checkpointSellPct" in data:

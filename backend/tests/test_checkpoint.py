@@ -148,4 +148,4 @@ def test_config_toggle_and_clamps(monkeypatch):
     # clamps
     asyncio.run(server.bot_config(server.BotConfigUpdate(checkpointBuyPct=150, checkpointHoldSec=99999)))
     assert server.BOT["config"]["checkpointBuyPct"] == 99.0
-    assert server.BOT["config"]["checkpointHoldSec"] == 600
+    assert server.BOT["config"]["checkpointHoldSec"] == 43200

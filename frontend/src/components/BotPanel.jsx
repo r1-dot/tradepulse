@@ -564,11 +564,11 @@ export default function BotPanel({ open, onClose }) {
                     <div>
                       <span className="mono text-[9px] font-semibold uppercase tracking-wider text-[#0E7490]">Hold time</span>
                       <div className="mt-1 grid grid-cols-4 gap-1.5" data-testid="bot-checkpoint-hold">
-                        {[10, 20, 30, 60].map((s) => (
+                        {[{ s: 10, l: "10s" }, { s: 20, l: "20s" }, { s: 30, l: "30s" }, { s: 60, l: "60s" }, { s: 300, l: "5m" }, { s: 900, l: "15m" }, { s: 1800, l: "30m" }, { s: 3600, l: "1h" }, { s: 7200, l: "2h" }, { s: 14400, l: "4h" }, { s: 43200, l: "12h" }].map(({ s, l }) => (
                           <button key={s} data-testid={`bot-checkpoint-hold-${s}`}
                             onClick={() => patch({ checkpointHoldSec: s })}
                             className={`mono border py-1 text-[11px] font-bold transition-colors ${Number(st.config.checkpointHoldSec) === s ? "border-[#0E7490] bg-[#0E7490] text-white" : "border-zinc-300 text-zinc-600 hover:border-[#0E7490]"}`}>
-                            {s}s
+                            {l}
                           </button>
                         ))}
                       </div>
