@@ -314,6 +314,12 @@ Scan all ~669 Binance USDT tokens across 15 timeframes (1s, 5s, 15s, 30s, 1m, 5m
 - Tests: `tests/test_checkpoint.py` (10) — hold-not-arm, off=both-sides, buy→long-only, sell→short-only, weak→skip+auto-cancel, window averaging, no-duplicate-hold, system-off clears, config toggle+clamps. **109/109 mocked unit tests pass**, no regressions. LIVE only verifiable on the VPS.
 
 
+## Change (2026-06) — Limit-slip system ON/OFF switch (default OFF)
+- New `limitSlipEnabled` (default False). `_limit_slip()` returns 0 when OFF, so every futures order stays a LIMIT but is priced exactly at the mark/trigger with NO slippage cap (may rest unfilled if price runs away); when ON it applies `limitSlippagePct` (aggressive crossing fill). All order builders already route through `_limit_slip()`, so no per-order changes.
+- BotPanel: ON/OFF toggle (`bot-futures-limitslip-toggle`) on the Limit-slip box; the % input is disabled/dimmed when OFF and the hint switches between "aggressive LIMIT (crosses book, caps slip)" and "LIMIT at mark/trigger (no slip cap)". Config `limitSlipEnabled` + `BotConfigUpdate`.
+- Verified: slip OFF→0.0 / ON→0.0005; 55 order-path unit tests pass; toggle renders OFF by default.
+
+
 ## Backlog
 - P1: Per-token detail drawer with 15-timeframe breakdown + mini sparkline
 - P2: Hyperliquid size precision rounding (szDecimals) to avoid order rejections

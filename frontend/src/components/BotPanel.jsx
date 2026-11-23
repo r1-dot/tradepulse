@@ -220,19 +220,29 @@ export default function BotPanel({ open, onClose }) {
                       />
                       <span className="mono text-[11px] font-bold text-[#F3BA2F]">x</span>
                     </div>
-                    <div className="flex items-center gap-1 border border-zinc-200 px-2 py-1" data-testid="bot-futures-limitslip-box">
+                    <div className={`flex items-center gap-1 border px-2 py-1 transition-opacity ${st.config.limitSlipEnabled ? "border-zinc-200" : "border-zinc-200 opacity-50"}`} data-testid="bot-futures-limitslip-box">
                       <span className="mono text-[10px] text-zinc-500">Limit slip</span>
                       <input
                         data-testid="bot-futures-limitslip"
                         type="number" min="0.001" max="5" step="0.01"
+                        disabled={!st.config.limitSlipEnabled}
                         value={form.limitSlippagePct}
                         onChange={(e) => setForm({ ...form, limitSlippagePct: e.target.value })}
                         onBlur={() => patch({ limitSlippagePct: parseFloat(form.limitSlippagePct) || 0.05 })}
-                        className="mono w-14 bg-transparent text-[12px] font-bold text-zinc-900 outline-none"
+                        className="mono w-14 bg-transparent text-[12px] font-bold text-zinc-900 outline-none disabled:cursor-not-allowed"
                       />
                       <span className="mono text-[11px] font-bold text-[#F3BA2F]">%</span>
+                      <button
+                        data-testid="bot-futures-limitslip-toggle"
+                        onClick={() => patch({ limitSlipEnabled: !st.config.limitSlipEnabled })}
+                        className={`mono ml-1 border px-1.5 py-0.5 text-[9px] font-semibold transition-colors ${st.config.limitSlipEnabled ? "border-[#A17A00] bg-[#F0B90B] text-zinc-900" : "border-zinc-300 text-zinc-500"}`}
+                      >
+                        {st.config.limitSlipEnabled ? "ON" : "OFF"}
+                      </button>
                     </div>
-                    <span className="mono text-[9px] leading-tight text-zinc-400">leverage 1–125 · all orders are aggressive LIMIT (cross book, cap slip) · reduce-only close</span>
+                    <span className="mono text-[9px] leading-tight text-zinc-400">
+                      leverage 1–125 · {st.config.limitSlipEnabled ? "aggressive LIMIT (crosses book, caps slip)" : "LIMIT at mark/trigger (no slip cap)"} · reduce-only close
+                    </span>
                   </div>
                 )}
                 {(st.config.exchange === "hyperliquid" || (st.config.dryRun && st.config.exchange !== "binance_futures")) && (

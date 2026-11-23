@@ -145,6 +145,7 @@ BOT_DEFAULTS = {
     "futPendingTimeoutSec": 300,   # how long a pending slippage-trigger entry waits (1-300s)
     "futuresTestnet": False,       # use testnet.binancefuture.com instead of fapi.binance.com
     "limitSlippagePct": 0.05,      # aggressive crossing-LIMIT slippage cap % for all futures orders
+    "limitSlipEnabled": False,     # OFF -> limit orders priced at the mark/trigger (no slippage cap)
     "maxLossPerTradeUsdt": 0.0002,  # hard cap: auto-close any position at this $ loss
     # --- STRADDLE SYSTEM: on a volume spike, arm a LONG stop above + SHORT stop below.
     # Whichever side price hits first fills; the other is cancelled (OCO breakout).
@@ -518,9 +519,13 @@ async def _fapi_book_ticker(http, symbol):
 
 
 def _limit_slip():
-    """Aggressive-limit slippage cap as a fraction (config limitSlippagePct, percent)."""
+    """Aggressive-limit slippage cap as a fraction. When the limit-slip system is OFF the cap is
+    zero -> every order is still a LIMIT priced exactly at the book/trigger (no buffer, may rest)."""
+    cfg = BOT["config"]
+    if not cfg.get("limitSlipEnabled", False):
+        return 0.0
     try:
-        return max(0.001, min(5.0, float(BOT["config"].get("limitSlippagePct", 0.05)))) / 100.0
+        return max(0.001, min(5.0, float(cfg.get("limitSlippagePct", 0.05)))) / 100.0
     except Exception:  # noqa: BLE001
         return 0.0005
 
@@ -3125,6 +3130,7 @@ class BotConfigUpdate(BaseModel):
     futPendingTimeoutSec: Optional[int] = None
     futuresTestnet: Optional[bool] = None
     limitSlippagePct: Optional[float] = None
+    limitSlipEnabled: Optional[bool] = None
     maxLossPerTradeUsdt: Optional[float] = None
     straddleEnabled: Optional[bool] = None
     straddleDualSide: Optional[bool] = None
